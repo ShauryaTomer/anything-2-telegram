@@ -1,5 +1,5 @@
 from dataclasses import FrozenInstanceError, fields, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -369,6 +369,43 @@ def test_every_emitted_payload_has_typed_scoped_ids_and_timestamp(event: object)
 def test_emitted_payloads_reject_non_datetime_timestamps(event: object) -> None:
     with pytest.raises(TypeError, match="occurred_at"):
         replace(event, occurred_at="2026-07-19")
+
+
+@pytest.mark.parametrize(
+    "event",
+    [value for value in _event_values() if not isinstance(value, DownloadTarget)],
+    ids=lambda event: type(event).__name__,
+)
+def test_every_emitted_payload_rejects_naive_timestamp(event: object) -> None:
+    with pytest.raises(ValueError, match="occurred_at must be timezone-aware"):
+        replace(event, occurred_at=NOW.replace(tzinfo=None))
+
+
+class _InvalidOffset(tzinfo):
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        return timedelta(hours=24)
+
+
+def test_event_timestamp_rejects_invalid_utc_offset_with_stable_error() -> None:
+    invalid_time = datetime(2026, 7, 19, 8, 30, tzinfo=_InvalidOffset())
+
+    with pytest.raises(ValueError, match="occurred_at must be timezone-aware"):
+        BatchCreated(uuid4(), "https://example.test/playlist", invalid_time)
+
+
+def test_event_timestamp_accepts_aware_non_utc_offset() -> None:
+    occurred_at = datetime(
+        2026,
+        7,
+        19,
+        14,
+        0,
+        tzinfo=timezone(timedelta(hours=5, minutes=30)),
+    )
+
+    assert BatchCreated(
+        uuid4(), "https://example.test/playlist", occurred_at
+    ).occurred_at is occurred_at
 
 
 def _event_uuid_fields() -> list[tuple[object, str]]:

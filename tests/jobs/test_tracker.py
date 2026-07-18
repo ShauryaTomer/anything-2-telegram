@@ -284,6 +284,17 @@ def test_unknown_reads_return_none() -> None:
     assert tracker.get_batch(BATCH) is None
 
 
+def test_mixed_aware_and_naive_job_times_fail_at_event_boundary(tracked_bus) -> None:
+    tracker, bus, errors = tracked_bus
+    emit_valid(bus, errors, JOB_QUEUED, youtube_queued())
+
+    with pytest.raises(ValueError, match="occurred_at must be timezone-aware"):
+        JobStarted(JOB_1, JobPhase.PRODUCING, NOW.replace(tzinfo=None))
+
+    assert tracker.get_job(JOB_1).status is JobStatus.WAITING  # type: ignore[union-attr]
+    assert errors == []
+
+
 def test_job_queued_creates_exact_waiting_snapshot(tracked_bus) -> None:
     tracker, bus, errors = tracked_bus
     emit_valid(bus, errors, JOB_QUEUED, youtube_queued())

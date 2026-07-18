@@ -36,6 +36,12 @@ ERROR = "error"
 
 def _require_event_time(occurred_at: object) -> None:
     _require_type(occurred_at, datetime, "occurred_at")
+    try:
+        utc_offset = occurred_at.utcoffset()
+    except Exception:
+        raise ValueError("occurred_at must be timezone-aware") from None
+    if utc_offset is None:
+        raise ValueError("occurred_at must be timezone-aware")
 
 
 @dataclass(frozen=True)
