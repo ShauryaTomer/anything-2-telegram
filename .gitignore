@@ -1,7 +1,15 @@
 # Secrets and local auth state
 .env
+.env.*
+*.env
 *.session
+*.session-journal
 yt-cookies.txt
+cookies.txt
+*.cookies
+credentials*.json
+token*.json
+auth*.json
 
 # Python environments and generated files
 .venv/
@@ -15,6 +23,9 @@ __pycache__/
 .nox/
 .coverage
 htmlcov/
+build/
+dist/
+*.egg-info/
 
 # Local worktrees and documentation
 .worktrees/
