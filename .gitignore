@@ -1,0 +1,28 @@
+# Secrets and local auth state
+.env
+*.session
+yt-cookies.txt
+
+# Python environments and generated files
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+htmlcov/
+
+# Local worktrees and documentation
+.worktrees/
+*.md
+docs/_work/
+
+# Teaching material
+lessons/
+reference/
+learning-records/
+assets/
