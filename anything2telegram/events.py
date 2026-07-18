@@ -10,6 +10,9 @@ from .domain import (
     StagedArtifact,
     _require_nonblank,
     _require_nonnegative,
+    _require_optional_uuid,
+    _require_type,
+    _require_uuid_tuple,
 )
 
 
@@ -29,6 +32,10 @@ TELEGRAM_UNAVAILABLE = "telegram.unavailable"
 ERROR = "error"
 
 
+def _require_event_time(occurred_at: object) -> None:
+    _require_type(occurred_at, datetime, "occurred_at")
+
+
 @dataclass(frozen=True)
 class BatchCreated:
     batch_id: UUID
@@ -36,6 +43,8 @@ class BatchCreated:
     occurred_at: datetime
 
     def __post_init__(self) -> None:
+        _require_type(self.batch_id, UUID, "batch_id")
+        _require_event_time(self.occurred_at)
         _require_nonblank(self.source_url, "source_url")
 
 
@@ -49,6 +58,12 @@ class JobQueued:
     occurred_at: datetime
 
     def __post_init__(self) -> None:
+        _require_type(self.job_id, UUID, "job_id")
+        _require_optional_uuid(self.batch_id, "batch_id")
+        _require_type(self.source_kind, SourceKind, "source_kind")
+        if self.staged_artifact is not None:
+            _require_type(self.staged_artifact, StagedArtifact, "staged_artifact")
+        _require_event_time(self.occurred_at)
         _require_nonblank(self.source, "source")
         if self.source_kind is SourceKind.YOUTUBE:
             if self.staged_artifact is not None:
@@ -69,6 +84,11 @@ class JobStarted:
     phase: JobPhase
     occurred_at: datetime
 
+    def __post_init__(self) -> None:
+        _require_type(self.job_id, UUID, "job_id")
+        _require_type(self.phase, JobPhase, "phase")
+        _require_event_time(self.occurred_at)
+
 
 @dataclass(frozen=True)
 class BatchJobsCreated:
@@ -78,6 +98,9 @@ class BatchJobsCreated:
     occurred_at: datetime
 
     def __post_init__(self) -> None:
+        _require_type(self.batch_id, UUID, "batch_id")
+        _require_uuid_tuple(self.job_ids, "job_ids")
+        _require_event_time(self.occurred_at)
         _require_nonnegative(self.skipped_entries, "skipped_entries")
 
 
@@ -88,6 +111,8 @@ class PlaylistExpansionRequested:
     occurred_at: datetime
 
     def __post_init__(self) -> None:
+        _require_type(self.batch_id, UUID, "batch_id")
+        _require_event_time(self.occurred_at)
         _require_nonblank(self.source_url, "source_url")
 
 
@@ -109,6 +134,14 @@ class PlaylistExpanded:
     occurred_at: datetime
 
     def __post_init__(self) -> None:
+        _require_type(self.batch_id, UUID, "batch_id")
+        _require_type(self.targets, tuple, "targets")
+        if not all(isinstance(target, DownloadTarget) for target in self.targets):
+            raise TypeError("targets must contain only DownloadTarget values")
+        source_ids = [target.source_id for target in self.targets]
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("targets must have unique source_id values")
+        _require_event_time(self.occurred_at)
         _require_nonnegative(self.skipped_entries, "skipped_entries")
 
 
@@ -118,6 +151,10 @@ class PlaylistExpansionFailed:
     error: ErrorInfo
     occurred_at: datetime
 
+    def __post_init__(self) -> None:
+        _require_type(self.batch_id, UUID, "batch_id")
+        _require_event_time(self.occurred_at)
+
 
 @dataclass(frozen=True)
 class YouTubeDownloadRequested:
@@ -126,6 +163,8 @@ class YouTubeDownloadRequested:
     occurred_at: datetime
 
     def __post_init__(self) -> None:
+        _require_type(self.job_id, UUID, "job_id")
+        _require_event_time(self.occurred_at)
         _require_nonblank(self.source_url, "source_url")
 
 
@@ -141,6 +180,9 @@ class ArtifactReady:
     occurred_at: datetime
 
     def __post_init__(self) -> None:
+        _require_type(self.job_id, UUID, "job_id")
+        _require_type(self.artifact_id, UUID, "artifact_id")
+        _require_event_time(self.occurred_at)
         _require_nonblank(self.filename, "filename")
         _require_nonnegative(self.size_bytes, "size_bytes")
 
@@ -152,6 +194,11 @@ class ArtifactProductionFailed:
     error: ErrorInfo
     occurred_at: datetime
 
+    def __post_init__(self) -> None:
+        _require_type(self.job_id, UUID, "job_id")
+        _require_optional_uuid(self.artifact_id, "artifact_id")
+        _require_event_time(self.occurred_at)
+
 
 @dataclass(frozen=True)
 class ArtifactUploaded:
@@ -161,6 +208,11 @@ class ArtifactUploaded:
     telegram_message_id: int
     occurred_at: datetime
 
+    def __post_init__(self) -> None:
+        _require_type(self.job_id, UUID, "job_id")
+        _require_type(self.artifact_id, UUID, "artifact_id")
+        _require_event_time(self.occurred_at)
+
 
 @dataclass(frozen=True)
 class ArtifactUploadFailed:
@@ -169,8 +221,16 @@ class ArtifactUploadFailed:
     error: ErrorInfo
     occurred_at: datetime
 
+    def __post_init__(self) -> None:
+        _require_type(self.job_id, UUID, "job_id")
+        _require_type(self.artifact_id, UUID, "artifact_id")
+        _require_event_time(self.occurred_at)
+
 
 @dataclass(frozen=True)
 class TelegramUnavailable:
     error: ErrorInfo
     occurred_at: datetime
+
+    def __post_init__(self) -> None:
+        _require_event_time(self.occurred_at)

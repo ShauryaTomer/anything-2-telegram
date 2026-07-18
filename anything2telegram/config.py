@@ -77,9 +77,10 @@ class Settings:
             _value(values, "ARTIFACT_ROOT", "/tmp/anything2telegram"),
             "ARTIFACT_ROOT",
         )
+        canonical_artifact_root = artifact_root.resolve()
         if (
-            artifact_root == Path(artifact_root.anchor)
-            or artifact_root.resolve() == resolved_base
+            canonical_artifact_root == Path(canonical_artifact_root.anchor)
+            or canonical_artifact_root == resolved_base
         ):
             raise ConfigError("ARTIFACT_ROOT points to an unsafe root")
 

@@ -191,6 +191,17 @@ def test_artifact_root_rejects_filesystem_and_repository_roots(
         Settings.from_env(tmp_path, required_env(ARTIFACT_ROOT=value))
 
 
+def test_artifact_root_rejects_symlink_to_filesystem_root(tmp_path: Path) -> None:
+    root_link = tmp_path / "root-link"
+    root_link.symlink_to(Path("/"), target_is_directory=True)
+
+    with pytest.raises(ConfigError, match="ARTIFACT_ROOT"):
+        Settings.from_env(
+            tmp_path,
+            required_env(ARTIFACT_ROOT=str(root_link)),
+        )
+
+
 def test_settings_are_frozen(tmp_path: Path) -> None:
     settings = Settings.from_env(tmp_path, required_env())
     with pytest.raises(AttributeError):

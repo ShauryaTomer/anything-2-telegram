@@ -42,6 +42,22 @@ def _require_nonnegative(value: int, field_name: str) -> None:
         raise ValueError(f"{field_name} must not be negative")
 
 
+def _require_type(value: object, expected_type: type, field_name: str) -> None:
+    if not isinstance(value, expected_type):
+        raise TypeError(f"{field_name} must be {expected_type.__name__}")
+
+
+def _require_optional_uuid(value: object, field_name: str) -> None:
+    if value is not None:
+        _require_type(value, UUID, field_name)
+
+
+def _require_uuid_tuple(value: object, field_name: str) -> None:
+    _require_type(value, tuple, field_name)
+    if not all(isinstance(item, UUID) for item in value):
+        raise TypeError(f"{field_name} must contain only UUID values")
+
+
 @dataclass(frozen=True)
 class ErrorInfo:
     code: str
@@ -63,6 +79,8 @@ class StagedArtifact:
     caption: str | None
 
     def __post_init__(self) -> None:
+        _require_type(self.job_id, UUID, "job_id")
+        _require_type(self.artifact_id, UUID, "artifact_id")
         _require_nonblank(self.filename, "filename")
         _require_nonnegative(self.size_bytes, "size_bytes")
 
@@ -83,6 +101,13 @@ class JobSnapshot:
     updated_at: datetime
 
     def __post_init__(self) -> None:
+        _require_type(self.id, UUID, "id")
+        _require_optional_uuid(self.batch_id, "batch_id")
+        _require_type(self.source_kind, SourceKind, "source_kind")
+        _require_type(self.status, JobStatus, "status")
+        _require_optional_uuid(self.artifact_id, "artifact_id")
+        _require_type(self.created_at, datetime, "created_at")
+        _require_type(self.updated_at, datetime, "updated_at")
         _require_nonblank(self.source, "source")
         if self.size_bytes is not None:
             _require_nonnegative(self.size_bytes, "size_bytes")
@@ -93,13 +118,18 @@ class BatchSnapshot:
     id: UUID
     source_url: str
     status: BatchStatus
-    ordered_job_ids: tuple[UUID, ...]
+    job_ids: tuple[UUID, ...]
     skipped_entries: int
     error: ErrorInfo | None
     created_at: datetime
     updated_at: datetime
 
     def __post_init__(self) -> None:
+        _require_type(self.id, UUID, "id")
+        _require_type(self.status, BatchStatus, "status")
+        _require_uuid_tuple(self.job_ids, "job_ids")
+        _require_type(self.created_at, datetime, "created_at")
+        _require_type(self.updated_at, datetime, "updated_at")
         _require_nonblank(self.source_url, "source_url")
         _require_nonnegative(self.skipped_entries, "skipped_entries")
 
@@ -110,6 +140,7 @@ class JobRef:
     status_url: str
 
     def __post_init__(self) -> None:
+        _require_type(self.id, UUID, "id")
         _require_nonblank(self.status_url, "status_url")
 
 
@@ -119,6 +150,7 @@ class BatchRef:
     status_url: str
 
     def __post_init__(self) -> None:
+        _require_type(self.id, UUID, "id")
         _require_nonblank(self.status_url, "status_url")
 
 
@@ -132,6 +164,8 @@ class UploadReservation:
     caption: str | None
 
     def __post_init__(self) -> None:
+        _require_type(self.job_id, UUID, "job_id")
+        _require_type(self.artifact_id, UUID, "artifact_id")
         _require_nonblank(self.filename, "filename")
 
 
