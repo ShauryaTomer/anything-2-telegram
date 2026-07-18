@@ -296,3 +296,36 @@ async def test_download_base_exception_cleans_and_reraises(tmp_path) -> None:
         await producer.handle_download_requested(event)
     assert failures == []
     assert not (storage.root / str(event.job_id)).exists()
+
+
+@pytest.mark.asyncio
+async def test_download_factory_error_emits_one_correlated_failure_without_bus_error(
+    tmp_path,
+) -> None:
+    def fail_id_factory():
+        raise RuntimeError("factory secret")
+
+    bus = AsyncIOEventEmitter()
+    bus_errors = []
+    failures = []
+    bus.on("error", bus_errors.append)
+    bus.on(ARTIFACT_PRODUCTION_FAILED, failures.append)
+    YouTubeArtifactProducer(
+        bus,
+        ArtifactStorage(tmp_path / "root"),
+        Runner(),
+        timeout_seconds=1,
+        id_factory=fail_id_factory,
+    )
+    event = YouTubeDownloadRequested(
+        uuid4(), "https://youtu.be/dQw4w9WgXcQ", NOW
+    )
+
+    bus.emit(YOUTUBE_DOWNLOAD_REQUESTED, event)
+    await settle()
+
+    assert bus_errors == []
+    assert len(failures) == 1
+    assert failures[0].job_id == event.job_id
+    assert failures[0].artifact_id is None
+    assert failures[0].error.code == "internal_error"

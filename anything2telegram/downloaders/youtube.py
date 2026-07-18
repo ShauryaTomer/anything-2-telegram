@@ -203,8 +203,9 @@ class YouTubeArtifactProducer:
     async def handle_download_requested(
         self, event: YouTubeDownloadRequested
     ) -> None:
-        artifact_id = self._id_factory()
+        artifact_id: UUID | None = None
         try:
+            artifact_id = self._id_factory()
             directory = self._storage.allocate_download_directory(
                 event.job_id, artifact_id
             )
@@ -372,7 +373,7 @@ class YouTubeArtifactProducer:
     def _emit_artifact_failure(
         self,
         event: YouTubeDownloadRequested,
-        artifact_id: UUID,
+        artifact_id: UUID | None,
         code: str,
         message: str,
     ) -> None:
