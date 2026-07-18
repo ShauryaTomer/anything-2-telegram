@@ -228,6 +228,55 @@ def move_job(
     raise AssertionError(f"unsupported target status: {status}")
 
 
+def create_job_at_status(
+    bus: AsyncIOEventEmitter,
+    errors: list[Exception],
+    status: JobStatus,
+) -> None:
+    emit_valid(bus, errors, JOB_QUEUED, youtube_queued())
+    if status is JobStatus.WAITING:
+        return
+    emit_valid(
+        bus,
+        errors,
+        JOB_STARTED,
+        JobStarted(JOB_1, JobPhase.PRODUCING, time(1)),
+    )
+    if status is JobStatus.PRODUCING:
+        return
+    emit_valid(bus, errors, ARTIFACT_READY, ready(occurred_at=time(2)))
+    if status is JobStatus.UPLOADING:
+        return
+    if status is JobStatus.COMPLETED:
+        emit_valid(
+            bus,
+            errors,
+            ARTIFACT_UPLOADED,
+            uploaded(occurred_at=time(3)),
+        )
+        return
+    emit_valid(
+        bus,
+        errors,
+        ARTIFACT_UPLOAD_FAILED,
+        ArtifactUploadFailed(JOB_1, ARTIFACT_1, UPLOAD_ERROR, time(3)),
+    )
+
+
+def terminal_fact(kind: str, step: int) -> tuple[str, object]:
+    if kind == "production_failed":
+        return (
+            ARTIFACT_PRODUCTION_FAILED,
+            ArtifactProductionFailed(JOB_1, None, DOWNLOAD_ERROR, time(step)),
+        )
+    if kind == "uploaded":
+        return ARTIFACT_UPLOADED, uploaded(occurred_at=time(step))
+    return (
+        ARTIFACT_UPLOAD_FAILED,
+        ArtifactUploadFailed(JOB_1, ARTIFACT_1, UPLOAD_ERROR, time(step)),
+    )
+
+
 def test_unknown_reads_return_none() -> None:
     tracker = JobTracker()
 
@@ -449,6 +498,62 @@ def test_upload_failure_records_error(tracked_bus) -> None:
     assert snapshot.updated_at == time(3)
 
 
+@pytest.mark.parametrize(
+    "status",
+    [
+        JobStatus.WAITING,
+        JobStatus.UPLOADING,
+        JobStatus.COMPLETED,
+        JobStatus.FAILED,
+    ],
+)
+def test_production_failure_rejects_every_status_except_producing(
+    tracked_bus, status
+) -> None:
+    tracker, bus, errors = tracked_bus
+    create_job_at_status(bus, errors, status)
+    before = tracker.get_job(JOB_1)
+
+    emit_invalid(
+        bus,
+        errors,
+        ARTIFACT_PRODUCTION_FAILED,
+        ArtifactProductionFailed(JOB_1, None, DOWNLOAD_ERROR, time(9)),
+        InvalidJobTransition,
+    )
+    assert tracker.get_job(JOB_1) == before
+
+
+@pytest.mark.parametrize(
+    ("topic", "event"),
+    [
+        (ARTIFACT_UPLOADED, uploaded(occurred_at=time(9))),
+        (
+            ARTIFACT_UPLOAD_FAILED,
+            ArtifactUploadFailed(JOB_1, ARTIFACT_1, UPLOAD_ERROR, time(9)),
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "status",
+    [
+        JobStatus.WAITING,
+        JobStatus.PRODUCING,
+        JobStatus.COMPLETED,
+        JobStatus.FAILED,
+    ],
+)
+def test_upload_terminal_rejects_every_status_except_uploading(
+    tracked_bus, status, topic, event
+) -> None:
+    tracker, bus, errors = tracked_bus
+    create_job_at_status(bus, errors, status)
+    before = tracker.get_job(JOB_1)
+
+    emit_invalid(bus, errors, topic, event, InvalidJobTransition)
+    assert tracker.get_job(JOB_1) == before
+
+
 @pytest.mark.parametrize("terminal_kind", ["production_failed", "uploaded", "upload_failed"])
 def test_exact_duplicate_job_terminal_event_is_idempotent(tracked_bus, terminal_kind) -> None:
     tracker, bus, errors = tracked_bus
@@ -496,36 +601,24 @@ def test_changed_duplicate_job_terminal_event_is_invalid(tracked_bus, terminal_k
 
 
 @pytest.mark.parametrize(
-    ("first_topic", "first_event", "second_topic", "second_event"),
+    ("first_kind", "second_kind"),
     [
-        (
-            ARTIFACT_PRODUCTION_FAILED,
-            ArtifactProductionFailed(JOB_1, None, DOWNLOAD_ERROR, time(2)),
-            ARTIFACT_UPLOADED,
-            uploaded(occurred_at=time(3)),
-        ),
-        (
-            ARTIFACT_UPLOADED,
-            uploaded(occurred_at=time(3)),
-            ARTIFACT_UPLOAD_FAILED,
-            ArtifactUploadFailed(JOB_1, ARTIFACT_1, UPLOAD_ERROR, time(4)),
-        ),
-        (
-            ARTIFACT_UPLOAD_FAILED,
-            ArtifactUploadFailed(JOB_1, ARTIFACT_1, UPLOAD_ERROR, time(3)),
-            ARTIFACT_UPLOADED,
-            uploaded(occurred_at=time(4)),
-        ),
+        (first_kind, second_kind)
+        for first_kind in ("production_failed", "uploaded", "upload_failed")
+        for second_kind in ("production_failed", "uploaded", "upload_failed")
+        if first_kind != second_kind
     ],
 )
 def test_conflicting_job_terminal_event_is_invalid(
-    tracked_bus, first_topic, first_event, second_topic, second_event
+    tracked_bus, first_kind, second_kind
 ) -> None:
     tracker, bus, errors = tracked_bus
     emit_valid(bus, errors, JOB_QUEUED, youtube_queued())
     emit_valid(bus, errors, JOB_STARTED, JobStarted(JOB_1, JobPhase.PRODUCING, time(1)))
-    if first_topic != ARTIFACT_PRODUCTION_FAILED:
+    if first_kind != "production_failed":
         emit_valid(bus, errors, ARTIFACT_READY, ready(occurred_at=time(2)))
+    first_topic, first_event = terminal_fact(first_kind, 3)
+    second_topic, second_event = terminal_fact(second_kind, 4)
     emit_valid(bus, errors, first_topic, first_event)
     first = tracker.get_job(JOB_1)
 
@@ -762,6 +855,12 @@ def test_playlist_expansion_failure_rejects_attached_batch(tracked_bus) -> None:
         ((JobStatus.WAITING, JobStatus.PRODUCING), 0, BatchStatus.PROCESSING, (1, 1, 0, 0, 0)),
         ((JobStatus.PRODUCING, JobStatus.PRODUCING), 0, BatchStatus.PROCESSING, (0, 2, 0, 0, 0)),
         ((JobStatus.UPLOADING, JobStatus.WAITING), 0, BatchStatus.PROCESSING, (1, 0, 1, 0, 0)),
+        ((JobStatus.COMPLETED, JobStatus.WAITING), 0, BatchStatus.PROCESSING, (1, 0, 0, 1, 0)),
+        ((JobStatus.COMPLETED, JobStatus.PRODUCING), 0, BatchStatus.PROCESSING, (0, 1, 0, 1, 0)),
+        ((JobStatus.COMPLETED, JobStatus.UPLOADING), 0, BatchStatus.PROCESSING, (0, 0, 1, 1, 0)),
+        ((JobStatus.FAILED, JobStatus.WAITING), 0, BatchStatus.PROCESSING, (1, 0, 0, 0, 1)),
+        ((JobStatus.FAILED, JobStatus.PRODUCING), 0, BatchStatus.PROCESSING, (0, 1, 0, 0, 1)),
+        ((JobStatus.FAILED, JobStatus.UPLOADING), 0, BatchStatus.PROCESSING, (0, 0, 1, 0, 1)),
         ((JobStatus.COMPLETED, JobStatus.COMPLETED), 0, BatchStatus.COMPLETED, (0, 0, 0, 2, 0)),
         (
             (JobStatus.COMPLETED, JobStatus.COMPLETED),
