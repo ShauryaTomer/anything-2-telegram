@@ -1,5 +1,6 @@
 import math
 import os
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,17 +27,25 @@ class Settings:
     shutdown_grace_seconds: float | int
 
     def __post_init__(self) -> None:
-        if self.api_id <= 0:
-            raise ConfigError("TG_API_ID must be positive")
-        if self.max_artifact_bytes <= 0:
-            raise ConfigError("MAX_ARTIFACT_BYTES must be positive")
+        _validate_int(self.api_id, "TG_API_ID", positive=True)
+        _validate_nonblank(self.api_hash, "TG_API_HASH")
+        _validate_nonblank(self.bot_token, "TG_BOT_TOKEN")
+        _validate_int(self.channel_id, "TG_CHANNEL_ID")
+        _validate_path(self.session_path, "TG_SESSION_PATH")
+        if self.cookies_path is not None:
+            _validate_path(self.cookies_path, "YTDLP_COOKIES_PATH")
+        _validate_path(self.artifact_root, "ARTIFACT_ROOT")
+        _validate_int(
+            self.max_artifact_bytes,
+            "MAX_ARTIFACT_BYTES",
+            positive=True,
+        )
         for key, value in (
             ("YTDLP_TIMEOUT_SECONDS", self.ytdlp_timeout_seconds),
             ("TG_UPLOAD_TIMEOUT_SECONDS", self.tg_upload_timeout_seconds),
             ("SHUTDOWN_GRACE_SECONDS", self.shutdown_grace_seconds),
         ):
-            if value <= 0 or not math.isfinite(value):
-                raise ConfigError(f"{key} must be positive and finite")
+            _validate_timeout(value, key)
 
     @classmethod
     def from_env(
@@ -63,6 +72,7 @@ class Settings:
             _value(values, "TG_SESSION_PATH", "./yt2tg.session"),
             "TG_SESSION_PATH",
         )
+        session_path = _telethon_session_path(session_path)
         cookies_value = values.get("YTDLP_COOKIES_PATH", "./yt-cookies.txt")
         cookies_path = None
         if cookies_value and cookies_value.strip():
@@ -165,18 +175,73 @@ def _path_from_base(base_dir: Path, value: str, key: str) -> Path:
     return Path(os.path.abspath(path))
 
 
+def _telethon_session_path(path: Path) -> Path:
+    if str(path).endswith(".session"):
+        return path
+    return Path(f"{path}.session")
+
+
 def _prepare_session_path(session_path: Path) -> None:
     parent = session_path.parent
+    descriptor: int | None = None
     try:
-        parent_existed = parent.exists()
-        parent.mkdir(parents=True, exist_ok=True)
-        if not parent_existed:
+        try:
+            parent_status = parent.lstat()
+        except FileNotFoundError:
+            parent_status = None
+
+        if parent_status is None:
+            parent.mkdir(mode=0o700, parents=True, exist_ok=False)
             parent.chmod(0o700)
-        if session_path.exists():
-            if not session_path.is_file():
-                raise OSError
         else:
-            session_path.touch(mode=0o600, exist_ok=False)
-        session_path.chmod(0o600)
+            if not stat.S_ISDIR(parent_status.st_mode):
+                raise OSError
+            if stat.S_IMODE(parent_status.st_mode) & 0o022:
+                raise OSError
+
+        try:
+            session_status = session_path.lstat()
+        except FileNotFoundError:
+            session_status = None
+
+        if session_status is not None and not stat.S_ISREG(session_status.st_mode):
+            raise OSError
+
+        flags = os.O_CREAT | os.O_RDWR
+        if session_status is None:
+            flags |= os.O_EXCL
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(session_path, flags, 0o600)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError
+        os.fchmod(descriptor, 0o600)
     except OSError:
         raise ConfigError("TG_SESSION_PATH could not be prepared") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _validate_int(value: object, key: str, *, positive: bool = False) -> None:
+    if type(value) is not int:
+        raise ConfigError(f"{key} must be an integer")
+    if positive and value <= 0:
+        raise ConfigError(f"{key} must be positive")
+
+
+def _validate_nonblank(value: object, key: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{key} must be a nonblank string")
+
+
+def _validate_path(value: object, key: str) -> None:
+    if not isinstance(value, Path):
+        raise ConfigError(f"{key} must be a Path")
+
+
+def _validate_timeout(value: object, key: str) -> None:
+    if type(value) not in (int, float):
+        raise ConfigError(f"{key} must be a number")
+    if value <= 0 or not math.isfinite(value):
+        raise ConfigError(f"{key} must be positive and finite")

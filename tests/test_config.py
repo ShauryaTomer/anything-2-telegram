@@ -1,4 +1,5 @@
 import stat
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -110,7 +111,7 @@ def test_absolute_paths_remain_absolute(tmp_path: Path) -> None:
         ),
     )
 
-    assert settings.session_path == session
+    assert settings.session_path == Path(f"{session}.session")
     assert settings.cookies_path == cookie
     assert settings.artifact_root == artifact_root
 
@@ -294,3 +295,133 @@ def test_session_filesystem_error_is_safe(tmp_path: Path) -> None:
     assert "TG_SESSION_PATH" in str(raised.value)
     assert str(session_path) not in str(raised.value)
     assert "secret-session-name" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("configured_name", "effective_name"),
+    [
+        ("telegram", "telegram.session"),
+        ("telegram.sqlite", "telegram.sqlite.session"),
+        ("telegram.SESSION", "telegram.SESSION.session"),
+        ("telegram.session", "telegram.session"),
+    ],
+)
+def test_session_path_matches_telethon_suffix_rules(
+    tmp_path: Path, configured_name: str, effective_name: str
+) -> None:
+    settings = Settings.from_env(
+        tmp_path,
+        required_env(TG_SESSION_PATH=configured_name),
+    )
+
+    assert settings.session_path == tmp_path / effective_name
+    assert settings.session_path.is_file()
+
+
+def test_settings_session_path_is_the_sqlite_file_telethon_uses(
+    tmp_path: Path,
+) -> None:
+    from telethon.sessions import SQLiteSession
+
+    configured_base = tmp_path / "sessions" / "telegram"
+    settings = Settings.from_env(
+        tmp_path,
+        required_env(TG_SESSION_PATH=str(configured_base)),
+    )
+
+    session = SQLiteSession(str(configured_base))
+    session.close()
+
+    assert settings.session_path == Path(session.filename)
+    assert settings.session_path.is_file()
+    assert stat.S_IMODE(settings.session_path.stat().st_mode) == 0o600
+
+
+def test_session_path_symlink_is_rejected_without_chmodding_target(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "real.session"
+    target.touch(mode=0o644)
+    target.chmod(0o644)
+    link = tmp_path / "linked.session"
+    link.symlink_to(target)
+
+    with pytest.raises(ConfigError) as raised:
+        Settings.from_env(
+            tmp_path,
+            required_env(TG_SESSION_PATH=str(link)),
+        )
+
+    assert "TG_SESSION_PATH" in str(raised.value)
+    assert str(link) not in str(raised.value)
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+
+@pytest.mark.parametrize("mode", [0o770, 0o707])
+def test_existing_writable_session_parent_is_rejected(
+    tmp_path: Path, mode: int
+) -> None:
+    parent = tmp_path / "unsafe-parent"
+    parent.mkdir()
+    parent.chmod(mode)
+    session_path = parent / "telegram.session"
+
+    with pytest.raises(ConfigError, match="TG_SESSION_PATH"):
+        Settings.from_env(
+            tmp_path,
+            required_env(TG_SESSION_PATH=str(session_path)),
+        )
+
+    assert not session_path.exists()
+    assert stat.S_IMODE(parent.stat().st_mode) == mode
+
+
+def valid_settings(tmp_path: Path) -> Settings:
+    return Settings(
+        api_id=12345,
+        api_hash="api-hash",
+        bot_token="bot-token",
+        channel_id=-100123,
+        session_path=tmp_path / "telegram.session",
+        cookies_path=None,
+        artifact_root=tmp_path / "artifacts",
+        max_artifact_bytes=100,
+        ytdlp_timeout_seconds=1,
+        tg_upload_timeout_seconds=1.5,
+        shutdown_grace_seconds=1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value", "config_key"),
+    [
+        ("api_id", True, "TG_API_ID"),
+        ("api_id", 1.5, "TG_API_ID"),
+        ("api_hash", 7, "TG_API_HASH"),
+        ("api_hash", " ", "TG_API_HASH"),
+        ("bot_token", 7, "TG_BOT_TOKEN"),
+        ("bot_token", "", "TG_BOT_TOKEN"),
+        ("channel_id", True, "TG_CHANNEL_ID"),
+        ("channel_id", 1.5, "TG_CHANNEL_ID"),
+        ("session_path", "/tmp/session", "TG_SESSION_PATH"),
+        ("cookies_path", "/tmp/cookies", "YTDLP_COOKIES_PATH"),
+        ("artifact_root", "/tmp/artifacts", "ARTIFACT_ROOT"),
+        ("max_artifact_bytes", True, "MAX_ARTIFACT_BYTES"),
+        ("max_artifact_bytes", 1.5, "MAX_ARTIFACT_BYTES"),
+        ("ytdlp_timeout_seconds", True, "YTDLP_TIMEOUT_SECONDS"),
+        ("ytdlp_timeout_seconds", "1", "YTDLP_TIMEOUT_SECONDS"),
+        ("ytdlp_timeout_seconds", float("nan"), "YTDLP_TIMEOUT_SECONDS"),
+        ("tg_upload_timeout_seconds", True, "TG_UPLOAD_TIMEOUT_SECONDS"),
+        ("tg_upload_timeout_seconds", float("inf"), "TG_UPLOAD_TIMEOUT_SECONDS"),
+        ("shutdown_grace_seconds", "1", "SHUTDOWN_GRACE_SECONDS"),
+        ("shutdown_grace_seconds", 0, "SHUTDOWN_GRACE_SECONDS"),
+    ],
+)
+def test_direct_settings_rejects_invalid_runtime_field_values(
+    tmp_path: Path,
+    field_name: str,
+    invalid_value: object,
+    config_key: str,
+) -> None:
+    with pytest.raises(ConfigError, match=config_key):
+        replace(valid_settings(tmp_path), **{field_name: invalid_value})
