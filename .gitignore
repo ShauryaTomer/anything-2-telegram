@@ -26,6 +26,7 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+uv.lock
 
 # Local worktrees and documentation
 .worktrees/
