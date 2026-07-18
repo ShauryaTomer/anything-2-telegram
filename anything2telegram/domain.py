@@ -179,6 +179,17 @@ class BatchSnapshot:
         _require_nonnegative(self.completed, "completed")
         _require_nonnegative(self.failed, "failed")
         _require_nonblank(self.source_url, "source_url")
+        if self.total_jobs != len(self.job_ids):
+            raise ValueError("total_jobs must match job_ids")
+        status_count = (
+            self.waiting
+            + self.producing
+            + self.uploading
+            + self.completed
+            + self.failed
+        )
+        if status_count != self.total_jobs:
+            raise ValueError("status counts must sum to total_jobs")
 
 
 @dataclass(frozen=True)

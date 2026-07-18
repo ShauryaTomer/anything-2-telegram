@@ -1,12 +1,13 @@
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
 from uuid import UUID
 
+from ..bus import EventBus
 from ..domain import (
     BatchSnapshot,
     BatchStatus,
     ErrorInfo,
+    JobPhase,
     JobSnapshot,
     JobStatus,
     SourceKind,
@@ -56,6 +57,7 @@ class _JobRecord:
     created_at: datetime
     updated_at: datetime
     staged: bool
+    ready_event: ArtifactReady | None = None
     terminal_event: object | None = None
 
 
@@ -68,6 +70,7 @@ class _BatchRecord:
     error: ErrorInfo | None
     created_at: datetime
     updated_at: datetime
+    pending_job_ids: tuple[UUID, ...] = ()
     terminal_event: object | None = None
 
 
@@ -76,7 +79,7 @@ class JobTracker:
         self._jobs: dict[UUID, _JobRecord] = {}
         self._batches: dict[UUID, _BatchRecord] = {}
 
-    def register(self, bus: Any) -> None:
+    def register(self, bus: EventBus) -> None:
         bus.on(BATCH_CREATED, self._on_batch_created)
         bus.on(BATCH_JOBS_CREATED, self._on_batch_jobs_created)
         bus.on(JOB_QUEUED, self._on_job_queued)
@@ -153,8 +156,12 @@ class JobTracker:
     def _on_job_queued(self, event: JobQueued) -> None:
         if event.job_id in self._jobs:
             raise TrackingError("duplicate job")
-        if event.batch_id is not None and event.batch_id not in self._batches:
-            raise TrackingError("unknown batch")
+        batch = None
+        if event.batch_id is not None:
+            batch = self._require_batch(event.batch_id)
+            if batch.job_ids or batch.terminal_event is not None:
+                raise TrackingError("invalid batch transition")
+            self._require_batch_time(batch, event.occurred_at)
         staged = event.staged_artifact
         self._jobs[event.job_id] = _JobRecord(
             id=event.job_id,
@@ -171,16 +178,27 @@ class JobTracker:
             updated_at=event.occurred_at,
             staged=staged is not None,
         )
+        if batch is not None:
+            batch.pending_job_ids += (event.job_id,)
         self._touch_batch(self._jobs[event.job_id], event.occurred_at)
 
     def _on_job_started(self, event: JobStarted) -> None:
         record = self._require_job(event.job_id)
+        self._require_job_time(record, event.occurred_at)
         self._require_status(record, JobStatus.WAITING)
+        expected_phase = JobPhase.UPLOADING if record.staged else JobPhase.PRODUCING
+        if event.phase is not expected_phase:
+            raise InvalidJobTransition("invalid job phase")
         record.status = JobStatus(event.phase.value)
         self._advance(record, event.occurred_at)
 
     def _on_artifact_ready(self, event: ArtifactReady) -> None:
         record = self._require_job(event.job_id)
+        if record.ready_event is not None:
+            if record.ready_event == event:
+                return
+            raise InvalidJobTransition("conflicting artifact ready event")
+        self._require_job_time(record, event.occurred_at)
         if record.staged:
             self._require_artifact(record, event.artifact_id)
         if record.status is JobStatus.UPLOADING:
@@ -192,6 +210,7 @@ class JobTracker:
         record.artifact_id = event.artifact_id
         record.filename = event.filename
         record.size_bytes = event.size_bytes
+        record.ready_event = event
         self._advance(record, event.occurred_at)
 
     def _on_artifact_production_failed(
@@ -200,6 +219,7 @@ class JobTracker:
         record = self._require_job(event.job_id)
         if self._terminal_duplicate(record, event):
             return
+        self._require_job_time(record, event.occurred_at)
         self._require_status(record, JobStatus.PRODUCING)
         if event.artifact_id is not None:
             if record.artifact_id is not None:
@@ -214,6 +234,7 @@ class JobTracker:
         record = self._require_job(event.job_id)
         if self._terminal_duplicate(record, event):
             return
+        self._require_job_time(record, event.occurred_at)
         self._require_status(record, JobStatus.UPLOADING)
         self._require_artifact(record, event.artifact_id)
         record.status = JobStatus.COMPLETED
@@ -225,6 +246,7 @@ class JobTracker:
         record = self._require_job(event.job_id)
         if self._terminal_duplicate(record, event):
             return
+        self._require_job_time(record, event.occurred_at)
         self._require_status(record, JobStatus.UPLOADING)
         self._require_artifact(record, event.artifact_id)
         record.status = JobStatus.FAILED
@@ -234,12 +256,11 @@ class JobTracker:
 
     def _on_batch_jobs_created(self, event: BatchJobsCreated) -> None:
         record = self._require_batch(event.batch_id)
+        self._require_batch_time(record, event.occurred_at)
         if record.job_ids or record.terminal_event is not None:
             raise TrackingError("invalid batch transition")
-        if not event.job_ids:
-            raise TrackingError("batch must contain jobs")
-        if len(event.job_ids) != len(set(event.job_ids)):
-            raise TrackingError("batch jobs must be unique")
+        if not record.pending_job_ids or event.job_ids != record.pending_job_ids:
+            raise TrackingError("batch jobs do not match queued jobs")
         for job_id in event.job_ids:
             job = self._jobs.get(job_id)
             if job is None:
@@ -247,6 +268,7 @@ class JobTracker:
             if job.batch_id != event.batch_id:
                 raise TrackingError("job does not belong to batch")
         record.job_ids = event.job_ids
+        record.pending_job_ids = ()
         record.skipped_entries = event.skipped_entries
         record.updated_at = event.occurred_at
 
@@ -258,7 +280,8 @@ class JobTracker:
             if record.terminal_event == event:
                 return
             raise TrackingError("conflicting batch terminal event")
-        if record.job_ids:
+        self._require_batch_time(record, event.occurred_at)
+        if record.job_ids or record.pending_job_ids:
             raise TrackingError("invalid batch transition")
         record.error = event.error
         record.terminal_event = event
@@ -294,6 +317,16 @@ class JobTracker:
             return True
         raise InvalidJobTransition("conflicting job terminal event")
 
+    @staticmethod
+    def _require_job_time(record: _JobRecord, occurred_at: datetime) -> None:
+        if occurred_at < record.updated_at:
+            raise InvalidJobTransition("stale job event")
+
+    @staticmethod
+    def _require_batch_time(record: _BatchRecord, occurred_at: datetime) -> None:
+        if occurred_at < record.updated_at:
+            raise TrackingError("stale batch event")
+
     def _advance(self, record: _JobRecord, occurred_at: datetime) -> None:
         record.updated_at = occurred_at
         self._touch_batch(record, occurred_at)
@@ -302,7 +335,7 @@ class JobTracker:
         if job.batch_id is None:
             return
         batch = self._batches[job.batch_id]
-        batch.updated_at = occurred_at
+        batch.updated_at = max(batch.updated_at, occurred_at)
 
     @staticmethod
     def _derive_batch_status(

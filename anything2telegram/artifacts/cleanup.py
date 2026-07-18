@@ -1,14 +1,9 @@
-from typing import Protocol
-
+from ..bus import EventBus
 from ..events import (
     ARTIFACT_PRODUCTION_FAILED,
     ARTIFACT_UPLOADED,
     ARTIFACT_UPLOAD_FAILED,
 )
-
-
-class EventBus(Protocol):
-    def on(self, event: str, handler: object) -> object: ...
 
 
 class ArtifactCleanup:

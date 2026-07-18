@@ -46,6 +46,7 @@ from anything2telegram.jobs.tracker import (
 NOW = datetime(2026, 7, 19, 8, 30, tzinfo=UTC)
 JOB_1 = UUID("10000000-0000-0000-0000-000000000001")
 JOB_2 = UUID("10000000-0000-0000-0000-000000000002")
+JOB_3 = UUID("10000000-0000-0000-0000-000000000003")
 BATCH = UUID("20000000-0000-0000-0000-000000000001")
 ARTIFACT_1 = UUID("30000000-0000-0000-0000-000000000001")
 ARTIFACT_2 = UUID("30000000-0000-0000-0000-000000000002")
@@ -194,9 +195,6 @@ def move_job(
 ) -> int:
     if status is JobStatus.WAITING:
         return step
-    if status is JobStatus.UPLOADING:
-        emit_valid(bus, errors, JOB_STARTED, JobStarted(job_id, JobPhase.UPLOADING, time(step)))
-        return step + 1
     emit_valid(bus, errors, JOB_STARTED, JobStarted(job_id, JobPhase.PRODUCING, time(step)))
     step += 1
     if status is JobStatus.PRODUCING:
@@ -217,6 +215,8 @@ def move_job(
         ready(job_id, artifact_id=artifact_id, occurred_at=time(step)),
     )
     step += 1
+    if status is JobStatus.UPLOADING:
+        return step
     if status is JobStatus.COMPLETED:
         emit_valid(
             bus,
@@ -366,6 +366,61 @@ def test_staged_job_success_lifecycle_confirms_artifact_ready(tracked_bus) -> No
     assert snapshot.updated_at == time(3)
 
 
+@pytest.mark.parametrize("is_staged", [False, True])
+def test_exact_duplicate_artifact_ready_is_idempotent(tracked_bus, is_staged) -> None:
+    tracker, bus, errors = tracked_bus
+    queued = staged_queued() if is_staged else youtube_queued()
+    phase = JobPhase.UPLOADING if is_staged else JobPhase.PRODUCING
+    event = ready(occurred_at=time(2))
+    emit_valid(bus, errors, JOB_QUEUED, queued)
+    emit_valid(bus, errors, JOB_STARTED, JobStarted(JOB_1, phase, time(1)))
+    emit_valid(bus, errors, ARTIFACT_READY, event)
+    first = tracker.get_job(JOB_1)
+
+    emit_valid(bus, errors, ARTIFACT_READY, event)
+    assert tracker.get_job(JOB_1) == first
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"artifact_id": ARTIFACT_2},
+        {"local_path": Path("/private/artifacts/other.mp4")},
+        {"filename": "other.mp4"},
+        {"media_type": "application/octet-stream"},
+        {"size_bytes": 124},
+        {"caption": "Other"},
+        {"occurred_at": time(3)},
+    ],
+)
+@pytest.mark.parametrize("is_staged", [False, True])
+def test_changed_second_artifact_ready_is_invalid(
+    tracked_bus, changes, is_staged
+) -> None:
+    tracker, bus, errors = tracked_bus
+    event = ready(occurred_at=time(2))
+    queued = staged_queued() if is_staged else youtube_queued()
+    phase = JobPhase.UPLOADING if is_staged else JobPhase.PRODUCING
+    emit_valid(bus, errors, JOB_QUEUED, queued)
+    emit_valid(
+        bus,
+        errors,
+        JOB_STARTED,
+        JobStarted(JOB_1, phase, time(1)),
+    )
+    emit_valid(bus, errors, ARTIFACT_READY, event)
+    first = tracker.get_job(JOB_1)
+
+    emit_invalid(
+        bus,
+        errors,
+        ARTIFACT_READY,
+        replace(event, **changes),
+        InvalidJobTransition,
+    )
+    assert tracker.get_job(JOB_1) == first
+
+
 @pytest.mark.parametrize(
     ("topic", "event"),
     [
@@ -424,6 +479,28 @@ def test_job_started_only_accepts_waiting_job(tracked_bus) -> None:
     assert tracker.get_job(JOB_1).status is JobStatus.PRODUCING  # type: ignore[union-attr]
 
 
+@pytest.mark.parametrize(
+    ("queued", "phase"),
+    [
+        (youtube_queued(), JobPhase.UPLOADING),
+        (staged_queued(), JobPhase.PRODUCING),
+    ],
+)
+def test_job_started_rejects_phase_for_wrong_source(tracked_bus, queued, phase) -> None:
+    tracker, bus, errors = tracked_bus
+    emit_valid(bus, errors, JOB_QUEUED, queued)
+    before = tracker.get_job(JOB_1)
+
+    emit_invalid(
+        bus,
+        errors,
+        JOB_STARTED,
+        JobStarted(JOB_1, phase, time(1)),
+        InvalidJobTransition,
+    )
+    assert tracker.get_job(JOB_1) == before
+
+
 @pytest.mark.parametrize("phase", [JobPhase.PRODUCING, JobPhase.UPLOADING])
 @pytest.mark.parametrize(
     "status",
@@ -446,19 +523,10 @@ def test_job_started_rejects_uploading_and_terminal_jobs(
     assert tracker.get_job(JOB_1) == before
 
 
-def test_artifact_ready_only_accepts_producing_or_staged_uploading_job(tracked_bus) -> None:
+def test_artifact_ready_rejects_waiting_job(tracked_bus) -> None:
     tracker, bus, errors = tracked_bus
     emit_valid(bus, errors, JOB_QUEUED, youtube_queued())
     emit_invalid(bus, errors, ARTIFACT_READY, ready(), InvalidJobTransition)
-
-    emit_valid(bus, errors, JOB_STARTED, JobStarted(JOB_1, JobPhase.UPLOADING, time(1)))
-    emit_invalid(
-        bus,
-        errors,
-        ARTIFACT_READY,
-        ready(occurred_at=time(2)),
-        InvalidJobTransition,
-    )
     assert tracker.get_job(JOB_1).artifact_id is None  # type: ignore[union-attr]
 
 
@@ -489,20 +557,6 @@ def test_staged_artifact_ready_rejects_mismatched_artifact(tracked_bus) -> None:
         ready(artifact_id=ARTIFACT_2, occurred_at=time(2)),
     )
 
-    assert tracker.get_job(JOB_1).artifact_id == ARTIFACT_1  # type: ignore[union-attr]
-
-
-def test_staged_artifact_must_match_even_after_producing_start(tracked_bus) -> None:
-    tracker, bus, errors = tracked_bus
-    emit_valid(bus, errors, JOB_QUEUED, staged_queued())
-    emit_valid(bus, errors, JOB_STARTED, JobStarted(JOB_1, JobPhase.PRODUCING, time(1)))
-
-    emit_invalid(
-        bus,
-        errors,
-        ARTIFACT_READY,
-        ready(artifact_id=ARTIFACT_2, occurred_at=time(2)),
-    )
     assert tracker.get_job(JOB_1).artifact_id == ARTIFACT_1  # type: ignore[union-attr]
 
 
@@ -798,6 +852,129 @@ def test_batch_attachment_requires_jobs_matching_batch(tracked_bus) -> None:
     assert tracker.get_batch(BATCH).job_ids == ()  # type: ignore[union-attr]
 
 
+@pytest.mark.parametrize(
+    "attached_ids",
+    [(JOB_1,), (JOB_2, JOB_1), (JOB_1, JOB_2, JOB_3)],
+    ids=["omission", "reordered", "extra"],
+)
+def test_batch_attachment_must_exactly_match_pending_jobs_in_order(
+    tracked_bus, attached_ids
+) -> None:
+    tracker, bus, errors = tracked_bus
+    emit_valid(
+        bus,
+        errors,
+        BATCH_CREATED,
+        BatchCreated(BATCH, "https://example.test/playlist", time(0)),
+    )
+    emit_valid(
+        bus,
+        errors,
+        JOB_QUEUED,
+        youtube_queued(JOB_1, batch_id=BATCH, occurred_at=time(1)),
+    )
+    emit_valid(
+        bus,
+        errors,
+        JOB_QUEUED,
+        youtube_queued(JOB_2, batch_id=BATCH, occurred_at=time(2)),
+    )
+
+    emit_invalid(
+        bus,
+        errors,
+        BATCH_JOBS_CREATED,
+        BatchJobsCreated(BATCH, attached_ids, 0, time(3)),
+    )
+    assert tracker.get_batch(BATCH).job_ids == ()  # type: ignore[union-attr]
+    emit_valid(
+        bus,
+        errors,
+        BATCH_JOBS_CREATED,
+        BatchJobsCreated(BATCH, (JOB_1, JOB_2), 0, time(4)),
+    )
+
+
+def test_batched_job_cannot_be_queued_after_batch_attachment(tracked_bus) -> None:
+    tracker, bus, errors = tracked_bus
+    create_batch_and_jobs(bus, errors)
+
+    emit_invalid(
+        bus,
+        errors,
+        JOB_QUEUED,
+        youtube_queued(JOB_3, batch_id=BATCH, occurred_at=time(4)),
+    )
+    assert tracker.get_job(JOB_3) is None
+
+
+def test_batched_job_cannot_be_queued_after_expansion_failure(tracked_bus) -> None:
+    tracker, bus, errors = tracked_bus
+    emit_valid(
+        bus,
+        errors,
+        BATCH_CREATED,
+        BatchCreated(BATCH, "https://example.test/playlist", time(0)),
+    )
+    emit_valid(
+        bus,
+        errors,
+        YOUTUBE_PLAYLIST_EXPANSION_FAILED,
+        PlaylistExpansionFailed(BATCH, DOWNLOAD_ERROR, time(1)),
+    )
+
+    emit_invalid(
+        bus,
+        errors,
+        JOB_QUEUED,
+        youtube_queued(JOB_1, batch_id=BATCH, occurred_at=time(2)),
+    )
+    assert tracker.get_job(JOB_1) is None
+
+
+def test_expansion_failure_rejects_already_queued_pending_child(tracked_bus) -> None:
+    tracker, bus, errors = tracked_bus
+    emit_valid(
+        bus,
+        errors,
+        BATCH_CREATED,
+        BatchCreated(BATCH, "https://example.test/playlist", time(0)),
+    )
+    emit_valid(
+        bus,
+        errors,
+        JOB_QUEUED,
+        youtube_queued(JOB_1, batch_id=BATCH, occurred_at=time(1)),
+    )
+
+    emit_invalid(
+        bus,
+        errors,
+        YOUTUBE_PLAYLIST_EXPANSION_FAILED,
+        PlaylistExpansionFailed(BATCH, DOWNLOAD_ERROR, time(2)),
+    )
+    assert tracker.get_batch(BATCH).status is BatchStatus.EXPANDING  # type: ignore[union-attr]
+
+
+def test_batched_job_timestamp_cannot_predate_batch(tracked_bus) -> None:
+    tracker, bus, errors = tracked_bus
+    emit_valid(
+        bus,
+        errors,
+        BATCH_CREATED,
+        BatchCreated(BATCH, "https://example.test/playlist", time(2)),
+    )
+
+    emit_invalid(
+        bus,
+        errors,
+        JOB_QUEUED,
+        youtube_queued(JOB_1, batch_id=BATCH, occurred_at=time(1)),
+    )
+    assert tracker.get_job(JOB_1) is None
+    assert tracker.get_batch(BATCH).updated_at == time(2)  # type: ignore[union-attr]
+
+
 def test_batch_attachment_is_only_allowed_while_expanding(tracked_bus) -> None:
     tracker, bus, errors = tracked_bus
     create_batch_and_jobs(bus, errors)
@@ -949,6 +1126,105 @@ def test_batch_updated_at_advances_for_each_attached_child_event(tracked_bus) ->
     emit_valid(bus, errors, ARTIFACT_READY, ready(occurred_at=time(5)))
     assert tracker.get_batch(BATCH).updated_at == time(5)  # type: ignore[union-attr]
     emit_valid(bus, errors, ARTIFACT_UPLOADED, uploaded(occurred_at=time(6)))
+    assert tracker.get_batch(BATCH).updated_at == time(6)  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize(
+    ("status", "topic", "event"),
+    [
+        (
+            JobStatus.WAITING,
+            JOB_STARTED,
+            JobStarted(JOB_1, JobPhase.PRODUCING, time(-1)),
+        ),
+        (JobStatus.PRODUCING, ARTIFACT_READY, ready(occurred_at=time(0))),
+        (
+            JobStatus.PRODUCING,
+            ARTIFACT_PRODUCTION_FAILED,
+            ArtifactProductionFailed(JOB_1, None, DOWNLOAD_ERROR, time(0)),
+        ),
+        (JobStatus.UPLOADING, ARTIFACT_UPLOADED, uploaded(occurred_at=time(1))),
+        (
+            JobStatus.UPLOADING,
+            ARTIFACT_UPLOAD_FAILED,
+            ArtifactUploadFailed(JOB_1, ARTIFACT_1, UPLOAD_ERROR, time(1)),
+        ),
+    ],
+)
+def test_job_lifecycle_rejects_stale_nonduplicate_events(
+    tracked_bus, status, topic, event
+) -> None:
+    tracker, bus, errors = tracked_bus
+    create_job_at_status(bus, errors, status)
+    before = tracker.get_job(JOB_1)
+
+    emit_invalid(bus, errors, topic, event, InvalidJobTransition)
+    assert tracker.get_job(JOB_1) == before
+
+
+def test_batch_attachment_rejects_timestamp_older_than_pending_child(
+    tracked_bus,
+) -> None:
+    tracker, bus, errors = tracked_bus
+    emit_valid(
+        bus,
+        errors,
+        BATCH_CREATED,
+        BatchCreated(BATCH, "https://example.test/playlist", time(0)),
+    )
+    emit_valid(
+        bus,
+        errors,
+        JOB_QUEUED,
+        youtube_queued(JOB_1, batch_id=BATCH, occurred_at=time(2)),
+    )
+
+    emit_invalid(
+        bus,
+        errors,
+        BATCH_JOBS_CREATED,
+        BatchJobsCreated(BATCH, (JOB_1,), 0, time(1)),
+    )
+    assert tracker.get_batch(BATCH).updated_at == time(2)  # type: ignore[union-attr]
+    assert tracker.get_batch(BATCH).job_ids == ()  # type: ignore[union-attr]
+
+
+def test_expansion_failure_rejects_timestamp_older_than_batch(tracked_bus) -> None:
+    tracker, bus, errors = tracked_bus
+    emit_valid(
+        bus,
+        errors,
+        BATCH_CREATED,
+        BatchCreated(BATCH, "https://example.test/playlist", time(2)),
+    )
+
+    emit_invalid(
+        bus,
+        errors,
+        YOUTUBE_PLAYLIST_EXPANSION_FAILED,
+        PlaylistExpansionFailed(BATCH, DOWNLOAD_ERROR, time(1)),
+    )
+    assert tracker.get_batch(BATCH).updated_at == time(2)  # type: ignore[union-attr]
+    assert tracker.get_batch(BATCH).status is BatchStatus.EXPANDING  # type: ignore[union-attr]
+
+
+def test_batch_freshness_never_regresses_across_children(tracked_bus) -> None:
+    tracker, bus, errors = tracked_bus
+    create_batch_and_jobs(bus, errors)
+    emit_valid(
+        bus,
+        errors,
+        JOB_STARTED,
+        JobStarted(JOB_1, JobPhase.PRODUCING, time(6)),
+    )
+    emit_valid(
+        bus,
+        errors,
+        JOB_STARTED,
+        JobStarted(JOB_2, JobPhase.PRODUCING, time(5)),
+    )
+
+    assert tracker.get_job(JOB_2).updated_at == time(5)  # type: ignore[union-attr]
     assert tracker.get_batch(BATCH).updated_at == time(6)  # type: ignore[union-attr]
 
 

@@ -321,6 +321,20 @@ def test_batch_snapshot_exposes_job_ids_in_order() -> None:
     assert not hasattr(snapshot, "ordered_job_ids")
 
 
+def test_batch_snapshot_total_jobs_must_match_job_ids() -> None:
+    snapshot = _valid_domain_value(BatchSnapshot)
+
+    with pytest.raises(ValueError, match="total_jobs"):
+        replace(snapshot, total_jobs=2)
+
+
+def test_batch_snapshot_status_counts_must_sum_to_total_jobs() -> None:
+    snapshot = _valid_domain_value(BatchSnapshot)
+
+    with pytest.raises(ValueError, match="counts"):
+        replace(snapshot, waiting=0)
+
+
 @pytest.mark.parametrize(
     ("event", "expected_ids"),
     [case for case in _event_cases() if not isinstance(case[0], DownloadTarget)],
