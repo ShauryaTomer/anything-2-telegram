@@ -46,11 +46,14 @@ class YouTubeProcessRunner:
         stdout_task = asyncio.create_task(self._read_bounded(process.stdout))
         stderr_task = asyncio.create_task(self._read_bounded(process.stderr))
         wait_task = asyncio.create_task(process.wait())
+        process_group_id = process.pid
         try:
-            try:
-                await asyncio.wait_for(asyncio.shield(wait_task), timeout_seconds)
-            except TimeoutError:
-                await self._terminate(process, wait_task)
+            _, pending = await asyncio.wait(
+                (wait_task, stdout_task, stderr_task),
+                timeout=timeout_seconds,
+            )
+            if pending:
+                await self._terminate(process_group_id, wait_task)
                 raise ProcessTimeoutError() from None
             stdout, stdout_count = await stdout_task
             _, stderr_count = await stderr_task
@@ -60,16 +63,26 @@ class YouTubeProcessRunner:
                 self._safe_stderr_summary(stderr_count),
             )
         except asyncio.CancelledError:
-            await self._cleanup_after_interrupt(process, wait_task)
+            await self._cleanup_after_interrupt(process_group_id, wait_task)
+            raise
+        except ProcessTimeoutError:
             raise
         except BaseException:
-            await self._cleanup_after_interrupt(process, wait_task)
+            await self._cleanup_after_interrupt(process_group_id, wait_task)
             raise
         finally:
             for task in (stdout_task, stderr_task):
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            done, _ = await asyncio.wait(
+                (stdout_task, stderr_task),
+                timeout=max(self._shutdown_grace_seconds, 0.1),
+            )
+            for task in done:
+                try:
+                    task.exception()
+                except asyncio.CancelledError:
+                    pass
 
     async def _read_bounded(
         self, stream: asyncio.StreamReader | None
@@ -87,25 +100,23 @@ class YouTubeProcessRunner:
             if remaining > 0:
                 stored.extend(chunk[:remaining])
 
-    async def _cleanup_after_interrupt(self, process, wait_task: asyncio.Task) -> None:
-        cleanup = asyncio.create_task(self._terminate(process, wait_task))
+    async def _cleanup_after_interrupt(
+        self, process_group_id: int, wait_task: asyncio.Task
+    ) -> None:
+        cleanup = asyncio.create_task(
+            self._terminate(process_group_id, wait_task)
+        )
         try:
             await asyncio.shield(cleanup)
         except asyncio.CancelledError:
             await cleanup
 
-    async def _terminate(self, process, wait_task: asyncio.Task) -> None:
-        if process.returncode is None:
-            self._signal_group(process.pid, signal.SIGTERM)
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(wait_task), self._shutdown_grace_seconds
-            )
-            return
-        except TimeoutError:
-            pass
-        if process.returncode is None:
-            self._signal_group(process.pid, signal.SIGKILL)
+    async def _terminate(
+        self, process_group_id: int, wait_task: asyncio.Task
+    ) -> None:
+        self._signal_group(process_group_id, signal.SIGTERM)
+        await asyncio.sleep(self._shutdown_grace_seconds)
+        self._signal_group(process_group_id, signal.SIGKILL)
         await asyncio.shield(wait_task)
 
     @staticmethod
