@@ -83,7 +83,10 @@ async def test_timeout_terminates_group_then_kills_and_reaps(monkeypatch) -> Non
     with pytest.raises(ProcessTimeoutError):
         await YouTubeProcessRunner(shutdown_grace_seconds=0).run(["yt-dlp"], 0.001)
 
-    assert calls == [(4321, signal.SIGTERM), (4321, signal.SIGKILL)]
+    assert [call for call in calls if call[1] != 0] == [
+        (4321, signal.SIGTERM),
+        (4321, signal.SIGKILL),
+    ]
     assert process.returncode == -signal.SIGKILL
 
 
@@ -97,7 +100,10 @@ async def test_cancellation_cleans_process_group_and_reraises(monkeypatch) -> No
 
     def killpg(pid, sig):
         calls.append(sig)
-        process.finish(-sig)
+        if sig == signal.SIGTERM:
+            process.finish(-sig)
+        elif sig == 0:
+            raise ProcessLookupError
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
     monkeypatch.setattr(os, "killpg", killpg)
@@ -107,7 +113,7 @@ async def test_cancellation_cleans_process_group_and_reraises(monkeypatch) -> No
 
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert calls == [signal.SIGTERM, signal.SIGKILL]
+    assert calls == [signal.SIGTERM, 0]
     assert process.returncode is not None
 
 
@@ -153,7 +159,7 @@ async def test_timeout_kills_group_when_leader_exits_but_descendant_holds_pipes(
         if sig == signal.SIGTERM:
             process.returncode = 0
             process._done.set()
-        else:
+        elif sig == signal.SIGKILL:
             process.stdout.feed_eof()
             process.stderr.feed_eof()
 
@@ -167,4 +173,6 @@ async def test_timeout_kills_group_when_leader_exits_but_descendant_holds_pipes(
             ),
             0.1,
         )
-    assert calls == [signal.SIGTERM, signal.SIGKILL]
+    assert calls[0] == signal.SIGTERM
+    assert 0 in calls
+    assert calls[-1] == signal.SIGKILL

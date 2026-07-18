@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import os
 import signal
 from collections.abc import Sequence
@@ -114,17 +115,51 @@ class YouTubeProcessRunner:
     async def _terminate(
         self, process_group_id: int, wait_task: asyncio.Task
     ) -> None:
-        self._signal_group(process_group_id, signal.SIGTERM)
-        await asyncio.sleep(self._shutdown_grace_seconds)
-        self._signal_group(process_group_id, signal.SIGKILL)
+        if not self._signal_group(process_group_id, signal.SIGTERM):
+            await asyncio.shield(wait_task)
+            return
+        if await self._group_survives_grace(process_group_id):
+            self._signal_group(process_group_id, signal.SIGKILL)
         await asyncio.shield(wait_task)
 
     @staticmethod
-    def _signal_group(pid: int, sig: signal.Signals) -> None:
+    def _signal_group(pid: int, sig: signal.Signals) -> bool:
         try:
             os.killpg(pid, sig)
-        except ProcessLookupError:
-            pass
+            return True
+        except OSError as error:
+            if (
+                isinstance(error, ProcessLookupError)
+                or error.errno == errno.ESRCH
+            ):
+                return False
+            raise
+
+    async def _group_survives_grace(self, process_group_id: int) -> bool:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._shutdown_grace_seconds
+        while True:
+            if not self._group_exists(process_group_id):
+                return False
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return True
+            await asyncio.sleep(min(0.05, remaining))
+
+    @staticmethod
+    def _group_exists(process_group_id: int) -> bool:
+        try:
+            os.killpg(process_group_id, 0)
+            return True
+        except OSError as error:
+            if (
+                isinstance(error, ProcessLookupError)
+                or error.errno == errno.ESRCH
+            ):
+                return False
+            if error.errno == errno.EPERM:
+                return True
+            raise
 
     @staticmethod
     def _safe_stderr_summary(byte_count: int) -> str:
