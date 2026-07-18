@@ -26,6 +26,7 @@ _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _DIRECTORY_FLAGS = os.O_RDONLY | _NOFOLLOW | _DIRECTORY
 _FILE_CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW
+_FILE_READ_FLAGS = os.O_RDONLY | os.O_NONBLOCK | _NOFOLLOW
 
 _ERROR_MESSAGES = {
     "invalid_filename": "Artifact filename is invalid",
@@ -156,6 +157,65 @@ class ArtifactStorage:
             size_bytes,
             reservation.caption,
         )
+
+    def validate_staged_artifact(
+        self,
+        staged: StagedArtifact,
+        expected_identity: tuple[int, int] | None = None,
+    ) -> tuple[int, int]:
+        if not isinstance(staged, StagedArtifact):
+            raise _error("invalid_reservation")
+        if expected_identity is not None and (
+            not isinstance(expected_identity, tuple)
+            or len(expected_identity) != 2
+            or not all(type(value) is int for value in expected_identity)
+        ):
+            raise _error("invalid_reservation")
+        reservation = UploadReservation(
+            staged.job_id,
+            staged.artifact_id,
+            staged.local_path,
+            staged.filename,
+            staged.media_type,
+            staged.caption,
+        )
+        self._validate_reservation(reservation)
+        job_name = str(staged.job_id)
+        artifact_name = str(staged.artifact_id)
+        with self._owned_root_fd() as root_fd, ExitStack() as stack:
+            job_fd = self._stage_directory_fd(root_fd, job_name)
+            stack.callback(os.close, job_fd)
+            artifact_fd = self._stage_directory_fd(job_fd, artifact_name)
+            stack.callback(os.close, artifact_fd)
+            try:
+                leaf_fd = os.open(
+                    staged.filename,
+                    _FILE_READ_FLAGS,
+                    dir_fd=artifact_fd,
+                )
+            except OSError:
+                raise _error("invalid_reservation") from None
+            stack.callback(os.close, leaf_fd)
+            leaf_stat = self._secure_file_fd(leaf_fd, "invalid_reservation")
+            self._require_tree_unchanged(
+                root_fd,
+                job_name,
+                job_fd,
+                artifact_name,
+                artifact_fd,
+                staged.filename,
+                leaf_fd,
+            )
+            identity = (leaf_stat.st_dev, leaf_stat.st_ino)
+            if (
+                leaf_stat.st_size != staged.size_bytes
+                or (
+                    expected_identity is not None
+                    and identity != expected_identity
+                )
+            ):
+                raise _error("invalid_reservation")
+            return identity
 
     def delete_job_directory(self, job_id: UUID) -> None:
         self._require_uuid(job_id)

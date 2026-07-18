@@ -673,6 +673,43 @@ def test_delete_job_directory_is_idempotent(tmp_path: Path) -> None:
     assert not (storage.root / str(job_id)).exists()
 
 
+@pytest.mark.asyncio
+async def test_validate_staged_artifact_returns_stable_identity(
+    tmp_path: Path,
+) -> None:
+    storage = _storage(tmp_path)
+    reservation = storage.reserve(uuid4(), uuid4(), "video.mp4", None, None)
+    staged = await storage.stage(
+        ChunkedUpload([b"data"]), reservation, max_bytes=4
+    )
+
+    identity = storage.validate_staged_artifact(staged)
+
+    current = staged.local_path.stat()
+    assert identity == (current.st_dev, current.st_ino)
+    assert storage.validate_staged_artifact(staged, identity) == identity
+
+
+@pytest.mark.asyncio
+async def test_validate_staged_artifact_rejects_same_size_replacement(
+    tmp_path: Path,
+) -> None:
+    storage = _storage(tmp_path)
+    _, ArtifactStorageError, _, _ = _api()
+    reservation = storage.reserve(uuid4(), uuid4(), "video.mp4", None, None)
+    staged = await storage.stage(
+        ChunkedUpload([b"first"]), reservation, max_bytes=5
+    )
+    identity = storage.validate_staged_artifact(staged)
+    staged.local_path.unlink()
+    staged.local_path.write_bytes(b"other")
+
+    with pytest.raises(ArtifactStorageError) as raised:
+        storage.validate_staged_artifact(staged, identity)
+
+    assert raised.value.code == "invalid_reservation"
+
+
 def test_delete_job_directory_rejects_symlink(tmp_path: Path) -> None:
     storage = _storage(tmp_path)
     _, ArtifactStorageError, _, _ = _api()

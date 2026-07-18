@@ -1,5 +1,5 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
@@ -10,6 +10,7 @@ from anything2telegram.artifacts.storage import ArtifactStorage
 from anything2telegram.domain import (
     ErrorInfo,
     JobPhase,
+    JobStatus,
     SourceKind,
     StagedArtifact,
 )
@@ -43,6 +44,7 @@ from anything2telegram.events import (
     YouTubeDownloadRequested,
 )
 from anything2telegram.jobs.scheduler import JobScheduler, SchedulerError
+from anything2telegram.jobs.tracker import JobTracker
 
 
 NOW = datetime(2026, 7, 19, 8, 30, tzinfo=UTC)
@@ -51,11 +53,16 @@ JOB_2 = UUID("10000000-0000-0000-0000-000000000002")
 JOB_3 = UUID("10000000-0000-0000-0000-000000000003")
 BATCH = UUID("20000000-0000-0000-0000-000000000001")
 ARTIFACT_1 = UUID("30000000-0000-0000-0000-000000000001")
+ARTIFACT_2 = UUID("30000000-0000-0000-0000-000000000002")
 DOWNLOAD_ERROR = ErrorInfo("download_failed", "Download failed")
 
 
 async def flush_pump() -> None:
     await asyncio.sleep(0)
+
+
+def time(step: int) -> datetime:
+    return NOW + timedelta(seconds=step)
 
 
 async def test_youtube_submission_queues_before_deferred_start() -> None:
@@ -512,7 +519,7 @@ async def test_pause_keeps_active_owner_and_stop_prevents_future_start() -> None
 
 
 @pytest.mark.parametrize("topic", [ARTIFACT_UPLOADED, ARTIFACT_UPLOAD_FAILED])
-async def test_upload_terminal_events_advance_current_owner(topic: str) -> None:
+async def test_upload_terminal_events_advance_ready_owner(topic: str) -> None:
     bus = AsyncIOEventEmitter()
     scheduler = JobScheduler(
         bus,
@@ -522,6 +529,19 @@ async def test_upload_terminal_events_advance_current_owner(topic: str) -> None:
     scheduler.submit_youtube_video("https://example.test/watch?v=one")
     scheduler.submit_youtube_video("https://example.test/watch?v=two")
     await flush_pump()
+    bus.emit(
+        ARTIFACT_READY,
+        ArtifactReady(
+            JOB_1,
+            ARTIFACT_1,
+            Path("/private/artifacts/video.mp4"),
+            "video.mp4",
+            "video/mp4",
+            7,
+            None,
+            NOW,
+        ),
+    )
 
     if topic == ARTIFACT_UPLOADED:
         event = ArtifactUploaded(JOB_1, ARTIFACT_1, -100123, 77, NOW)
@@ -588,3 +608,360 @@ async def test_stop_from_synchronous_queued_listener_blocks_same_pump_start() ->
     assert scheduler.stopped
     assert scheduler.active_id is None
     assert scheduler.pending_count == 1
+
+
+@pytest.mark.parametrize("scheduler_first", [False, True])
+async def test_tracker_and_scheduler_reject_invalid_matching_terminals(
+    scheduler_first: bool,
+) -> None:
+    bus = AsyncIOEventEmitter()
+    tracker = JobTracker()
+    errors: list[Exception] = []
+    bus.on("error", errors.append)
+    ids = iter((JOB_1, JOB_2))
+    clock_values = iter(time(step) for step in range(12))
+
+    if scheduler_first:
+        scheduler = JobScheduler(
+            bus, id_factory=ids.__next__, clock=clock_values.__next__
+        )
+        tracker.register(bus)
+    else:
+        tracker.register(bus)
+        scheduler = JobScheduler(
+            bus, id_factory=ids.__next__, clock=clock_values.__next__
+        )
+
+    scheduler.submit_youtube_video("https://example.test/watch?v=one")
+    scheduler.submit_youtube_video("https://example.test/watch?v=two")
+    await flush_pump()
+
+    bus.emit(
+        ARTIFACT_PRODUCTION_FAILED,
+        ArtifactProductionFailed(JOB_1, None, DOWNLOAD_ERROR, time(1)),
+    )
+    await flush_pump()
+    assert scheduler.active_id == JOB_1
+    job = tracker.get_job(JOB_1)
+    assert job is not None
+    assert job.status is JobStatus.PRODUCING
+
+    bus.emit(
+        ARTIFACT_READY,
+        ArtifactReady(
+            JOB_1,
+            ARTIFACT_1,
+            Path("/private/artifacts/video.mp4"),
+            "video.mp4",
+            "video/mp4",
+            7,
+            None,
+            time(5),
+        ),
+    )
+    bus.emit(
+        ARTIFACT_PRODUCTION_FAILED,
+        ArtifactProductionFailed(JOB_1, ARTIFACT_1, DOWNLOAD_ERROR, time(6)),
+    )
+    bus.emit(
+        ARTIFACT_UPLOADED,
+        ArtifactUploaded(JOB_1, ARTIFACT_2, -100123, 77, time(7)),
+    )
+    await flush_pump()
+
+    assert scheduler.active_id == JOB_1
+    job = tracker.get_job(JOB_1)
+    assert job is not None
+    assert job.status is JobStatus.UPLOADING
+    assert len(errors) == 3
+
+    bus.emit(
+        ARTIFACT_UPLOADED,
+        ArtifactUploaded(JOB_1, ARTIFACT_1, -100123, 78, time(8)),
+    )
+    await flush_pump()
+
+    assert scheduler.active_id == JOB_2
+    job = tracker.get_job(JOB_1)
+    assert job is not None
+    assert job.status is JobStatus.COMPLETED
+
+
+async def test_cancel_unqueued_reservation_is_idempotent_and_cleans_storage(
+    tmp_path: Path,
+) -> None:
+    storage = ArtifactStorage(tmp_path / "artifacts")
+    scheduler = JobScheduler(
+        AsyncIOEventEmitter(),
+        storage,
+        id_factory=iter((JOB_1, ARTIFACT_1)).__next__,
+        clock=lambda: NOW,
+    )
+    reservation = scheduler.reserve_local_upload("video.mp4", None, None)
+    job_directory = storage.root / str(JOB_1)
+    assert job_directory.is_dir()
+
+    assert scheduler.cancel_local_upload(JOB_1)
+    assert not job_directory.exists()
+    assert not scheduler.cancel_local_upload(JOB_1)
+
+
+async def test_cancel_waiting_staged_upload_removes_queue_and_storage(
+    tmp_path: Path,
+) -> None:
+    bus = AsyncIOEventEmitter()
+    storage = ArtifactStorage(tmp_path / "artifacts")
+    scheduler = JobScheduler(
+        bus,
+        storage,
+        id_factory=iter((JOB_1, ARTIFACT_1)).__next__,
+        clock=lambda: NOW,
+    )
+    reservation = scheduler.reserve_local_upload("video.mp4", None, None)
+    reservation.destination.write_bytes(b"done")
+    scheduler.enqueue_reserved_upload(
+        StagedArtifact(
+            JOB_1,
+            ARTIFACT_1,
+            reservation.destination,
+            reservation.filename,
+            None,
+            4,
+            None,
+        )
+    )
+
+    assert scheduler.cancel_local_upload(JOB_1)
+    assert scheduler.pending_count == 0
+    assert not (storage.root / str(JOB_1)).exists()
+    await flush_pump()
+    assert scheduler.active_id is None
+
+
+async def test_stop_cleans_reserved_and_waiting_staged_uploads(
+    tmp_path: Path,
+) -> None:
+    bus = AsyncIOEventEmitter()
+    storage = ArtifactStorage(tmp_path / "artifacts")
+    scheduler = JobScheduler(
+        bus,
+        storage,
+        id_factory=iter(
+            (JOB_1, JOB_2, ARTIFACT_1, JOB_3, ARTIFACT_2)
+        ).__next__,
+        clock=lambda: NOW,
+    )
+    scheduler.submit_youtube_video("https://example.test/watch?v=active")
+    waiting = scheduler.reserve_local_upload("waiting.mp4", None, None)
+    waiting.destination.write_bytes(b"wait")
+    scheduler.enqueue_reserved_upload(
+        StagedArtifact(
+            JOB_2,
+            ARTIFACT_1,
+            waiting.destination,
+            waiting.filename,
+            None,
+            4,
+            None,
+        )
+    )
+    reserved = scheduler.reserve_local_upload("reserved.mp4", None, None)
+    await flush_pump()
+    assert scheduler.active_id == JOB_1
+
+    scheduler.stop()
+
+    assert scheduler.pending_count == 0
+    assert not (storage.root / str(JOB_2)).exists()
+    assert not (storage.root / str(JOB_3)).exists()
+    assert not scheduler.cancel_local_upload(JOB_3)
+    assert reserved.job_id == JOB_3
+
+
+async def test_cancel_and_stop_never_delete_active_staged_upload(
+    tmp_path: Path,
+) -> None:
+    bus = AsyncIOEventEmitter()
+    storage = ArtifactStorage(tmp_path / "artifacts")
+    scheduler = JobScheduler(
+        bus,
+        storage,
+        id_factory=iter((JOB_1, ARTIFACT_1)).__next__,
+        clock=lambda: NOW,
+    )
+    reservation = scheduler.reserve_local_upload("active.mp4", None, None)
+    reservation.destination.write_bytes(b"live")
+    scheduler.enqueue_reserved_upload(
+        StagedArtifact(
+            JOB_1,
+            ARTIFACT_1,
+            reservation.destination,
+            reservation.filename,
+            None,
+            4,
+            None,
+        )
+    )
+    await flush_pump()
+
+    assert not scheduler.cancel_local_upload(JOB_1)
+    scheduler.stop()
+
+    assert scheduler.active_id == JOB_1
+    assert reservation.destination.read_bytes() == b"live"
+
+
+async def test_playlist_derived_facts_respect_causal_time_during_clock_rollback(
+) -> None:
+    bus = AsyncIOEventEmitter()
+    tracker = JobTracker()
+    tracker.register(bus)
+    errors: list[Exception] = []
+    bus.on("error", errors.append)
+    clock_values = iter((time(10), time(9), time(5), time(1), time(0)))
+    scheduler = JobScheduler(
+        bus,
+        id_factory=iter((BATCH, JOB_1)).__next__,
+        clock=clock_values.__next__,
+    )
+    facts: list[object] = []
+    for topic in (
+        YOUTUBE_PLAYLIST_EXPANSION_REQUESTED,
+        JOB_QUEUED,
+        BATCH_JOBS_CREATED,
+        JOB_STARTED,
+        YOUTUBE_DOWNLOAD_REQUESTED,
+    ):
+        bus.on(topic, facts.append)
+
+    scheduler.submit_playlist_expansion("https://example.test/playlist")
+    await flush_pump()
+    bus.emit(
+        YOUTUBE_PLAYLIST_EXPANDED,
+        PlaylistExpanded(
+            BATCH,
+            (DownloadTarget("one", "https://example.test/watch?v=one"),),
+            0,
+            time(20),
+        ),
+    )
+    await flush_pump()
+
+    assert errors == []
+    job = tracker.get_job(JOB_1)
+    assert job is not None
+    assert job.status is JobStatus.PRODUCING
+    assert [event.occurred_at for event in facts] == [
+        time(10),
+        time(20),
+        time(20),
+        time(20),
+        time(20),
+    ]
+
+
+async def test_staged_start_and_ready_respect_queued_time_during_clock_rollback(
+    tmp_path: Path,
+) -> None:
+    bus = AsyncIOEventEmitter()
+    tracker = JobTracker()
+    tracker.register(bus)
+    errors: list[Exception] = []
+    bus.on("error", errors.append)
+    storage = ArtifactStorage(tmp_path / "artifacts")
+    scheduler = JobScheduler(
+        bus,
+        storage,
+        id_factory=iter((JOB_1, ARTIFACT_1)).__next__,
+        clock=iter((time(10), time(5), time(1))).__next__,
+    )
+    reservation = scheduler.reserve_local_upload("video.mp4", None, None)
+    reservation.destination.write_bytes(b"done")
+    starts: list[JobStarted] = []
+    ready_facts: list[ArtifactReady] = []
+    bus.on(JOB_STARTED, starts.append)
+    bus.on(ARTIFACT_READY, ready_facts.append)
+
+    scheduler.enqueue_reserved_upload(
+        StagedArtifact(
+            JOB_1,
+            ARTIFACT_1,
+            reservation.destination,
+            reservation.filename,
+            None,
+            4,
+            None,
+        )
+    )
+    await flush_pump()
+
+    assert errors == []
+    assert starts[0].occurred_at == time(10)
+    assert ready_facts[0].occurred_at == time(10)
+    job = tracker.get_job(JOB_1)
+    assert job is not None
+    assert job.status is JobStatus.UPLOADING
+
+
+async def test_staged_file_drift_fails_safely_without_artifact_ready(
+    tmp_path: Path,
+) -> None:
+    bus = AsyncIOEventEmitter()
+    tracker = JobTracker()
+    tracker.register(bus)
+    errors: list[Exception] = []
+    bus.on("error", errors.append)
+    storage = ArtifactStorage(tmp_path / "artifacts")
+    scheduler = JobScheduler(
+        bus,
+        storage,
+        id_factory=iter((JOB_1, JOB_2, ARTIFACT_1, JOB_3)).__next__,
+        clock=lambda: NOW,
+    )
+    ready_facts: list[ArtifactReady] = []
+    upload_failures: list[ArtifactUploadFailed] = []
+    bus.on(ARTIFACT_READY, ready_facts.append)
+    bus.on(ARTIFACT_UPLOAD_FAILED, upload_failures.append)
+
+    scheduler.submit_youtube_video("https://example.test/watch?v=active")
+    reservation = scheduler.reserve_local_upload("staged.mp4", None, None)
+    reservation.destination.write_bytes(b"first")
+    scheduler.enqueue_reserved_upload(
+        StagedArtifact(
+            JOB_2,
+            ARTIFACT_1,
+            reservation.destination,
+            reservation.filename,
+            None,
+            5,
+            None,
+        )
+    )
+    scheduler.submit_youtube_video("https://example.test/watch?v=later")
+    await flush_pump()
+    reservation.destination.unlink()
+    reservation.destination.write_bytes(b"other")
+
+    bus.emit(
+        ARTIFACT_PRODUCTION_FAILED,
+        ArtifactProductionFailed(JOB_1, None, DOWNLOAD_ERROR, NOW),
+    )
+    await flush_pump()
+
+    assert errors == []
+    assert [event for event in ready_facts if event.job_id == JOB_2] == []
+    assert upload_failures == [
+        ArtifactUploadFailed(
+            JOB_2,
+            ARTIFACT_1,
+            ErrorInfo("artifact_invalid", "Staged artifact is unavailable"),
+            NOW,
+        )
+    ]
+    job = tracker.get_job(JOB_2)
+    assert job is not None
+    assert job.status is JobStatus.FAILED
+    assert not (storage.root / str(JOB_2)).exists()
+
+    await flush_pump()
+    assert scheduler.active_id == JOB_3

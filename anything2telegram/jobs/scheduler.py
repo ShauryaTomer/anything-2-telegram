@@ -1,6 +1,4 @@
 import asyncio
-import os
-import stat
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -8,6 +6,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID, uuid4
 
+from ..artifacts.storage import ArtifactStorageError
 from ..bus import EventBus
 from ..domain import (
     ErrorInfo,
@@ -50,17 +49,21 @@ from ..events import (
 class _YouTubeWork:
     job_id: UUID
     source_url: str
+    causal_at: datetime
 
 
 @dataclass(frozen=True)
 class _PlaylistWork:
     batch_id: UUID
     source_url: str
+    causal_at: datetime
 
 
 @dataclass(frozen=True)
 class _StagedWork:
     staged: StagedArtifact
+    causal_at: datetime
+    identity: tuple[int, int]
 
     @property
     def job_id(self) -> UUID:
@@ -79,6 +82,14 @@ class _ReservationStorage(Protocol):
         media_type: str | None,
         caption: str | None,
     ) -> UploadReservation: ...
+
+    def delete_job_directory(self, job_id: UUID) -> None: ...
+
+    def validate_staged_artifact(
+        self,
+        staged: StagedArtifact,
+        expected_identity: tuple[int, int] | None = None,
+    ) -> tuple[int, int]: ...
 
 
 class SchedulerError(Exception):
@@ -103,11 +114,15 @@ class JobScheduler:
         self._clock = clock
         self._queue: deque[_Work] = deque()
         self._active: _Work | None = None
+        self._active_phase: JobPhase | None = None
+        self._active_artifact_id: UUID | None = None
+        self._active_causal_at: datetime | None = None
         self._deferred_facts: deque[tuple[str, object]] = deque()
         self._reservations: dict[UUID, UploadReservation] = {}
         self._pump_scheduled = False
         self._paused = False
         self._stopped = False
+        bus.on(ARTIFACT_READY, self._on_artifact_ready)
         bus.on(ARTIFACT_PRODUCTION_FAILED, self._on_job_terminal)
         bus.on(ARTIFACT_UPLOADED, self._on_job_terminal)
         bus.on(ARTIFACT_UPLOAD_FAILED, self._on_job_terminal)
@@ -145,15 +160,16 @@ class JobScheduler:
         self._require_accepting()
         self._require_source_url(source_url)
         job_id = self._id_factory()
+        occurred_at = self._clock()
         event = JobQueued(
             job_id,
             None,
             SourceKind.YOUTUBE,
             source_url,
             None,
-            self._clock(),
+            occurred_at,
         )
-        self._queue.append(_YouTubeWork(job_id, source_url))
+        self._queue.append(_YouTubeWork(job_id, source_url, occurred_at))
         self._bus.emit(JOB_QUEUED, event)
         self._request_pump()
         return job_id
@@ -163,8 +179,9 @@ class JobScheduler:
         self._require_accepting()
         self._require_source_url(source_url)
         batch_id = self._id_factory()
-        event = BatchCreated(batch_id, source_url, self._clock())
-        self._queue.append(_PlaylistWork(batch_id, source_url))
+        occurred_at = self._clock()
+        event = BatchCreated(batch_id, source_url, occurred_at)
+        self._queue.append(_PlaylistWork(batch_id, source_url, occurred_at))
         self._bus.emit(BATCH_CREATED, event)
         self._request_pump()
         return batch_id
@@ -210,32 +227,28 @@ class JobScheduler:
             raise SchedulerError(
                 "invalid_reservation", "Upload reservation does not match"
             )
-        try:
-            staged_stat = staged.local_path.lstat()
-        except OSError:
-            raise SchedulerError(
-                "upload_not_staged", "Local upload has not been staged"
-            ) from None
-        if (
-            not stat.S_ISREG(staged_stat.st_mode)
-            or staged_stat.st_uid != os.getuid()
-            or staged_stat.st_nlink != 1
-            or staged_stat.st_size != staged.size_bytes
-        ):
+        if self._storage is None:
             raise SchedulerError(
                 "upload_not_staged", "Local upload has not been staged"
             )
+        try:
+            identity = self._storage.validate_staged_artifact(staged)
+        except ArtifactStorageError:
+            raise SchedulerError(
+                "upload_not_staged", "Local upload has not been staged"
+            ) from None
 
+        occurred_at = self._clock()
         event = JobQueued(
             staged.job_id,
             None,
             SourceKind.LOCAL_UPLOAD,
             staged.filename,
             staged,
-            self._clock(),
+            occurred_at,
         )
         del self._reservations[staged.job_id]
-        self._queue.append(_StagedWork(staged))
+        self._queue.append(_StagedWork(staged, occurred_at, identity))
         self._bus.emit(JOB_QUEUED, event)
         self._request_pump()
         return staged.job_id
@@ -248,6 +261,37 @@ class JobScheduler:
 
     def stop(self) -> None:
         self._stopped = True
+        for job_id in tuple(self._reservations):
+            self.cancel_local_upload(job_id)
+        for work in tuple(self._queue):
+            if isinstance(work, _StagedWork):
+                self.cancel_local_upload(work.job_id)
+
+    def cancel_local_upload(self, job_id: UUID) -> bool:
+        if not isinstance(job_id, UUID):
+            raise TypeError("job_id must be UUID")
+        if isinstance(self._active, _StagedWork) and self._active.job_id == job_id:
+            return False
+        if self._storage is None:
+            return False
+        reservation = self._reservations.get(job_id)
+        if reservation is not None:
+            self._storage.delete_job_directory(job_id)
+            del self._reservations[job_id]
+            return True
+        waiting = next(
+            (
+                work
+                for work in self._queue
+                if isinstance(work, _StagedWork) and work.job_id == job_id
+            ),
+            None,
+        )
+        if waiting is None:
+            return False
+        self._storage.delete_job_directory(job_id)
+        self._queue.remove(waiting)
+        return True
 
     def _require_accepting(self) -> None:
         if self._stopped:
@@ -276,15 +320,46 @@ class JobScheduler:
             self._active is None
             or isinstance(self._active, _PlaylistWork)
             or event.job_id != self._active.job_id
+            or self._active_causal_at is None
+            or event.occurred_at < self._active_causal_at
         ):
             return
-        self._active = None
+        if isinstance(event, ArtifactProductionFailed):
+            if self._active_phase is not JobPhase.PRODUCING:
+                return
+        elif (
+            self._active_phase is not JobPhase.UPLOADING
+            or event.artifact_id != self._active_artifact_id
+        ):
+            return
+        self._clear_active()
         self._request_pump()
+
+    def _on_artifact_ready(self, event: ArtifactReady) -> None:
+        if (
+            not isinstance(self._active, _YouTubeWork)
+            or self._active_phase is not JobPhase.PRODUCING
+            or event.job_id != self._active.job_id
+            or self._active_causal_at is None
+            or event.occurred_at < self._active_causal_at
+        ):
+            return
+        self._active_phase = JobPhase.UPLOADING
+        self._active_artifact_id = event.artifact_id
+        self._active_causal_at = event.occurred_at
+
+    def _clear_active(self) -> None:
+        self._active = None
+        self._active_phase = None
+        self._active_artifact_id = None
+        self._active_causal_at = None
 
     def _on_playlist_expanded(self, event: PlaylistExpanded) -> None:
         if (
             not isinstance(self._active, _PlaylistWork)
             or event.batch_id != self._active.batch_id
+            or self._active_causal_at is None
+            or event.occurred_at < self._active_causal_at
         ):
             return
         unique_targets = []
@@ -295,7 +370,9 @@ class JobScheduler:
             seen_urls.add(target.source_url)
             unique_targets.append(target)
 
-        occurred_at = self._clock()
+        occurred_at = max(
+            self._clock(), event.occurred_at, self._active.causal_at
+        )
         if not unique_targets:
             self._deferred_facts.append(
                 (
@@ -310,11 +387,11 @@ class JobScheduler:
                     ),
                 )
             )
-            self._active = None
+            self._clear_active()
             self._request_pump()
             return
         children = [
-            _YouTubeWork(self._id_factory(), target.source_url)
+            _YouTubeWork(self._id_factory(), target.source_url, occurred_at)
             for target in unique_targets
         ]
         self._queue.extendleft(reversed(children))
@@ -343,7 +420,7 @@ class JobScheduler:
                 ),
             )
         )
-        self._active = None
+        self._clear_active()
         self._request_pump()
 
     def _on_playlist_expansion_failed(
@@ -352,9 +429,11 @@ class JobScheduler:
         if (
             not isinstance(self._active, _PlaylistWork)
             or event.batch_id != self._active.batch_id
+            or self._active_causal_at is None
+            or event.occurred_at < self._active_causal_at
         ):
             return
-        self._active = None
+        self._clear_active()
         self._request_pump()
 
     def _on_telegram_unavailable(self, event: TelegramUnavailable) -> None:
@@ -377,19 +456,57 @@ class JobScheduler:
         work = self._queue.popleft()
         self._active = work
         if isinstance(work, _PlaylistWork):
+            self._active_phase = None
+            self._active_artifact_id = None
+            occurred_at = self._at_or_after(work.causal_at)
+            self._active_causal_at = occurred_at
             self._bus.emit(
                 YOUTUBE_PLAYLIST_EXPANSION_REQUESTED,
                 PlaylistExpansionRequested(
-                    work.batch_id, work.source_url, self._clock()
+                    work.batch_id, work.source_url, occurred_at
                 ),
             )
             return
         if isinstance(work, _StagedWork):
             staged = work.staged
+            self._active_phase = JobPhase.UPLOADING
+            self._active_artifact_id = staged.artifact_id
+            started_at = self._at_or_after(work.causal_at)
+            self._active_causal_at = started_at
             self._bus.emit(
                 JOB_STARTED,
-                JobStarted(staged.job_id, JobPhase.UPLOADING, self._clock()),
+                JobStarted(staged.job_id, JobPhase.UPLOADING, started_at),
             )
+            ready_at = self._at_or_after(started_at)
+            self._active_causal_at = ready_at
+            try:
+                if self._storage is None:
+                    raise ArtifactStorageError(
+                        "invalid_reservation",
+                        "Upload reservation is invalid",
+                    )
+                self._storage.validate_staged_artifact(
+                    staged, work.identity
+                )
+            except ArtifactStorageError:
+                self._bus.emit(
+                    ARTIFACT_UPLOAD_FAILED,
+                    ArtifactUploadFailed(
+                        staged.job_id,
+                        staged.artifact_id,
+                        ErrorInfo(
+                            "artifact_invalid",
+                            "Staged artifact is unavailable",
+                        ),
+                        ready_at,
+                    ),
+                )
+                if self._storage is not None:
+                    try:
+                        self._storage.delete_job_directory(staged.job_id)
+                    except ArtifactStorageError:
+                        pass
+                return
             self._bus.emit(
                 ARTIFACT_READY,
                 ArtifactReady(
@@ -400,17 +517,26 @@ class JobScheduler:
                     staged.media_type,
                     staged.size_bytes,
                     staged.caption,
-                    self._clock(),
+                    ready_at,
                 ),
             )
             return
+        self._active_phase = JobPhase.PRODUCING
+        self._active_artifact_id = None
+        started_at = self._at_or_after(work.causal_at)
+        self._active_causal_at = started_at
         self._bus.emit(
             JOB_STARTED,
-            JobStarted(work.job_id, JobPhase.PRODUCING, self._clock()),
+            JobStarted(work.job_id, JobPhase.PRODUCING, started_at),
         )
+        requested_at = self._at_or_after(started_at)
+        self._active_causal_at = requested_at
         self._bus.emit(
             YOUTUBE_DOWNLOAD_REQUESTED,
             YouTubeDownloadRequested(
-                work.job_id, work.source_url, self._clock()
+                work.job_id, work.source_url, requested_at
             ),
         )
+
+    def _at_or_after(self, causal_at: datetime) -> datetime:
+        return max(self._clock(), causal_at)
