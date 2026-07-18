@@ -232,14 +232,18 @@ class UploadReservation:
 
 @dataclass(frozen=True)
 class ProcessResult:
-    returncode: int
+    exit_code: int
     stdout: str
     stderr_safe_summary: str
 
     def __post_init__(self) -> None:
-        _require_int(self.returncode, "returncode")
+        _require_int(self.exit_code, "exit_code")
         _require_type(self.stdout, str, "stdout")
         _require_type(self.stderr_safe_summary, str, "stderr_safe_summary")
+
+    @property
+    def returncode(self) -> int:
+        return self.exit_code
 
 
 @dataclass(frozen=True)
