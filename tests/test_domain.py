@@ -535,3 +535,119 @@ def test_negative_counts_and_sizes_are_rejected(factory) -> None:
 def test_blank_required_strings_are_rejected(factory) -> None:
     with pytest.raises(ValueError):
         factory()
+
+
+def _valid_domain_value(value_type: type) -> object:
+    return next(value for value in _domain_values() if isinstance(value, value_type))
+
+
+@pytest.mark.parametrize(
+    ("value", "changes"),
+    [
+        (ErrorInfo("code", "message"), {"code": 1}),
+        (_valid_domain_value(StagedArtifact), {"local_path": "/tmp/video.mp4"}),
+        (_valid_domain_value(JobSnapshot), {"error": "failure"}),
+        (_valid_domain_value(BatchSnapshot), {"error": "failure"}),
+        (_valid_domain_value(JobRef), {"id": "not-a-uuid"}),
+        (_valid_domain_value(BatchRef), {"status_url": 42}),
+        (_valid_domain_value(UploadReservation), {"caption": 42}),
+        (ProcessResult(0, "stdout", "stderr"), {"returncode": True}),
+        (TelegramUploadResult(-100, 1), {"message_id": 1.5}),
+    ],
+)
+def test_every_domain_class_rejects_a_malformed_field(
+    value: object, changes: dict[str, object]
+) -> None:
+    with pytest.raises(TypeError):
+        replace(value, **changes)
+
+
+@pytest.mark.parametrize(
+    ("value", "changes"),
+    [
+        (_valid_domain_value(StagedArtifact), {"filename": 7}),
+        (_valid_domain_value(StagedArtifact), {"media_type": 7}),
+        (_valid_domain_value(StagedArtifact), {"size_bytes": True}),
+        (_valid_domain_value(StagedArtifact), {"size_bytes": 1.5}),
+        (_valid_domain_value(StagedArtifact), {"caption": 7}),
+        (_valid_domain_value(JobSnapshot), {"filename": " "}),
+        (_valid_domain_value(JobSnapshot), {"filename": 7}),
+        (_valid_domain_value(JobSnapshot), {"size_bytes": True}),
+        (_valid_domain_value(JobSnapshot), {"telegram_message_id": 1.5}),
+        (_valid_domain_value(BatchSnapshot), {"skipped_entries": True}),
+        (_valid_domain_value(UploadReservation), {"destination": "/tmp/video"}),
+        (_valid_domain_value(UploadReservation), {"media_type": 7}),
+        (ProcessResult(0, "stdout", "stderr"), {"stdout": 7}),
+        (ProcessResult(0, "stdout", "stderr"), {"stderr_safe_summary": 7}),
+        (TelegramUploadResult(-100, 1), {"chat_id": True}),
+    ],
+)
+def test_domain_primitive_fields_enforce_exact_runtime_types(
+    value: object, changes: dict[str, object]
+) -> None:
+    expected_error = ValueError if changes.get("filename") == " " else TypeError
+    with pytest.raises(expected_error):
+        replace(value, **changes)
+
+
+def _event_of(value_type: type) -> object:
+    return next(value for value in _event_values() if isinstance(value, value_type))
+
+
+@pytest.mark.parametrize(
+    ("event", "changes"),
+    [
+        (_event_of(BatchCreated), {"source_url": 7}),
+        (_event_of(JobQueued), {"source": 7}),
+        (_event_of(JobStarted), {"phase": "producing"}),
+        (_event_of(BatchJobsCreated), {"skipped_entries": True}),
+        (_event_of(PlaylistExpansionRequested), {"source_url": 7}),
+        (DownloadTarget("id", "url"), {"source_id": 7}),
+        (_event_of(PlaylistExpanded), {"targets": []}),
+        (_event_of(PlaylistExpansionFailed), {"error": "failure"}),
+        (_event_of(YouTubeDownloadRequested), {"source_url": 7}),
+        (_event_of(ArtifactReady), {"local_path": "/tmp/video"}),
+        (_event_of(ArtifactProductionFailed), {"error": "failure"}),
+        (_event_of(ArtifactUploaded), {"telegram_chat_id": True}),
+        (_event_of(ArtifactUploadFailed), {"error": "failure"}),
+        (_event_of(TelegramUnavailable), {"error": "failure"}),
+    ],
+)
+def test_every_event_class_rejects_a_malformed_field(
+    event: object, changes: dict[str, object]
+) -> None:
+    with pytest.raises(TypeError):
+        replace(event, **changes)
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected_error"),
+    [
+        ({"filename": 7}, TypeError),
+        ({"media_type": 7}, TypeError),
+        ({"size_bytes": True}, TypeError),
+        ({"size_bytes": 1.5}, TypeError),
+        ({"caption": 7}, TypeError),
+        ({"filename": " "}, ValueError),
+    ],
+)
+def test_artifact_ready_enforces_all_artifact_field_contracts(
+    changes: dict[str, object], expected_error: type[Exception]
+) -> None:
+    with pytest.raises(expected_error):
+        replace(_event_of(ArtifactReady), **changes)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("telegram_chat_id", 1.5),
+        ("telegram_message_id", True),
+        ("telegram_message_id", 1.5),
+    ],
+)
+def test_artifact_uploaded_requires_strict_integer_telegram_ids(
+    field_name: str, invalid_value: object
+) -> None:
+    with pytest.raises(TypeError):
+        replace(_event_of(ArtifactUploaded), **{field_name: invalid_value})

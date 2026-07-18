@@ -1,7 +1,7 @@
 import math
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -14,8 +14,8 @@ class ConfigError(ValueError):
 @dataclass(frozen=True)
 class Settings:
     api_id: int
-    api_hash: str
-    bot_token: str
+    api_hash: str = field(repr=False)
+    bot_token: str = field(repr=False)
     channel_id: int
     session_path: Path
     cookies_path: Path | None
@@ -63,8 +63,6 @@ class Settings:
             _value(values, "TG_SESSION_PATH", "./yt2tg.session"),
             "TG_SESSION_PATH",
         )
-        session_path.parent.mkdir(parents=True, exist_ok=True)
-
         cookies_value = values.get("YTDLP_COOKIES_PATH", "./yt-cookies.txt")
         cookies_path = None
         if cookies_value and cookies_value.strip():
@@ -86,7 +84,7 @@ class Settings:
         ):
             raise ConfigError("ARTIFACT_ROOT points to an unsafe root")
 
-        return cls(
+        settings = cls(
             api_id=api_id,
             api_hash=api_hash,
             bot_token=bot_token,
@@ -115,6 +113,8 @@ class Settings:
                 default="30",
             ),
         )
+        _prepare_session_path(settings.session_path)
+        return settings
 
 
 def _required(values: Mapping[str, str], key: str) -> str:
@@ -163,3 +163,20 @@ def _path_from_base(base_dir: Path, value: str, key: str) -> Path:
     if not path.is_absolute():
         path = base_dir / path
     return Path(os.path.abspath(path))
+
+
+def _prepare_session_path(session_path: Path) -> None:
+    parent = session_path.parent
+    try:
+        parent_existed = parent.exists()
+        parent.mkdir(parents=True, exist_ok=True)
+        if not parent_existed:
+            parent.chmod(0o700)
+        if session_path.exists():
+            if not session_path.is_file():
+                raise OSError
+        else:
+            session_path.touch(mode=0o600, exist_ok=False)
+        session_path.chmod(0o600)
+    except OSError:
+        raise ConfigError("TG_SESSION_PATH could not be prepared") from None

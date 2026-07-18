@@ -32,12 +32,19 @@ class JobPhase(str, Enum):
     UPLOADING = "uploading"
 
 
-def _require_nonblank(value: str, field_name: str) -> None:
+def _require_nonblank(value: object, field_name: str) -> None:
+    _require_type(value, str, field_name)
     if not value.strip():
         raise ValueError(f"{field_name} must not be blank")
 
 
-def _require_nonnegative(value: int, field_name: str) -> None:
+def _require_int(value: object, field_name: str) -> None:
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be int")
+
+
+def _require_nonnegative(value: object, field_name: str) -> None:
+    _require_int(value, field_name)
     if value < 0:
         raise ValueError(f"{field_name} must not be negative")
 
@@ -50,6 +57,28 @@ def _require_type(value: object, expected_type: type, field_name: str) -> None:
 def _require_optional_uuid(value: object, field_name: str) -> None:
     if value is not None:
         _require_type(value, UUID, field_name)
+
+
+def _require_optional_type(
+    value: object, expected_type: type, field_name: str
+) -> None:
+    if value is not None:
+        _require_type(value, expected_type, field_name)
+
+
+def _require_optional_int(value: object, field_name: str) -> None:
+    if value is not None:
+        _require_int(value, field_name)
+
+
+def _require_optional_nonnegative(value: object, field_name: str) -> None:
+    if value is not None:
+        _require_nonnegative(value, field_name)
+
+
+def _require_optional_nonblank(value: object, field_name: str) -> None:
+    if value is not None:
+        _require_nonblank(value, field_name)
 
 
 def _require_uuid_tuple(value: object, field_name: str) -> None:
@@ -81,8 +110,11 @@ class StagedArtifact:
     def __post_init__(self) -> None:
         _require_type(self.job_id, UUID, "job_id")
         _require_type(self.artifact_id, UUID, "artifact_id")
+        _require_type(self.local_path, Path, "local_path")
         _require_nonblank(self.filename, "filename")
+        _require_optional_type(self.media_type, str, "media_type")
         _require_nonnegative(self.size_bytes, "size_bytes")
+        _require_optional_type(self.caption, str, "caption")
 
 
 @dataclass(frozen=True)
@@ -106,11 +138,13 @@ class JobSnapshot:
         _require_type(self.source_kind, SourceKind, "source_kind")
         _require_type(self.status, JobStatus, "status")
         _require_optional_uuid(self.artifact_id, "artifact_id")
+        _require_optional_nonblank(self.filename, "filename")
+        _require_optional_nonnegative(self.size_bytes, "size_bytes")
+        _require_optional_int(self.telegram_message_id, "telegram_message_id")
+        _require_optional_type(self.error, ErrorInfo, "error")
         _require_type(self.created_at, datetime, "created_at")
         _require_type(self.updated_at, datetime, "updated_at")
         _require_nonblank(self.source, "source")
-        if self.size_bytes is not None:
-            _require_nonnegative(self.size_bytes, "size_bytes")
 
 
 @dataclass(frozen=True)
@@ -128,10 +162,11 @@ class BatchSnapshot:
         _require_type(self.id, UUID, "id")
         _require_type(self.status, BatchStatus, "status")
         _require_uuid_tuple(self.job_ids, "job_ids")
+        _require_nonnegative(self.skipped_entries, "skipped_entries")
+        _require_optional_type(self.error, ErrorInfo, "error")
         _require_type(self.created_at, datetime, "created_at")
         _require_type(self.updated_at, datetime, "updated_at")
         _require_nonblank(self.source_url, "source_url")
-        _require_nonnegative(self.skipped_entries, "skipped_entries")
 
 
 @dataclass(frozen=True)
@@ -166,7 +201,10 @@ class UploadReservation:
     def __post_init__(self) -> None:
         _require_type(self.job_id, UUID, "job_id")
         _require_type(self.artifact_id, UUID, "artifact_id")
+        _require_type(self.destination, Path, "destination")
         _require_nonblank(self.filename, "filename")
+        _require_optional_type(self.media_type, str, "media_type")
+        _require_optional_type(self.caption, str, "caption")
 
 
 @dataclass(frozen=True)
@@ -175,8 +213,17 @@ class ProcessResult:
     stdout: str
     stderr_safe_summary: str
 
+    def __post_init__(self) -> None:
+        _require_int(self.returncode, "returncode")
+        _require_type(self.stdout, str, "stdout")
+        _require_type(self.stderr_safe_summary, str, "stderr_safe_summary")
+
 
 @dataclass(frozen=True)
 class TelegramUploadResult:
     chat_id: int
     message_id: int
+
+    def __post_init__(self) -> None:
+        _require_int(self.chat_id, "chat_id")
+        _require_int(self.message_id, "message_id")

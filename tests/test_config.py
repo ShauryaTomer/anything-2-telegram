@@ -1,3 +1,4 @@
+import stat
 from pathlib import Path
 
 import pytest
@@ -217,3 +218,79 @@ def test_settings_are_frozen(tmp_path: Path) -> None:
     settings = Settings.from_env(tmp_path, required_env())
     with pytest.raises(AttributeError):
         settings.api_id = 999  # type: ignore[misc]
+
+
+def test_settings_repr_redacts_telegram_secrets(tmp_path: Path) -> None:
+    api_hash = "highly-sensitive-api-hash"
+    bot_token = "highly-sensitive-bot-token"
+
+    settings = Settings.from_env(
+        tmp_path,
+        required_env(TG_API_HASH=api_hash, TG_BOT_TOKEN=bot_token),
+    )
+
+    assert api_hash not in repr(settings)
+    assert bot_token not in repr(settings)
+
+
+def test_invalid_later_config_does_not_mutate_session_filesystem(
+    tmp_path: Path,
+) -> None:
+    session_path = tmp_path / "new-private-parent" / "telegram.session"
+
+    with pytest.raises(ConfigError, match="MAX_ARTIFACT_BYTES"):
+        Settings.from_env(
+            tmp_path,
+            required_env(
+                TG_SESSION_PATH=str(session_path),
+                MAX_ARTIFACT_BYTES="invalid",
+            ),
+        )
+
+    assert not session_path.parent.exists()
+    assert not session_path.exists()
+
+
+def test_new_session_parent_and_file_get_private_modes(tmp_path: Path) -> None:
+    session_path = tmp_path / "new-private-parent" / "telegram.session"
+
+    Settings.from_env(
+        tmp_path,
+        required_env(TG_SESSION_PATH=str(session_path)),
+    )
+
+    assert stat.S_IMODE(session_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(session_path.stat().st_mode) == 0o600
+
+
+def test_existing_session_file_is_restricted_without_chmodding_base_dir(
+    tmp_path: Path,
+) -> None:
+    session_path = tmp_path / "telegram.session"
+    session_path.touch(mode=0o644)
+    session_path.chmod(0o644)
+    tmp_path.chmod(0o755)
+
+    Settings.from_env(
+        tmp_path,
+        required_env(TG_SESSION_PATH=str(session_path)),
+    )
+
+    assert stat.S_IMODE(session_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o755
+
+
+def test_session_filesystem_error_is_safe(tmp_path: Path) -> None:
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    session_path = blocker / "secret-session-name"
+
+    with pytest.raises(ConfigError) as raised:
+        Settings.from_env(
+            tmp_path,
+            required_env(TG_SESSION_PATH=str(session_path)),
+        )
+
+    assert "TG_SESSION_PATH" in str(raised.value)
+    assert str(session_path) not in str(raised.value)
+    assert "secret-session-name" not in str(raised.value)

@@ -10,6 +10,8 @@ from .domain import (
     StagedArtifact,
     _require_nonblank,
     _require_nonnegative,
+    _require_int,
+    _require_optional_type,
     _require_optional_uuid,
     _require_type,
     _require_uuid_tuple,
@@ -153,6 +155,7 @@ class PlaylistExpansionFailed:
 
     def __post_init__(self) -> None:
         _require_type(self.batch_id, UUID, "batch_id")
+        _require_type(self.error, ErrorInfo, "error")
         _require_event_time(self.occurred_at)
 
 
@@ -182,9 +185,12 @@ class ArtifactReady:
     def __post_init__(self) -> None:
         _require_type(self.job_id, UUID, "job_id")
         _require_type(self.artifact_id, UUID, "artifact_id")
-        _require_event_time(self.occurred_at)
+        _require_type(self.local_path, Path, "local_path")
         _require_nonblank(self.filename, "filename")
+        _require_optional_type(self.media_type, str, "media_type")
         _require_nonnegative(self.size_bytes, "size_bytes")
+        _require_optional_type(self.caption, str, "caption")
+        _require_event_time(self.occurred_at)
 
 
 @dataclass(frozen=True)
@@ -197,6 +203,7 @@ class ArtifactProductionFailed:
     def __post_init__(self) -> None:
         _require_type(self.job_id, UUID, "job_id")
         _require_optional_uuid(self.artifact_id, "artifact_id")
+        _require_type(self.error, ErrorInfo, "error")
         _require_event_time(self.occurred_at)
 
 
@@ -211,6 +218,8 @@ class ArtifactUploaded:
     def __post_init__(self) -> None:
         _require_type(self.job_id, UUID, "job_id")
         _require_type(self.artifact_id, UUID, "artifact_id")
+        _require_int(self.telegram_chat_id, "telegram_chat_id")
+        _require_int(self.telegram_message_id, "telegram_message_id")
         _require_event_time(self.occurred_at)
 
 
@@ -224,6 +233,7 @@ class ArtifactUploadFailed:
     def __post_init__(self) -> None:
         _require_type(self.job_id, UUID, "job_id")
         _require_type(self.artifact_id, UUID, "artifact_id")
+        _require_type(self.error, ErrorInfo, "error")
         _require_event_time(self.occurred_at)
 
 
@@ -233,4 +243,5 @@ class TelegramUnavailable:
     occurred_at: datetime
 
     def __post_init__(self) -> None:
+        _require_type(self.error, ErrorInfo, "error")
         _require_event_time(self.occurred_at)
