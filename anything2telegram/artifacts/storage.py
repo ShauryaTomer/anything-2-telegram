@@ -296,12 +296,18 @@ class ArtifactStorage:
             raise _error("storage_unowned") from None
 
         try:
-            root_stat = self._secure_directory_fd(root_fd, "storage_unowned")
+            root_stat = self._inspect_directory_fd(root_fd, "storage_unowned")
             identity = (root_stat.st_dev, root_stat.st_ino)
             if self._directory_is_empty(root_fd):
+                self._tighten_directory_fd(root_fd, "storage_unowned")
                 self._create_marker(root_fd)
             else:
-                self._validate_marker(root_fd)
+                marker_fd = self._open_valid_marker_fd(root_fd)
+                try:
+                    self._tighten_directory_fd(root_fd, "storage_unowned")
+                    self._tighten_file_fd(marker_fd, "storage_unowned")
+                finally:
+                    os.close(marker_fd)
             return identity
         finally:
             os.close(root_fd)
@@ -313,11 +319,16 @@ class ArtifactStorage:
         except OSError:
             raise _error("storage_unowned") from None
         try:
-            root_stat = self._secure_directory_fd(root_fd, "storage_unowned")
+            root_stat = self._inspect_directory_fd(root_fd, "storage_unowned")
             if (root_stat.st_dev, root_stat.st_ino) != self._root_identity:
                 raise _error("storage_unowned")
-            self._validate_marker(root_fd)
-            yield root_fd
+            marker_fd = self._open_valid_marker_fd(root_fd)
+            try:
+                self._tighten_directory_fd(root_fd, "storage_unowned")
+                self._tighten_file_fd(marker_fd, "storage_unowned")
+                yield root_fd
+            finally:
+                os.close(marker_fd)
         finally:
             os.close(root_fd)
 
@@ -364,14 +375,23 @@ class ArtifactStorage:
             raise _error("invalid_reservation")
         return directory_fd
 
-    def _secure_directory_fd(self, directory_fd: int, code: str):
+    def _inspect_directory_fd(self, directory_fd: int, code: str):
         try:
             current = os.fstat(directory_fd)
             if not stat.S_ISDIR(current.st_mode) or current.st_uid != os.getuid():
                 raise _error(code)
+            return current
+        except ArtifactStorageError:
+            raise
+        except OSError:
+            raise _error(code) from None
+
+    def _tighten_directory_fd(self, directory_fd: int, code: str):
+        current = self._inspect_directory_fd(directory_fd, code)
+        try:
             if stat.S_IMODE(current.st_mode) != _DIRECTORY_MODE:
                 os.fchmod(directory_fd, _DIRECTORY_MODE)
-                current = os.fstat(directory_fd)
+                current = self._inspect_directory_fd(directory_fd, code)
             if stat.S_IMODE(current.st_mode) != _DIRECTORY_MODE:
                 raise _error(code)
             return current
@@ -380,7 +400,11 @@ class ArtifactStorage:
         except OSError:
             raise _error(code) from None
 
-    def _secure_file_fd(self, file_fd: int, code: str):
+    def _secure_directory_fd(self, directory_fd: int, code: str):
+        self._inspect_directory_fd(directory_fd, code)
+        return self._tighten_directory_fd(directory_fd, code)
+
+    def _inspect_file_fd(self, file_fd: int, code: str):
         try:
             current = os.fstat(file_fd)
             if (
@@ -389,9 +413,18 @@ class ArtifactStorage:
                 or current.st_nlink != 1
             ):
                 raise _error(code)
+            return current
+        except ArtifactStorageError:
+            raise
+        except OSError:
+            raise _error(code) from None
+
+    def _tighten_file_fd(self, file_fd: int, code: str):
+        current = self._inspect_file_fd(file_fd, code)
+        try:
             if stat.S_IMODE(current.st_mode) != _FILE_MODE:
                 os.fchmod(file_fd, _FILE_MODE)
-                current = os.fstat(file_fd)
+                current = self._inspect_file_fd(file_fd, code)
             if stat.S_IMODE(current.st_mode) != _FILE_MODE:
                 raise _error(code)
             return current
@@ -399,6 +432,10 @@ class ArtifactStorage:
             raise
         except OSError:
             raise _error(code) from None
+
+    def _secure_file_fd(self, file_fd: int, code: str):
+        self._inspect_file_fd(file_fd, code)
+        return self._tighten_file_fd(file_fd, code)
 
     def _create_marker(self, root_fd: int) -> None:
         try:
@@ -413,7 +450,9 @@ class ArtifactStorage:
             return
         except OSError:
             raise _error("storage_unowned") from None
+        created_stat = None
         try:
+            created_stat = os.fstat(marker_fd)
             self._secure_file_fd(marker_fd, "storage_unowned")
             remaining = memoryview(_MARKER_BYTES)
             while remaining:
@@ -423,29 +462,46 @@ class ArtifactStorage:
                 remaining = remaining[written:]
             os.fsync(marker_fd)
         except ArtifactStorageError:
+            if created_stat is not None:
+                self._unlink_matching_leaf(
+                    root_fd, OWNERSHIP_MARKER_NAME, created_stat
+                )
             raise
         except OSError:
+            if created_stat is not None:
+                self._unlink_matching_leaf(
+                    root_fd, OWNERSHIP_MARKER_NAME, created_stat
+                )
             raise _error("storage_io_error") from None
         finally:
             os.close(marker_fd)
 
     def _validate_marker(self, root_fd: int) -> None:
+        marker_fd = self._open_valid_marker_fd(root_fd)
+        try:
+            self._tighten_file_fd(marker_fd, "storage_unowned")
+        finally:
+            os.close(marker_fd)
+
+    def _open_valid_marker_fd(self, root_fd: int) -> int:
         try:
             marker_fd = os.open(
                 OWNERSHIP_MARKER_NAME,
-                os.O_RDONLY | _NOFOLLOW,
+                os.O_RDONLY | os.O_NONBLOCK | _NOFOLLOW,
                 dir_fd=root_fd,
             )
         except OSError:
             raise _error("storage_unowned") from None
         try:
-            self._secure_file_fd(marker_fd, "storage_unowned")
+            self._inspect_file_fd(marker_fd, "storage_unowned")
             os.lseek(marker_fd, 0, os.SEEK_SET)
             content = os.read(marker_fd, len(_MARKER_BYTES) + 1)
             if content != _MARKER_BYTES:
                 raise _error("storage_unowned")
-        finally:
+            return marker_fd
+        except BaseException:
             os.close(marker_fd)
+            raise
 
     def _validate_reservation(self, reservation: UploadReservation) -> None:
         if not isinstance(reservation, UploadReservation):
@@ -598,7 +654,10 @@ class ArtifactStorage:
         ):
             raise _error("invalid_filename")
         sanitized = _SAFE_FILENAME.sub("_", filename)
-        if sanitized in {"", ".", ".."}:
+        if (
+            sanitized in {"", ".", ".."}
+            or len(sanitized.encode("utf-8")) > 255
+        ):
             raise _error("invalid_filename")
         return sanitized
 

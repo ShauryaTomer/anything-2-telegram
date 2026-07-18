@@ -2,6 +2,8 @@ import asyncio
 import errno
 import os
 import stat
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import Mock
 from uuid import UUID, uuid4
@@ -116,25 +118,35 @@ def test_hardlinked_ownership_marker_is_rejected(tmp_path: Path) -> None:
 def test_marker_creation_does_not_follow_racing_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    ArtifactStorage, _, marker_name, marker_content = _api()
+    ArtifactStorage, ArtifactStorageError, marker_name, _ = _api()
     root = tmp_path / "artifacts"
     root.mkdir(mode=0o700)
     victim = tmp_path / "victim"
     victim.write_text("keep")
-    original_write_text = Path.write_text
+    original_open = storage_module.os.open
+    hook_used = False
+    monkeypatch.setattr(
+        ArtifactStorage, "_require_secure_platform", staticmethod(lambda: None)
+    )
 
-    def racing_write_text(path: Path, data: str, *args, **kwargs):
-        if path.name == marker_name:
-            path.symlink_to(victim)
-        return original_write_text(path, data, *args, **kwargs)
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal hook_used
+        if not hook_used and path == marker_name and flags & os.O_CREAT:
+            hook_used = True
+            os.symlink(victim, marker_name, dir_fd=dir_fd)
+        if dir_fd is None:
+            return original_open(path, flags, mode)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
 
-    monkeypatch.setattr(Path, "write_text", racing_write_text)
+    monkeypatch.setattr(storage_module.os, "open", racing_open)
 
-    ArtifactStorage(root)
+    with pytest.raises(ArtifactStorageError) as raised:
+        ArtifactStorage(root)
 
+    assert raised.value.code == "storage_unowned"
+    assert hook_used
     assert victim.read_text() == "keep"
-    assert not (root / marker_name).is_symlink()
-    assert (root / marker_name).read_text() == marker_content
+    assert (root / marker_name).is_symlink()
 
 
 def test_nonempty_unowned_root_is_rejected(tmp_path: Path) -> None:
@@ -151,6 +163,19 @@ def test_nonempty_unowned_root_is_rejected(tmp_path: Path) -> None:
     assert (root / "keep.txt").read_text() == "keep"
 
 
+def test_nonempty_unowned_root_mode_is_preserved(tmp_path: Path) -> None:
+    ArtifactStorage, ArtifactStorageError, _, _ = _api()
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    root.chmod(0o777)
+    (root / "keep.txt").write_text("keep")
+
+    with pytest.raises(ArtifactStorageError):
+        ArtifactStorage(root)
+
+    assert stat.S_IMODE(root.stat().st_mode) == 0o777
+
+
 def test_wrong_marker_is_rejected(tmp_path: Path) -> None:
     ArtifactStorage, ArtifactStorageError, marker_name, _ = _api()
     root = tmp_path / "artifacts"
@@ -161,6 +186,77 @@ def test_wrong_marker_is_rejected(tmp_path: Path) -> None:
         ArtifactStorage(root)
 
     assert raised.value.code == "storage_unowned"
+
+
+def test_invalid_marker_preserves_root_and_marker_modes(tmp_path: Path) -> None:
+    ArtifactStorage, ArtifactStorageError, marker_name, _ = _api()
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    root.chmod(0o777)
+    marker = root / marker_name
+    marker.write_text("wrong")
+    marker.chmod(0o666)
+
+    with pytest.raises(ArtifactStorageError):
+        ArtifactStorage(root)
+
+    assert stat.S_IMODE(root.stat().st_mode) == 0o777
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o666
+
+
+def test_fifo_marker_rejection_is_bounded(tmp_path: Path) -> None:
+    _, _, marker_name, _ = _api()
+    root = tmp_path / "artifacts"
+    root.mkdir(mode=0o700)
+    os.mkfifo(root / marker_name, mode=0o600)
+    script = (
+        "from pathlib import Path\n"
+        "from anything2telegram.artifacts.storage import ArtifactStorage, "
+        "ArtifactStorageError\n"
+        f"root = Path({str(root)!r})\n"
+        "try:\n"
+        "    ArtifactStorage(root)\n"
+        "except ArtifactStorageError:\n"
+        "    raise SystemExit(0)\n"
+        "raise SystemExit(1)\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path.cwd(),
+        capture_output=True,
+        timeout=1,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+
+
+@pytest.mark.parametrize("failure", ["write", "fsync"])
+def test_failed_marker_creation_rolls_back_for_next_prepare(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    ArtifactStorage, ArtifactStorageError, marker_name, marker_content = _api()
+    root = tmp_path / "artifacts"
+    root.mkdir(mode=0o700)
+    original = getattr(storage_module.os, failure)
+
+    def fail(*args, **kwargs):
+        raise OSError(errno.EIO, "secret marker path")
+
+    monkeypatch.setattr(storage_module.os, failure, fail)
+
+    with pytest.raises(ArtifactStorageError) as raised:
+        ArtifactStorage(root)
+
+    assert raised.value.code == "storage_io_error"
+    assert not (root / marker_name).exists()
+
+    monkeypatch.setattr(storage_module.os, failure, original)
+    ArtifactStorage(root)
+    assert (root / marker_name).read_text() == marker_content
 
 
 def test_root_symlink_is_rejected(tmp_path: Path) -> None:
@@ -214,6 +310,20 @@ def test_reserve_rejects_existing_regular_destination(tmp_path: Path) -> None:
 
     assert raised.value.code == "storage_collision"
     assert reservation.destination.read_bytes() == b"existing"
+
+
+def test_reserve_rejects_overlong_filename_before_creating_job(
+    tmp_path: Path,
+) -> None:
+    storage = _storage(tmp_path)
+    _, ArtifactStorageError, _, _ = _api()
+    job_id = uuid4()
+
+    with pytest.raises(ArtifactStorageError) as raised:
+        storage.reserve(job_id, uuid4(), "a" * 256, None, None)
+
+    assert raised.value.code == "invalid_filename"
+    assert not (storage.root / str(job_id)).exists()
 
 
 @pytest.mark.parametrize(
@@ -397,11 +507,10 @@ async def test_stage_parent_swap_never_writes_outside_root(
 
     monkeypatch.setattr(storage_module.os, "open", racing_open)
 
-    try:
+    with pytest.raises(storage_module.ArtifactStorageError) as raised:
         await storage.stage(ChunkedUpload([b"data"]), reservation, max_bytes=100)
-    except storage_module.ArtifactStorageError:
-        pass
 
+    assert raised.value.code == "invalid_reservation"
     assert swapped
     assert not outside_leaf.exists()
 

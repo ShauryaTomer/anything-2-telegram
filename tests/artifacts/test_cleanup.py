@@ -97,3 +97,19 @@ def test_cleanup_failure_is_logged_safely_and_swallowed() -> None:
     rendered = " ".join(str(value) for value in (*args, *kwargs.values()))
     assert "/secret" not in rendered
     assert str(event.job_id) not in rendered
+
+
+def test_cleanup_logger_failure_is_swallowed_and_later_listeners_run() -> None:
+    ArtifactCleanup = _cleanup_api()
+    storage = RecordingStorage(RuntimeError("delete failed"))
+    logger = Mock()
+    logger.error.side_effect = RuntimeError("logger failed")
+    bus = EventEmitter()
+    ArtifactCleanup(storage, logger).register(bus)
+    topic, event = _events(uuid4())[0]
+    later_events: list[object] = []
+    bus.on(topic, later_events.append)
+
+    assert bus.emit(topic, event) is True
+
+    assert later_events == [event]

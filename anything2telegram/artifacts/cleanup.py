@@ -25,4 +25,7 @@ class ArtifactCleanup:
         try:
             self._storage.delete_job_directory(event.job_id)
         except Exception:
-            self._logger.error("Artifact cleanup failed")
+            try:
+                self._logger.error("Artifact cleanup failed")
+            except Exception:
+                pass
