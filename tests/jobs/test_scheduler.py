@@ -701,27 +701,32 @@ async def test_cancel_unqueued_reservation_is_idempotent_and_cleans_storage(
     job_directory = storage.root / str(JOB_1)
     assert job_directory.is_dir()
 
-    assert scheduler.cancel_local_upload(JOB_1)
+    assert scheduler.cancel_reserved_upload(JOB_1)
     assert not job_directory.exists()
-    assert not scheduler.cancel_local_upload(JOB_1)
+    assert not scheduler.cancel_reserved_upload(JOB_1)
 
 
-async def test_cancel_waiting_staged_upload_removes_queue_and_storage(
+async def test_cancel_reserved_upload_does_not_cancel_queued_job(
     tmp_path: Path,
 ) -> None:
     bus = AsyncIOEventEmitter()
+    tracker = JobTracker()
+    tracker.register(bus)
+    errors: list[Exception] = []
+    bus.on("error", errors.append)
     storage = ArtifactStorage(tmp_path / "artifacts")
     scheduler = JobScheduler(
         bus,
         storage,
-        id_factory=iter((JOB_1, ARTIFACT_1)).__next__,
+        id_factory=iter((JOB_1, JOB_2, ARTIFACT_1)).__next__,
         clock=lambda: NOW,
     )
+    scheduler.submit_youtube_video("https://example.test/watch?v=active")
     reservation = scheduler.reserve_local_upload("video.mp4", None, None)
     reservation.destination.write_bytes(b"done")
     scheduler.enqueue_reserved_upload(
         StagedArtifact(
-            JOB_1,
+            JOB_2,
             ARTIFACT_1,
             reservation.destination,
             reservation.filename,
@@ -730,12 +735,32 @@ async def test_cancel_waiting_staged_upload_removes_queue_and_storage(
             None,
         )
     )
-
-    assert scheduler.cancel_local_upload(JOB_1)
-    assert scheduler.pending_count == 0
-    assert not (storage.root / str(JOB_1)).exists()
     await flush_pump()
-    assert scheduler.active_id is None
+
+    assert not scheduler.cancel_reserved_upload(JOB_2)
+    assert scheduler.pending_count == 1
+    assert reservation.destination.read_bytes() == b"done"
+    job = tracker.get_job(JOB_2)
+    assert job is not None
+    assert job.status is JobStatus.WAITING
+
+    bus.emit(
+        ARTIFACT_PRODUCTION_FAILED,
+        ArtifactProductionFailed(JOB_1, None, DOWNLOAD_ERROR, NOW),
+    )
+    await flush_pump()
+    assert scheduler.active_id == JOB_2
+    job = tracker.get_job(JOB_2)
+    assert job is not None
+    assert job.status is JobStatus.UPLOADING
+    bus.emit(
+        ARTIFACT_UPLOADED,
+        ArtifactUploaded(JOB_2, ARTIFACT_1, -100123, 88, NOW),
+    )
+    assert errors == []
+    job = tracker.get_job(JOB_2)
+    assert job is not None
+    assert job.status is JobStatus.COMPLETED
 
 
 async def test_stop_cleans_reserved_and_waiting_staged_uploads(
@@ -774,7 +799,7 @@ async def test_stop_cleans_reserved_and_waiting_staged_uploads(
     assert scheduler.pending_count == 0
     assert not (storage.root / str(JOB_2)).exists()
     assert not (storage.root / str(JOB_3)).exists()
-    assert not scheduler.cancel_local_upload(JOB_3)
+    assert not scheduler.cancel_reserved_upload(JOB_3)
     assert reserved.job_id == JOB_3
 
 
@@ -804,11 +829,53 @@ async def test_cancel_and_stop_never_delete_active_staged_upload(
     )
     await flush_pump()
 
-    assert not scheduler.cancel_local_upload(JOB_1)
+    assert not scheduler.cancel_reserved_upload(JOB_1)
     scheduler.stop()
 
     assert scheduler.active_id == JOB_1
     assert reservation.destination.read_bytes() == b"live"
+
+
+async def test_stop_cleanup_continues_after_one_storage_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecordingLogger:
+        def __init__(self) -> None:
+            self.errors: list[str] = []
+
+        def error(self, message: str) -> None:
+            self.errors.append(message)
+
+    storage = ArtifactStorage(tmp_path / "artifacts")
+    logger = RecordingLogger()
+    scheduler = JobScheduler(
+        AsyncIOEventEmitter(),
+        storage,
+        id_factory=iter((JOB_1, ARTIFACT_1, JOB_2, ARTIFACT_2)).__next__,
+        clock=lambda: NOW,
+        logger=logger,
+    )
+    scheduler.reserve_local_upload("first.mp4", None, None)
+    scheduler.reserve_local_upload("second.mp4", None, None)
+    original_delete = storage.delete_job_directory
+    attempted: list[UUID] = []
+
+    def fail_first(job_id: UUID) -> None:
+        attempted.append(job_id)
+        if job_id == JOB_1:
+            raise RuntimeError("private path detail")
+        original_delete(job_id)
+
+    monkeypatch.setattr(storage, "delete_job_directory", fail_first)
+
+    scheduler.stop()
+
+    assert scheduler.stopped
+    assert attempted == [JOB_1, JOB_2]
+    assert (storage.root / str(JOB_1)).exists()
+    assert not (storage.root / str(JOB_2)).exists()
+    assert logger.errors == ["Local upload cleanup failed"]
 
 
 async def test_playlist_derived_facts_respect_causal_time_during_clock_rollback(

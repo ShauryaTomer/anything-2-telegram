@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -107,11 +108,13 @@ class JobScheduler:
         *,
         id_factory: Callable[[], UUID] = uuid4,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        logger: object | None = None,
     ) -> None:
         self._bus = bus
         self._storage = storage
         self._id_factory = id_factory
         self._clock = clock
+        self._logger = logger if logger is not None else logging.getLogger(__name__)
         self._queue: deque[_Work] = deque()
         self._active: _Work | None = None
         self._active_phase: JobPhase | None = None
@@ -262,36 +265,43 @@ class JobScheduler:
     def stop(self) -> None:
         self._stopped = True
         for job_id in tuple(self._reservations):
-            self.cancel_local_upload(job_id)
+            self._best_effort_cleanup(self._release_reservation, job_id)
         for work in tuple(self._queue):
             if isinstance(work, _StagedWork):
-                self.cancel_local_upload(work.job_id)
+                self._best_effort_cleanup(
+                    self._release_waiting_staged_upload, work
+                )
 
-    def cancel_local_upload(self, job_id: UUID) -> bool:
+    def cancel_reserved_upload(self, job_id: UUID) -> bool:
         if not isinstance(job_id, UUID):
             raise TypeError("job_id must be UUID")
-        if isinstance(self._active, _StagedWork) and self._active.job_id == job_id:
+        if self._storage is None or job_id not in self._reservations:
             return False
-        if self._storage is None:
-            return False
-        reservation = self._reservations.get(job_id)
-        if reservation is not None:
-            self._storage.delete_job_directory(job_id)
-            del self._reservations[job_id]
-            return True
-        waiting = next(
-            (
-                work
-                for work in self._queue
-                if isinstance(work, _StagedWork) and work.job_id == job_id
-            ),
-            None,
-        )
-        if waiting is None:
-            return False
-        self._storage.delete_job_directory(job_id)
-        self._queue.remove(waiting)
+        self._release_reservation(job_id)
         return True
+
+    def _release_reservation(self, job_id: UUID) -> None:
+        if self._storage is None:
+            return
+        self._storage.delete_job_directory(job_id)
+        del self._reservations[job_id]
+
+    def _release_waiting_staged_upload(self, work: _StagedWork) -> None:
+        if self._storage is None:
+            return
+        self._storage.delete_job_directory(work.job_id)
+        self._queue.remove(work)
+
+    def _best_effort_cleanup(
+        self, cleanup: Callable[..., None], target: object
+    ) -> None:
+        try:
+            cleanup(target)
+        except Exception:
+            try:
+                self._logger.error("Local upload cleanup failed")
+            except Exception:
+                pass
 
     def _require_accepting(self) -> None:
         if self._stopped:
