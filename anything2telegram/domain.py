@@ -157,6 +157,12 @@ class BatchSnapshot:
     error: ErrorInfo | None
     created_at: datetime
     updated_at: datetime
+    total_jobs: int
+    waiting: int
+    producing: int
+    uploading: int
+    completed: int
+    failed: int
 
     def __post_init__(self) -> None:
         _require_type(self.id, UUID, "id")
@@ -166,6 +172,12 @@ class BatchSnapshot:
         _require_optional_type(self.error, ErrorInfo, "error")
         _require_type(self.created_at, datetime, "created_at")
         _require_type(self.updated_at, datetime, "updated_at")
+        _require_nonnegative(self.total_jobs, "total_jobs")
+        _require_nonnegative(self.waiting, "waiting")
+        _require_nonnegative(self.producing, "producing")
+        _require_nonnegative(self.uploading, "uploading")
+        _require_nonnegative(self.completed, "completed")
+        _require_nonnegative(self.failed, "failed")
         _require_nonblank(self.source_url, "source_url")
 
 

@@ -149,6 +149,12 @@ def _domain_values() -> list[object]:
             None,
             NOW,
             NOW,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
         ),
         JobRef(job_id, f"/jobs/{job_id}"),
         BatchRef(batch_id, f"/batches/{batch_id}"),
@@ -303,6 +309,12 @@ def test_batch_snapshot_exposes_job_ids_in_order() -> None:
         None,
         NOW,
         NOW,
+        2,
+        2,
+        0,
+        0,
+        0,
+        0,
     )
 
     assert snapshot.job_ids == job_ids
@@ -485,7 +497,20 @@ def test_local_upload_requires_no_batch_and_a_matching_staged_artifact() -> None
         lambda: BatchJobsCreated(uuid4(), (), -1, NOW),
         lambda: PlaylistExpanded(uuid4(), (), -1, NOW),
         lambda: BatchSnapshot(
-            uuid4(), "url", BatchStatus.WAITING, (), -1, None, NOW, NOW
+            uuid4(),
+            "url",
+            BatchStatus.WAITING,
+            (),
+            -1,
+            None,
+            NOW,
+            NOW,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
         ),
         lambda: JobSnapshot(
             uuid4(),
