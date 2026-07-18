@@ -26,6 +26,8 @@ class Settings:
     shutdown_grace_seconds: float | int
 
     def __post_init__(self) -> None:
+        if self.api_id <= 0:
+            raise ConfigError("TG_API_ID must be positive")
         if self.max_artifact_bytes <= 0:
             raise ConfigError("MAX_ARTIFACT_BYTES must be positive")
         for key, value in (

@@ -165,6 +165,17 @@ def test_invalid_numbers_raise_safe_errors(tmp_path: Path, key: str, value: str)
     assert raised.value.__cause__ is None
 
 
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_api_id_must_be_positive_and_error_is_safe(
+    tmp_path: Path, value: str
+) -> None:
+    with pytest.raises(ConfigError) as raised:
+        Settings.from_env(tmp_path, required_env(TG_API_ID=value))
+
+    assert "TG_API_ID" in str(raised.value)
+    assert value not in str(raised.value)
+
+
 @pytest.mark.parametrize(
     ("key", "value"),
     [
