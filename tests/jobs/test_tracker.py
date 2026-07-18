@@ -424,6 +424,28 @@ def test_job_started_only_accepts_waiting_job(tracked_bus) -> None:
     assert tracker.get_job(JOB_1).status is JobStatus.PRODUCING  # type: ignore[union-attr]
 
 
+@pytest.mark.parametrize("phase", [JobPhase.PRODUCING, JobPhase.UPLOADING])
+@pytest.mark.parametrize(
+    "status",
+    [JobStatus.UPLOADING, JobStatus.COMPLETED, JobStatus.FAILED],
+)
+def test_job_started_rejects_uploading_and_terminal_jobs(
+    tracked_bus, status, phase
+) -> None:
+    tracker, bus, errors = tracked_bus
+    create_job_at_status(bus, errors, status)
+    before = tracker.get_job(JOB_1)
+
+    emit_invalid(
+        bus,
+        errors,
+        JOB_STARTED,
+        JobStarted(JOB_1, phase, time(9)),
+        InvalidJobTransition,
+    )
+    assert tracker.get_job(JOB_1) == before
+
+
 def test_artifact_ready_only_accepts_producing_or_staged_uploading_job(tracked_bus) -> None:
     tracker, bus, errors = tracked_bus
     emit_valid(bus, errors, JOB_QUEUED, youtube_queued())
@@ -438,6 +460,22 @@ def test_artifact_ready_only_accepts_producing_or_staged_uploading_job(tracked_b
         InvalidJobTransition,
     )
     assert tracker.get_job(JOB_1).artifact_id is None  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("status", [JobStatus.COMPLETED, JobStatus.FAILED])
+def test_artifact_ready_rejects_terminal_jobs(tracked_bus, status) -> None:
+    tracker, bus, errors = tracked_bus
+    create_job_at_status(bus, errors, status)
+    before = tracker.get_job(JOB_1)
+
+    emit_invalid(
+        bus,
+        errors,
+        ARTIFACT_READY,
+        ready(occurred_at=time(9)),
+        InvalidJobTransition,
+    )
+    assert tracker.get_job(JOB_1) == before
 
 
 def test_staged_artifact_ready_rejects_mismatched_artifact(tracked_bus) -> None:
@@ -854,7 +892,9 @@ def test_playlist_expansion_failure_rejects_attached_batch(tracked_bus) -> None:
         ((JobStatus.WAITING, JobStatus.WAITING), 0, BatchStatus.WAITING, (2, 0, 0, 0, 0)),
         ((JobStatus.WAITING, JobStatus.PRODUCING), 0, BatchStatus.PROCESSING, (1, 1, 0, 0, 0)),
         ((JobStatus.PRODUCING, JobStatus.PRODUCING), 0, BatchStatus.PROCESSING, (0, 2, 0, 0, 0)),
+        ((JobStatus.PRODUCING, JobStatus.UPLOADING), 0, BatchStatus.PROCESSING, (0, 1, 1, 0, 0)),
         ((JobStatus.UPLOADING, JobStatus.WAITING), 0, BatchStatus.PROCESSING, (1, 0, 1, 0, 0)),
+        ((JobStatus.UPLOADING, JobStatus.UPLOADING), 0, BatchStatus.PROCESSING, (0, 0, 2, 0, 0)),
         ((JobStatus.COMPLETED, JobStatus.WAITING), 0, BatchStatus.PROCESSING, (1, 0, 0, 1, 0)),
         ((JobStatus.COMPLETED, JobStatus.PRODUCING), 0, BatchStatus.PROCESSING, (0, 1, 0, 1, 0)),
         ((JobStatus.COMPLETED, JobStatus.UPLOADING), 0, BatchStatus.PROCESSING, (0, 0, 1, 1, 0)),
