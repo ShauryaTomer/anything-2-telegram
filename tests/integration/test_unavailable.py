@@ -99,6 +99,10 @@ async def test_runtime_telegram_unavailable_pauses_choreography(
             assert second.status_code == 202
             first_id = first.json()["id"]
             second_id = second.json()["id"]
+            first_job_dir = settings.artifact_root / first_id
+            second_job_dir = settings.artifact_root / second_id
+            assert first_job_dir.is_dir()
+            assert second_job_dir.is_dir()
 
             telegram.release_upload.set()
             await asyncio.wait_for(unavailable.wait(), timeout=1)
@@ -115,6 +119,8 @@ async def test_runtime_telegram_unavailable_pauses_choreography(
             assert service.state.scheduler.paused is True
             assert service.state.scheduler.pending_count == 1
             assert telegram.upload_calls == 1
+            assert first_job_dir.exists() is False
+            assert second_job_dir.is_dir()
 
             rejected = await client.post(
                 "/jobs/youtube",

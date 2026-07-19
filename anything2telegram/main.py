@@ -10,6 +10,7 @@ from uuid import UUID
 from fastapi import FastAPI
 from pyee.asyncio import AsyncIOEventEmitter
 
+from .artifacts.cleanup import ArtifactCleanup
 from .artifacts.storage import ArtifactStorage, ArtifactStorageError
 from .api.jobs import create_jobs_app
 from .config import Settings
@@ -31,6 +32,7 @@ _STATE_NAMES = (
     "readiness",
     "tracker",
     "scheduler",
+    "artifact_cleanup",
     "process_runner",
     "youtube_producer",
     "telegram",
@@ -42,6 +44,8 @@ class StorageAdapter(Protocol):
     root: Path
 
     def clear_orphans(self) -> None: ...
+
+    def delete_job_directory(self, job_id: UUID) -> None: ...
 
     async def stage(
         self, upload: object, reservation: UploadReservation, max_bytes: int
@@ -385,6 +389,9 @@ def create_app(
             scheduler = factories.scheduler_factory(bus, storage)
             scheduler_ref["scheduler"] = scheduler
             service.state.scheduler = scheduler
+            artifact_cleanup = ArtifactCleanup(storage, _LOGGER)
+            artifact_cleanup.register(bus)
+            service.state.artifact_cleanup = artifact_cleanup
             process_runner = factories.process_runner_factory()
             service.state.process_runner = process_runner
             youtube_producer = factories.youtube_factory(
