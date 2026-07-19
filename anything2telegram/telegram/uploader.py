@@ -125,12 +125,22 @@ class TelegramArtifactUploader:
         self._monitor_task = asyncio.create_task(self._monitor_disconnect())
         self._monitor_task.add_done_callback(self._monitor_done)
 
-    async def stop(self) -> None:
+    async def stop(self, *, disconnect: bool = True) -> None:
         if self._stopping:
             return
-        await self._stop(asyncio.current_task())
+        await self._stop(asyncio.current_task(), disconnect=disconnect)
 
-    async def _stop(self, current: asyncio.Task[object] | None) -> None:
+    def begin_shutdown(self) -> None:
+        self._shutting_down = True
+        self._accepting = False
+        self._remove_listener()
+
+    async def _stop(
+        self,
+        current: asyncio.Task[object] | None,
+        *,
+        disconnect: bool = True,
+    ) -> None:
         self._stopping = True
         self._shutting_down = True
         self._accepting = False
@@ -147,10 +157,11 @@ class TelegramArtifactUploader:
             monitor.cancel()
         if monitor is not None:
             await asyncio.gather(monitor, return_exceptions=True)
-        try:
-            await self._client.disconnect()
-        except Exception:
-            self._safe_log("Telegram disconnect failed")
+        if disconnect:
+            try:
+                await self._client.disconnect()
+            except Exception:
+                self._safe_log("Telegram disconnect failed")
         self._started = False
 
     async def handle_artifact_ready(self, event: ArtifactReady) -> None:
@@ -184,7 +195,7 @@ class TelegramArtifactUploader:
                 )
             except asyncio.CancelledError:
                 self._claimed.discard(key)
-                if not self._stopping:
+                if not self._shutting_down:
                     await self._stop(task)
                 raise
             except TelegramUnavailableError:
