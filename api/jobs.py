@@ -6,6 +6,7 @@ from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import ClientDisconnect
 
 from anything2telegram.artifacts.storage import ArtifactStorageError
@@ -194,6 +195,22 @@ def create_jobs_app(
     ) -> JSONResponse:
         return _error(422, "invalid_request", "Request is invalid")
 
+    @app.exception_handler(StarletteHTTPException)
+    async def framework_http_error(
+        _request: object, error: StarletteHTTPException
+    ) -> JSONResponse:
+        if error.status_code == 404:
+            return _error(404, "not_found", "Resource not found")
+        if error.status_code == 405:
+            return _error(405, "method_not_allowed", "Method not allowed")
+        if 400 <= error.status_code < 500:
+            return _error(
+                error.status_code,
+                "invalid_request",
+                "Request is invalid",
+            )
+        return _error(500, "internal_error", "Internal server error")
+
     @app.post("/jobs/youtube", status_code=202)
     async def submit_youtube(request: _YouTubeRequest) -> object:
         try:
@@ -305,12 +322,15 @@ def create_jobs_app(
         return _batch_body(snapshot)
 
     @app.get("/health")
-    async def health() -> dict[str, bool]:
+    async def health() -> JSONResponse:
         telegram_connected = _safe_bool(telegram, "is_connected")
-        return {
-            "ready": _safe_bool(readiness, "is_accepting")
-            and telegram_connected,
-            "telegram_connected": telegram_connected,
-        }
+        ready = _safe_bool(readiness, "is_accepting") and telegram_connected
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={
+                "ready": ready,
+                "telegram_connected": telegram_connected,
+            },
+        )
 
     return app

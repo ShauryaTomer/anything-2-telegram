@@ -204,6 +204,21 @@ def test_youtube_validation_and_readiness_have_stable_errors() -> None:
     }
     assert scheduler.calls == []
 
+    framework_errors = [
+        (client.get("/unknown"), 404, "not_found", "Resource not found"),
+        (
+            client.delete("/health"),
+            405,
+            "method_not_allowed",
+            "Method not allowed",
+        ),
+    ]
+    for response, status, code, message in framework_errors:
+        assert response.status_code == status
+        assert response.json() == {
+            "detail": {"code": code, "message": message}
+        }
+
 
 def test_upload_streams_stage_before_enqueue_and_returns_exact_202() -> None:
     response = client.post(
@@ -351,13 +366,17 @@ def test_job_batch_snapshots_are_exact_and_bad_ids_are_404() -> None:
 
 
 def test_health_is_exact_and_tracks_runtime_disconnect() -> None:
-    assert client.get("/health").json() == {
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {
         "ready": True,
         "telegram_connected": True,
     }
 
     telegram.connected = False
-    assert client.get("/health").json() == {
+    response = client.get("/health")
+    assert response.status_code == 503
+    assert response.json() == {
         "ready": False,
         "telegram_connected": False,
     }
@@ -366,3 +385,12 @@ def test_health_is_exact_and_tracks_runtime_disconnect() -> None:
     )
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "service_unavailable"
+
+    telegram.connected = True
+    readiness.accepting = False
+    response = client.get("/health")
+    assert response.status_code == 503
+    assert response.json() == {
+        "ready": False,
+        "telegram_connected": True,
+    }
