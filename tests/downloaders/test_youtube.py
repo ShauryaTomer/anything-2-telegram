@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -123,7 +124,8 @@ async def test_expansion_uses_exact_args_and_emits_ordered_deduped_targets(tmp_p
     assert errors == []
     assert runner.calls == [
         ([
-            "yt-dlp", "--flat-playlist", "--dump-json", "--no-warnings",
+            sys.executable, "-m", "yt_dlp",
+            "--flat-playlist", "--dump-json", "--no-warnings",
             "--ignore-errors", "--cookies", str(tmp_path / "cookies.txt"),
             request.source_url,
         ], 15)
@@ -189,7 +191,8 @@ async def test_download_exact_args_and_ready_metadata(tmp_path) -> None:
 
     directory = storage.root / str(event.job_id) / str(ARTIFACT_ID)
     assert runner.calls[0] == ([
-        "yt-dlp", "-f", YTDLP_FORMAT, "--merge-output-format", "mp4",
+        sys.executable, "-m", "yt_dlp",
+        "-f", YTDLP_FORMAT, "--merge-output-format", "mp4",
         "--max-filesize", "20",
         "--restrict-filenames", "--no-playlist", "--js-runtimes", "node",
         "--remote-components", "ejs:github", "-o",

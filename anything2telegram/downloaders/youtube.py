@@ -2,6 +2,7 @@ import asyncio
 import json
 import mimetypes
 import re
+import sys
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from enum import Enum
@@ -38,6 +39,7 @@ YTDLP_FORMAT = (
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _PLAYLIST_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 _FINAL_MEDIA_SUFFIXES = frozenset({".mp4", ".mkv", ".webm"})
+_YTDLP_COMMAND = (sys.executable, "-m", "yt_dlp")
 _UNAVAILABLE = frozenset(
     {"private", "premium_only", "subscriber_only", "needs_auth", "unavailable"}
 )
@@ -275,7 +277,7 @@ class YouTubeArtifactProducer:
 
     def _playlist_args(self, source_url: str) -> list[str]:
         return [
-            "yt-dlp",
+            *_YTDLP_COMMAND,
             "--flat-playlist",
             "--dump-json",
             "--no-warnings",
@@ -286,7 +288,7 @@ class YouTubeArtifactProducer:
 
     def _download_args(self, source_url: str, directory: Path) -> list[str]:
         return [
-            "yt-dlp",
+            *_YTDLP_COMMAND,
             "-f",
             self._format_selector,
             "--merge-output-format",
