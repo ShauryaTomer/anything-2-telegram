@@ -30,7 +30,6 @@ uv.lock
 
 # Local worktrees and documentation
 .worktrees/
-*.md
 docs/_work/
 
 # Teaching material
