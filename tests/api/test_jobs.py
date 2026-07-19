@@ -9,9 +9,11 @@ from starlette.requests import ClientDisconnect, Request
 
 from anything2telegram.artifacts.storage import ArtifactStorageError
 from anything2telegram.domain import (
+    BatchRef,
     BatchSnapshot,
     BatchStatus,
     ErrorInfo,
+    JobRef,
     JobSnapshot,
     JobStatus,
     SourceKind,
@@ -43,17 +45,17 @@ class FakeScheduler:
         self.cancel_error: Exception | None = None
         self.accepting = True
 
-    def submit_youtube_video(self, url: str) -> UUID:
+    def submit_video(self, url: str) -> JobRef:
         self.calls.append(("video", url))
         if self.submission_error is not None:
             raise self.submission_error
-        return JOB_ID
+        return JobRef(JOB_ID, f"/jobs/{JOB_ID}")
 
-    def submit_playlist_expansion(self, url: str) -> UUID:
+    def submit_playlist(self, url: str) -> BatchRef:
         self.calls.append(("playlist", url))
         if self.submission_error is not None:
             raise self.submission_error
-        return BATCH_ID
+        return BatchRef(BATCH_ID, f"/batches/{BATCH_ID}")
 
     def reserve_local_upload(
         self, filename: str, media_type: str | None, caption: str | None
@@ -70,12 +72,14 @@ class FakeScheduler:
             caption,
         )
 
-    def enqueue_reserved_upload(self, staged: StagedArtifact) -> UUID:
-        self.calls.append(("enqueue", staged.size_bytes))
+    def enqueue_reserved_upload(
+        self, reservation: UploadReservation, size_bytes: int
+    ) -> JobRef:
+        self.calls.append(("enqueue", size_bytes))
         if self.enqueue_error is not None:
             self.accepting = False
             raise self.enqueue_error
-        return staged.job_id
+        return JobRef(reservation.job_id, f"/jobs/{reservation.job_id}")
 
     def cancel_reserved_upload(self, job_id: UUID) -> bool:
         self.calls.append(("cancel", job_id))
@@ -629,3 +633,4 @@ def test_health_is_exact_and_tracks_runtime_disconnect() -> None:
     )
     assert response.status_code == 503
     assert scheduler.calls == []
+    JobRef,

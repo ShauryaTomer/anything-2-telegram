@@ -20,8 +20,10 @@ from starlette.requests import ClientDisconnect
 
 from anything2telegram.artifacts.storage import ArtifactStorageError
 from anything2telegram.domain import (
+    BatchRef,
     BatchSnapshot,
     ErrorInfo,
+    JobRef,
     JobSnapshot,
     StagedArtifact,
     UploadReservation,
@@ -42,9 +44,12 @@ class Scheduler(Protocol):
     @property
     def accepting(self) -> bool: ...
 
-    def submit_youtube_video(self, source_url: str) -> UUID: ...
+    @property
+    def active_id(self) -> UUID | None: ...
 
-    def submit_playlist_expansion(self, source_url: str) -> UUID: ...
+    def submit_video(self, source_url: str) -> JobRef: ...
+
+    def submit_playlist(self, source_url: str) -> BatchRef: ...
 
     def reserve_local_upload(
         self,
@@ -53,9 +58,15 @@ class Scheduler(Protocol):
         caption: str | None,
     ) -> UploadReservation: ...
 
-    def enqueue_reserved_upload(self, staged: StagedArtifact) -> UUID: ...
+    def enqueue_reserved_upload(
+        self, reservation: UploadReservation, size_bytes: int
+    ) -> JobRef: ...
 
     def cancel_reserved_upload(self, job_id: UUID) -> bool: ...
+
+    def pause(self) -> None: ...
+
+    def stop(self) -> None: ...
 
 
 class Tracker(Protocol):
@@ -213,11 +224,11 @@ def _batch_body(snapshot: BatchSnapshot) -> dict[str, object]:
     }
 
 
-def _submission_body(kind: str, identifier: UUID, path: str) -> dict[str, str]:
+def _submission_body(kind: str, ref: JobRef | BatchRef) -> dict[str, str]:
     return {
         "type": kind,
-        "id": str(identifier),
-        "status_url": f"/{path}/{identifier}",
+        "id": str(ref.id),
+        "status_url": ref.status_url,
     }
 
 
@@ -405,10 +416,10 @@ def create_jobs_app(
             return _service_unavailable()
         try:
             if kind is YouTubeUrlKind.VIDEO:
-                job_id = scheduler.submit_youtube_video(request.url)
-                return _submission_body("job", job_id, "jobs")
-            batch_id = scheduler.submit_playlist_expansion(request.url)
-            return _submission_body("batch", batch_id, "batches")
+                job = scheduler.submit_video(request.url)
+                return _submission_body("job", job)
+            batch = scheduler.submit_playlist(request.url)
+            return _submission_body("batch", batch)
         except SchedulerError as error:
             if _scheduler_unavailable(error):
                 return _service_unavailable()
@@ -492,7 +503,9 @@ def create_jobs_app(
                 if not accepting():
                     _cancel_reservation(scheduler, reservation.job_id)
                     return _service_unavailable()
-                job_id = scheduler.enqueue_reserved_upload(staged)
+                job = scheduler.enqueue_reserved_upload(
+                    reservation, staged.size_bytes
+                )
             except ArtifactStorageError as error:
                 _cancel_reservation(scheduler, reservation.job_id)
                 return _storage_error(error)
@@ -521,7 +534,7 @@ def create_jobs_app(
             except BaseException:
                 _cancel_reservation(scheduler, reservation.job_id)
                 raise
-            return _submission_body("job", job_id, "jobs")
+            return _submission_body("job", job)
         finally:
             await _close_form(form)
 

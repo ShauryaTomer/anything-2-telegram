@@ -8,11 +8,13 @@ from pyee.asyncio import AsyncIOEventEmitter
 
 from anything2telegram.artifacts.storage import ArtifactStorage
 from anything2telegram.domain import (
+    BatchRef,
     ErrorInfo,
     JobPhase,
+    JobRef,
     JobStatus,
     SourceKind,
-    StagedArtifact,
+    UploadReservation,
 )
 from anything2telegram.events import (
     ARTIFACT_PRODUCTION_FAILED,
@@ -80,13 +82,15 @@ async def test_youtube_submission_queues_before_deferred_start() -> None:
         lambda event: facts.append((YOUTUBE_DOWNLOAD_REQUESTED, event)),
     )
 
-    job_id = scheduler.submit_youtube_video(
+    job = scheduler.submit_video(
         "https://example.test/watch?v=one"
     )
 
-    assert job_id == JOB_1
+    assert job == JobRef(JOB_1, f"/jobs/{JOB_1}")
     assert scheduler.pending_count == 1
     assert scheduler.active_id is None
+    with pytest.raises(AttributeError):
+        scheduler.active_id = JOB_2  # type: ignore[misc]
     assert facts == [
         (
             JOB_QUEUED,
@@ -138,8 +142,8 @@ async def test_synchronous_terminal_handler_never_starts_next_job_nested() -> No
     started: list[UUID] = []
     bus.on(JOB_STARTED, lambda event: started.append(event.job_id))
 
-    scheduler.submit_youtube_video("https://example.test/watch?v=one")
-    scheduler.submit_youtube_video("https://example.test/watch?v=two")
+    scheduler.submit_video("https://example.test/watch?v=one")
+    scheduler.submit_video("https://example.test/watch?v=two")
     await flush_pump()
 
     assert nested_active_ids == [None]
@@ -161,7 +165,7 @@ async def test_fifo_ignores_duplicate_and_stale_terminal_events() -> None:
     bus.on(JOB_STARTED, lambda event: started.append(event.job_id))
 
     for name in ("one", "two", "three"):
-        scheduler.submit_youtube_video(f"https://example.test/watch?v={name}")
+        scheduler.submit_video(f"https://example.test/watch?v={name}")
     await flush_pump()
     assert scheduler.active_id == JOB_1
 
@@ -205,15 +209,15 @@ async def test_playlist_children_are_deduped_and_inserted_at_queue_front() -> No
     ):
         bus.on(topic, lambda event, topic=topic: facts.append((topic, event)))
 
-    batch_id = scheduler.submit_playlist_expansion(
+    batch = scheduler.submit_playlist(
         "https://example.test/playlist"
     )
-    later_job_id = scheduler.submit_youtube_video(
+    later_job = scheduler.submit_video(
         "https://example.test/watch?v=later"
     )
 
-    assert batch_id == BATCH
-    assert later_job_id == JOB_1
+    assert batch == BatchRef(BATCH, f"/batches/{BATCH}")
+    assert later_job == JobRef(JOB_1, f"/jobs/{JOB_1}")
     assert facts[0] == (
         BATCH_CREATED,
         BatchCreated(BATCH, "https://example.test/playlist", NOW),
@@ -287,7 +291,7 @@ async def test_playlist_children_are_deduped_and_inserted_at_queue_front() -> No
         ArtifactProductionFailed(child_2, None, DOWNLOAD_ERROR, NOW),
     )
     await flush_pump()
-    assert scheduler.active_id == later_job_id
+    assert scheduler.active_id == later_job.id
 
 
 async def test_empty_playlist_emits_safe_failure_then_advances() -> None:
@@ -300,8 +304,8 @@ async def test_empty_playlist_emits_safe_failure_then_advances() -> None:
     failures: list[PlaylistExpansionFailed] = []
     bus.on(YOUTUBE_PLAYLIST_EXPANSION_FAILED, failures.append)
 
-    scheduler.submit_playlist_expansion("https://example.test/playlist")
-    scheduler.submit_youtube_video("https://example.test/watch?v=later")
+    scheduler.submit_playlist("https://example.test/playlist")
+    scheduler.submit_video("https://example.test/watch?v=later")
     await flush_pump()
 
     bus.emit(
@@ -330,9 +334,9 @@ async def test_playlist_failure_advances_once_and_stale_failure_is_ignored() -> 
         id_factory=iter((BATCH, JOB_1, JOB_2)).__next__,
         clock=lambda: NOW,
     )
-    scheduler.submit_playlist_expansion("https://example.test/playlist")
-    scheduler.submit_youtube_video("https://example.test/watch?v=one")
-    scheduler.submit_youtube_video("https://example.test/watch?v=two")
+    scheduler.submit_playlist("https://example.test/playlist")
+    scheduler.submit_video("https://example.test/watch?v=one")
+    scheduler.submit_video("https://example.test/watch?v=two")
     await flush_pump()
 
     failed = PlaylistExpansionFailed(
@@ -362,24 +366,14 @@ async def test_reserved_staged_upload_waits_for_fifo_turn(tmp_path: Path) -> Non
     for topic in (JOB_QUEUED, JOB_STARTED, ARTIFACT_READY):
         bus.on(topic, lambda event, topic=topic: facts.append((topic, event)))
 
-    scheduler.submit_youtube_video("https://example.test/watch?v=first")
+    scheduler.submit_video("https://example.test/watch?v=first")
     reservation = scheduler.reserve_local_upload(
         "local video.mp4", "video/mp4", "Local video"
     )
     reservation.destination.write_bytes(b"payload")
-    staged = StagedArtifact(
-        reservation.job_id,
-        reservation.artifact_id,
-        reservation.destination,
-        reservation.filename,
-        reservation.media_type,
-        7,
-        reservation.caption,
-    )
+    job = scheduler.enqueue_reserved_upload(reservation, 7)
 
-    job_id = scheduler.enqueue_reserved_upload(staged)
-
-    assert job_id == JOB_2
+    assert job == JobRef(JOB_2, f"/jobs/{JOB_2}")
     assert reservation.job_id == JOB_2
     assert reservation.artifact_id == ARTIFACT_1
     assert not [event for topic, event in facts if topic == ARTIFACT_READY]
@@ -451,18 +445,9 @@ async def test_reserved_upload_commit_failure_stops_admission(
         bus.on(
             JOB_STARTED,
             lambda _event: (_ for _ in ()).throw(RuntimeError("private")),
-        )
+    )
     reservation = scheduler.reserve_local_upload("video.mp4", None, None)
     reservation.destination.write_bytes(b"done")
-    staged = StagedArtifact(
-        JOB_1,
-        ARTIFACT_1,
-        reservation.destination,
-        reservation.filename,
-        None,
-        4,
-        None,
-    )
 
     def fail_pump_schedule() -> None:
         raise RuntimeError("private loop detail")
@@ -471,13 +456,15 @@ async def test_reserved_upload_commit_failure_stops_admission(
         monkeypatch.setattr(scheduler, "_request_pump", fail_pump_schedule)
 
     if failure_phase == "start":
-        assert scheduler.enqueue_reserved_upload(staged) == JOB_1
+        assert scheduler.enqueue_reserved_upload(
+            reservation, 4
+        ) == JobRef(JOB_1, f"/jobs/{JOB_1}")
         with pytest.raises(RuntimeError):
             scheduler._pump()
     else:
         expected_error = SchedulerError if failure_phase == "assembly" else RuntimeError
         with pytest.raises(expected_error):
-            scheduler.enqueue_reserved_upload(staged)
+            scheduler.enqueue_reserved_upload(reservation, 4)
 
     snapshot = tracker.get_job(JOB_1)
     assert snapshot is not None
@@ -488,7 +475,7 @@ async def test_reserved_upload_commit_failure_stops_admission(
     assert scheduler.fatal
     assert not scheduler.accepting
     with pytest.raises(SchedulerError) as raised:
-        scheduler.submit_youtube_video("https://example.test/watch?v=later")
+        scheduler.submit_video("https://example.test/watch?v=later")
     assert raised.value.code == "scheduler_unavailable"
 
 
@@ -505,18 +492,20 @@ async def test_reserved_upload_requires_completed_matching_local_write(
     queued: list[JobQueued] = []
     bus.on(JOB_QUEUED, queued.append)
     reservation = scheduler.reserve_local_upload("video.mp4", None, None)
-    staged = StagedArtifact(
-        JOB_1,
-        ARTIFACT_1,
+    mismatched = UploadReservation(
+        reservation.job_id,
+        reservation.artifact_id,
         reservation.destination,
         reservation.filename,
-        None,
-        4,
-        None,
+        reservation.media_type,
+        "different caption",
     )
-
+    with pytest.raises(SchedulerError, match="does not match"):
+        scheduler.enqueue_reserved_upload(mismatched, 4)
+    with pytest.raises(SchedulerError, match="size"):
+        scheduler.enqueue_reserved_upload(reservation, -1)
     try:
-        scheduler.enqueue_reserved_upload(staged)
+        scheduler.enqueue_reserved_upload(reservation, 4)
     except SchedulerError as error:
         assert error.code == "upload_not_staged"
     else:
@@ -526,9 +515,11 @@ async def test_reserved_upload_requires_completed_matching_local_write(
     assert scheduler.pending_count == 0
 
     reservation.destination.write_bytes(b"done")
-    assert scheduler.enqueue_reserved_upload(staged) == JOB_1
+    assert scheduler.enqueue_reserved_upload(
+        reservation, 4
+    ) == JobRef(JOB_1, f"/jobs/{JOB_1}")
     with pytest.raises(SchedulerError, match="reservation"):
-        scheduler.enqueue_reserved_upload(staged)
+        scheduler.enqueue_reserved_upload(reservation, 4)
 
 
 async def test_telegram_unavailable_pauses_start_until_explicit_resume() -> None:
@@ -547,19 +538,19 @@ async def test_telegram_unavailable_pauses_start_until_explicit_resume() -> None
     )
     assert not scheduler.accepting
     unavailable_actions = [
-        lambda: scheduler.submit_youtube_video("https://example.test/watch?v=new"),
-        lambda: scheduler.submit_playlist_expansion("https://example.test/list"),
+        lambda: scheduler.submit_video("https://example.test/watch?v=new"),
+        lambda: scheduler.submit_playlist("https://example.test/list"),
         lambda: scheduler.reserve_local_upload("video.mp4", None, None),
         lambda: scheduler.enqueue_reserved_upload(
-            StagedArtifact(
+            UploadReservation(
                 JOB_3,
                 ARTIFACT_1,
                 Path("/private/staged/video.mp4"),
                 "video.mp4",
                 None,
-                1,
                 None,
-            )
+            ),
+            1,
         ),
     ]
     for action in unavailable_actions:
@@ -572,10 +563,14 @@ async def test_telegram_unavailable_pauses_start_until_explicit_resume() -> None
     assert scheduler.pending_count == 0
 
     scheduler.resume()
-    scheduler.submit_youtube_video("https://example.test/watch?v=one")
+    scheduler.submit_video("https://example.test/watch?v=one")
     await flush_pump()
 
     assert not scheduler.paused
+    assert scheduler.active_id == JOB_1
+    scheduler.pause()
+    assert scheduler.paused
+    assert not scheduler.accepting
     assert scheduler.active_id == JOB_1
 
 
@@ -586,8 +581,8 @@ async def test_pause_keeps_active_owner_and_stop_prevents_future_start() -> None
         id_factory=iter((JOB_1, JOB_2, JOB_3)).__next__,
         clock=lambda: NOW,
     )
-    scheduler.submit_youtube_video("https://example.test/watch?v=one")
-    scheduler.submit_youtube_video("https://example.test/watch?v=two")
+    scheduler.submit_video("https://example.test/watch?v=one")
+    scheduler.submit_video("https://example.test/watch?v=two")
     await flush_pump()
     assert scheduler.active_id == JOB_1
 
@@ -613,7 +608,7 @@ async def test_pause_keeps_active_owner_and_stop_prevents_future_start() -> None
     assert scheduler.pending_count == 1
 
     with pytest.raises(SchedulerError) as raised:
-        scheduler.submit_youtube_video("https://example.test/watch?v=three")
+        scheduler.submit_video("https://example.test/watch?v=three")
     assert raised.value.code == "scheduler_unavailable"
 
 
@@ -625,8 +620,8 @@ async def test_upload_terminal_events_advance_ready_owner(topic: str) -> None:
         id_factory=iter((JOB_1, JOB_2)).__next__,
         clock=lambda: NOW,
     )
-    scheduler.submit_youtube_video("https://example.test/watch?v=one")
-    scheduler.submit_youtube_video("https://example.test/watch?v=two")
+    scheduler.submit_video("https://example.test/watch?v=one")
+    scheduler.submit_video("https://example.test/watch?v=two")
     await flush_pump()
     bus.emit(
         ARTIFACT_READY,
@@ -666,12 +661,12 @@ async def test_invalid_source_does_not_consume_id_or_mutate_queue() -> None:
     )
 
     with pytest.raises(ValueError, match="source_url"):
-        scheduler.submit_youtube_video("  ")
+        scheduler.submit_video("  ")
 
     assert scheduler.pending_count == 0
-    assert scheduler.submit_youtube_video(
+    assert scheduler.submit_video(
         "https://example.test/watch?v=valid"
-    ) == JOB_1
+    ) == JobRef(JOB_1, f"/jobs/{JOB_1}")
 
 
 async def test_stop_from_synchronous_queued_listener_blocks_same_pump_start() -> None:
@@ -690,7 +685,7 @@ async def test_stop_from_synchronous_queued_listener_blocks_same_pump_start() ->
         scheduler.stop()
 
     bus.on(JOB_QUEUED, stop_on_child)
-    scheduler.submit_playlist_expansion("https://example.test/playlist")
+    scheduler.submit_playlist("https://example.test/playlist")
     await flush_pump()
     bus.emit(
         YOUTUBE_PLAYLIST_EXPANDED,
@@ -731,8 +726,8 @@ async def test_tracker_and_scheduler_reject_invalid_matching_terminals(
             bus, id_factory=ids.__next__, clock=clock_values.__next__
         )
 
-    scheduler.submit_youtube_video("https://example.test/watch?v=one")
-    scheduler.submit_youtube_video("https://example.test/watch?v=two")
+    scheduler.submit_video("https://example.test/watch?v=one")
+    scheduler.submit_video("https://example.test/watch?v=two")
     await flush_pump()
 
     bus.emit(
@@ -820,20 +815,10 @@ async def test_cancel_reserved_upload_does_not_cancel_queued_job(
         id_factory=iter((JOB_1, JOB_2, ARTIFACT_1)).__next__,
         clock=lambda: NOW,
     )
-    scheduler.submit_youtube_video("https://example.test/watch?v=active")
+    scheduler.submit_video("https://example.test/watch?v=active")
     reservation = scheduler.reserve_local_upload("video.mp4", None, None)
     reservation.destination.write_bytes(b"done")
-    scheduler.enqueue_reserved_upload(
-        StagedArtifact(
-            JOB_2,
-            ARTIFACT_1,
-            reservation.destination,
-            reservation.filename,
-            None,
-            4,
-            None,
-        )
-    )
+    scheduler.enqueue_reserved_upload(reservation, 4)
     await flush_pump()
 
     assert not scheduler.cancel_reserved_upload(JOB_2)
@@ -875,20 +860,10 @@ async def test_stop_cleans_reserved_and_waiting_staged_uploads(
         ).__next__,
         clock=lambda: NOW,
     )
-    scheduler.submit_youtube_video("https://example.test/watch?v=active")
+    scheduler.submit_video("https://example.test/watch?v=active")
     waiting = scheduler.reserve_local_upload("waiting.mp4", None, None)
     waiting.destination.write_bytes(b"wait")
-    scheduler.enqueue_reserved_upload(
-        StagedArtifact(
-            JOB_2,
-            ARTIFACT_1,
-            waiting.destination,
-            waiting.filename,
-            None,
-            4,
-            None,
-        )
-    )
+    scheduler.enqueue_reserved_upload(waiting, 4)
     reserved = scheduler.reserve_local_upload("reserved.mp4", None, None)
     await flush_pump()
     assert scheduler.active_id == JOB_1
@@ -915,17 +890,7 @@ async def test_cancel_and_stop_never_delete_active_staged_upload(
     )
     reservation = scheduler.reserve_local_upload("active.mp4", None, None)
     reservation.destination.write_bytes(b"live")
-    scheduler.enqueue_reserved_upload(
-        StagedArtifact(
-            JOB_1,
-            ARTIFACT_1,
-            reservation.destination,
-            reservation.filename,
-            None,
-            4,
-            None,
-        )
-    )
+    scheduler.enqueue_reserved_upload(reservation, 4)
     await flush_pump()
 
     assert not scheduler.cancel_reserved_upload(JOB_1)
@@ -1000,7 +965,7 @@ async def test_playlist_derived_facts_respect_causal_time_during_clock_rollback(
     ):
         bus.on(topic, facts.append)
 
-    scheduler.submit_playlist_expansion("https://example.test/playlist")
+    scheduler.submit_playlist("https://example.test/playlist")
     await flush_pump()
     bus.emit(
         YOUTUBE_PLAYLIST_EXPANDED,
@@ -1048,17 +1013,7 @@ async def test_staged_start_and_ready_respect_queued_time_during_clock_rollback(
     bus.on(JOB_STARTED, starts.append)
     bus.on(ARTIFACT_READY, ready_facts.append)
 
-    scheduler.enqueue_reserved_upload(
-        StagedArtifact(
-            JOB_1,
-            ARTIFACT_1,
-            reservation.destination,
-            reservation.filename,
-            None,
-            4,
-            None,
-        )
-    )
+    scheduler.enqueue_reserved_upload(reservation, 4)
     await flush_pump()
 
     assert errors == []
@@ -1089,21 +1044,11 @@ async def test_staged_file_drift_fails_safely_without_artifact_ready(
     bus.on(ARTIFACT_READY, ready_facts.append)
     bus.on(ARTIFACT_UPLOAD_FAILED, upload_failures.append)
 
-    scheduler.submit_youtube_video("https://example.test/watch?v=active")
+    scheduler.submit_video("https://example.test/watch?v=active")
     reservation = scheduler.reserve_local_upload("staged.mp4", None, None)
     reservation.destination.write_bytes(b"first")
-    scheduler.enqueue_reserved_upload(
-        StagedArtifact(
-            JOB_2,
-            ARTIFACT_1,
-            reservation.destination,
-            reservation.filename,
-            None,
-            5,
-            None,
-        )
-    )
-    scheduler.submit_youtube_video("https://example.test/watch?v=later")
+    scheduler.enqueue_reserved_upload(reservation, 5)
+    scheduler.submit_video("https://example.test/watch?v=later")
     await flush_pump()
     reservation.destination.unlink()
     reservation.destination.write_bytes(b"other")

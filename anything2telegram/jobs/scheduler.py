@@ -10,8 +10,10 @@ from uuid import UUID, uuid4
 from ..artifacts.storage import ArtifactStorageError
 from ..bus import EventBus
 from ..domain import (
+    BatchRef,
     ErrorInfo,
     JobPhase,
+    JobRef,
     SourceKind,
     StagedArtifact,
     UploadReservation,
@@ -175,7 +177,11 @@ class JobScheduler:
     def accepting(self) -> bool:
         return not (self._paused or self._stopped or self._fatal)
 
-    def submit_youtube_video(self, source_url: str) -> UUID:
+    def submit_video(self, source_url: str) -> JobRef:
+        job_id = self._submit_video_id(source_url)
+        return JobRef(job_id, f"/jobs/{job_id}")
+
+    def _submit_video_id(self, source_url: str) -> UUID:
         asyncio.get_running_loop()
         self._require_accepting()
         self._require_source_url(source_url)
@@ -194,7 +200,11 @@ class JobScheduler:
         self._request_pump_after_commit()
         return job_id
 
-    def submit_playlist_expansion(self, source_url: str) -> UUID:
+    def submit_playlist(self, source_url: str) -> BatchRef:
+        batch_id = self._submit_playlist_id(source_url)
+        return BatchRef(batch_id, f"/batches/{batch_id}")
+
+    def _submit_playlist_id(self, source_url: str) -> UUID:
         asyncio.get_running_loop()
         self._require_accepting()
         self._require_source_url(source_url)
@@ -225,28 +235,38 @@ class JobScheduler:
         self._reservations[job_id] = reservation
         return reservation
 
-    def enqueue_reserved_upload(self, staged: StagedArtifact) -> UUID:
+    def enqueue_reserved_upload(
+        self, reservation: UploadReservation, size_bytes: int
+    ) -> JobRef:
         asyncio.get_running_loop()
         self._require_accepting()
-        if not isinstance(staged, StagedArtifact):
+        if not isinstance(reservation, UploadReservation):
             raise SchedulerError(
                 "invalid_reservation", "Upload reservation is invalid"
             )
-        reservation = self._reservations.get(staged.job_id)
-        if reservation is None:
+        expected = self._reservations.get(reservation.job_id)
+        if expected is None:
             raise SchedulerError(
                 "invalid_reservation", "Upload reservation is unknown"
             )
-        if (
-            staged.artifact_id != reservation.artifact_id
-            or staged.local_path != reservation.destination
-            or staged.filename != reservation.filename
-            or staged.media_type != reservation.media_type
-            or staged.caption != reservation.caption
-        ):
+        if reservation != expected:
             raise SchedulerError(
                 "invalid_reservation", "Upload reservation does not match"
             )
+        try:
+            staged = StagedArtifact(
+                reservation.job_id,
+                reservation.artifact_id,
+                reservation.destination,
+                reservation.filename,
+                reservation.media_type,
+                size_bytes,
+                reservation.caption,
+            )
+        except (TypeError, ValueError):
+            raise SchedulerError(
+                "invalid_reservation", "Upload size is invalid"
+            ) from None
         if self._storage is None:
             raise SchedulerError(
                 "upload_not_staged", "Local upload has not been staged"
@@ -271,7 +291,10 @@ class JobScheduler:
         self._queue.append(_StagedWork(staged, occurred_at, identity))
         self._emit_committed(JOB_QUEUED, event)
         self._request_pump_after_commit()
-        return staged.job_id
+        return JobRef(staged.job_id, f"/jobs/{staged.job_id}")
+
+    def pause(self) -> None:
+        self._paused = True
 
     def resume(self) -> None:
         if self._stopped or self._fatal or not self._paused:
@@ -363,7 +386,7 @@ class JobScheduler:
             raise ValueError("source_url must not be blank")
 
     def _request_pump(self) -> None:
-        if self._stopped or self._fatal or self._pump_scheduled:
+        if self._paused or self._stopped or self._fatal or self._pump_scheduled:
             return
         self._pump_scheduled = True
         asyncio.get_running_loop().call_soon(self._pump)
@@ -504,7 +527,7 @@ class JobScheduler:
         self._request_pump()
 
     def _on_telegram_unavailable(self, event: TelegramUnavailable) -> None:
-        self._paused = True
+        self.pause()
 
     def _pump(self) -> None:
         try:
