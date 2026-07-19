@@ -1,3 +1,4 @@
+import asyncio
 import errno
 import logging
 from datetime import datetime
@@ -35,6 +36,9 @@ _MAX_FORM_FIELD_BYTES = 4096
 
 
 class Scheduler(Protocol):
+    @property
+    def accepting(self) -> bool: ...
+
     def submit_youtube_video(self, source_url: str) -> UUID: ...
 
     def submit_playlist_expansion(self, source_url: str) -> UUID: ...
@@ -57,10 +61,14 @@ class Tracker(Protocol):
     def get_batch(self, batch_id: UUID) -> BatchSnapshot | None: ...
 
 
+class UploadSource(Protocol):
+    async def read(self, size: int) -> bytes: ...
+
+
 class Storage(Protocol):
     async def stage(
         self,
-        upload: UploadFile,
+        upload: UploadSource,
         reservation: UploadReservation,
         max_bytes: int,
     ) -> StagedArtifact: ...
@@ -102,6 +110,17 @@ class _BoundedMultiPartParser(MultiPartParser):
         super().on_part_data(data, start, end)
 
 
+class _DisconnectAwareUpload:
+    def __init__(self, request: Request, upload: UploadFile) -> None:
+        self._request = request
+        self._upload = upload
+
+    async def read(self, size: int) -> bytes:
+        if await self._request.is_disconnected():
+            raise ClientDisconnect()
+        return await self._upload.read(size)
+
+
 def _safe_log(message: str) -> None:
     try:
         _LOGGER.error(message)
@@ -131,6 +150,13 @@ def _safe_bool(check: object, method_name: str) -> bool:
     try:
         method = getattr(check, method_name)
         return method() is True
+    except Exception:
+        return False
+
+
+def _scheduler_accepting(scheduler: Scheduler) -> bool:
+    try:
+        return scheduler.accepting is True
     except Exception:
         return False
 
@@ -283,8 +309,12 @@ async def _close_form(form: FormData | None) -> None:
         return
     try:
         await form.close()
-    except BaseException:
+    except Exception:
         _safe_log("Multipart temporary file cleanup failed")
+
+
+def _scheduler_unavailable(error: SchedulerError) -> bool:
+    return error.code in {"scheduler_unavailable", "scheduler_stopped"}
 
 
 def create_jobs_app(
@@ -302,8 +332,10 @@ def create_jobs_app(
     app = FastAPI()
 
     def accepting() -> bool:
-        return _safe_bool(readiness, "is_accepting") and _safe_bool(
-            telegram, "is_connected"
+        return (
+            _safe_bool(readiness, "is_accepting")
+            and _safe_bool(telegram, "is_connected")
+            and _scheduler_accepting(scheduler)
         )
 
     @app.exception_handler(RequestValidationError)
@@ -367,7 +399,7 @@ def create_jobs_app(
             batch_id = scheduler.submit_playlist_expansion(request.url)
             return _submission_body("batch", batch_id, "batches")
         except SchedulerError as error:
-            if error.code == "scheduler_stopped":
+            if _scheduler_unavailable(error):
                 return _service_unavailable()
             return _error(500, "submission_failed", "Submission failed")
         except Exception:
@@ -407,6 +439,9 @@ def create_jobs_app(
         if not file.filename:
             await _close_form(form)
             return _error(422, "invalid_request", "Request is invalid")
+        if not accepting():
+            await _close_form(form)
+            return _service_unavailable()
 
         try:
             try:
@@ -416,7 +451,7 @@ def create_jobs_app(
                     caption,
                 )
             except SchedulerError as error:
-                if error.code == "scheduler_stopped":
+                if _scheduler_unavailable(error):
                     return _service_unavailable()
                 return _error(
                     500,
@@ -435,15 +470,27 @@ def create_jobs_app(
                 )
 
             try:
-                staged = await storage.stage(file, reservation, max_upload_bytes)
+                staged = await storage.stage(
+                    _DisconnectAwareUpload(request, file),
+                    reservation,
+                    max_upload_bytes,
+                )
+                await asyncio.sleep(0)
+                if await request.is_disconnected():
+                    raise ClientDisconnect()
+                if not accepting():
+                    _cancel_reservation(scheduler, reservation.job_id)
+                    return _service_unavailable()
                 job_id = scheduler.enqueue_reserved_upload(staged)
             except ArtifactStorageError as error:
                 _cancel_reservation(scheduler, reservation.job_id)
                 return _storage_error(error)
             except SchedulerError as error:
-                _cancel_reservation(scheduler, reservation.job_id)
-                if error.code == "scheduler_stopped":
+                if _scheduler_unavailable(error):
+                    if not error.committed:
+                        _cancel_reservation(scheduler, reservation.job_id)
                     return _service_unavailable()
+                _cancel_reservation(scheduler, reservation.job_id)
                 return _error(
                     500,
                     "upload_enqueue_failed",
@@ -453,7 +500,8 @@ def create_jobs_app(
                 _cancel_reservation(scheduler, reservation.job_id)
                 raise
             except Exception:
-                _cancel_reservation(scheduler, reservation.job_id)
+                if _scheduler_accepting(scheduler):
+                    _cancel_reservation(scheduler, reservation.job_id)
                 return _error(
                     500,
                     "upload_staging_failed",
@@ -491,7 +539,11 @@ def create_jobs_app(
     @app.get("/health")
     async def health() -> JSONResponse:
         telegram_connected = _safe_bool(telegram, "is_connected")
-        ready = _safe_bool(readiness, "is_accepting") and telegram_connected
+        ready = (
+            _safe_bool(readiness, "is_accepting")
+            and telegram_connected
+            and _scheduler_accepting(scheduler)
+        )
         return JSONResponse(
             status_code=200 if ready else 503,
             content={

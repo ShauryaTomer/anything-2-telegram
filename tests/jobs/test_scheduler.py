@@ -413,9 +413,13 @@ async def test_reserved_staged_upload_waits_for_fifo_turn(tmp_path: Path) -> Non
     ]
 
 
-async def test_reserved_upload_listener_failure_is_contained_and_fact_delivered(
+@pytest.mark.parametrize(
+    "failure_phase", ["dispatch", "pump", "start", "assembly"]
+)
+async def test_reserved_upload_commit_failure_stops_admission(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
 ) -> None:
     class RecordingLogger:
         def __init__(self) -> None:
@@ -434,9 +438,20 @@ async def test_reserved_upload_listener_failure_is_contained_and_fact_delivered(
         clock=lambda: NOW,
         logger=logger,
     )
-    bus.on(JOB_QUEUED, lambda _event: (_ for _ in ()).throw(RuntimeError("private")))
     tracker = JobTracker()
     tracker.register(bus)
+    if failure_phase in {"dispatch", "assembly"}:
+        if failure_phase == "assembly":
+            bus.on("error", scheduler.fail)
+        bus.on(
+            JOB_QUEUED,
+            lambda _event: (_ for _ in ()).throw(RuntimeError("private")),
+        )
+    elif failure_phase == "start":
+        bus.on(
+            JOB_STARTED,
+            lambda _event: (_ for _ in ()).throw(RuntimeError("private")),
+        )
     reservation = scheduler.reserve_local_upload("video.mp4", None, None)
     reservation.destination.write_bytes(b"done")
     staged = StagedArtifact(
@@ -452,17 +467,29 @@ async def test_reserved_upload_listener_failure_is_contained_and_fact_delivered(
     def fail_pump_schedule() -> None:
         raise RuntimeError("private loop detail")
 
-    monkeypatch.setattr(scheduler, "_request_pump", fail_pump_schedule)
+    if failure_phase == "pump":
+        monkeypatch.setattr(scheduler, "_request_pump", fail_pump_schedule)
 
-    assert scheduler.enqueue_reserved_upload(staged) == JOB_1
-    assert scheduler.pending_count == 1
+    if failure_phase == "start":
+        assert scheduler.enqueue_reserved_upload(staged) == JOB_1
+        with pytest.raises(RuntimeError):
+            scheduler._pump()
+    else:
+        expected_error = SchedulerError if failure_phase == "assembly" else RuntimeError
+        with pytest.raises(expected_error):
+            scheduler.enqueue_reserved_upload(staged)
+
     snapshot = tracker.get_job(JOB_1)
     assert snapshot is not None
-    assert snapshot.status is JobStatus.WAITING
-    assert logger.errors == [
-        "Event listener failed",
-        "Scheduler pump scheduling failed",
-    ]
+    expected_status = (
+        JobStatus.UPLOADING if failure_phase == "start" else JobStatus.WAITING
+    )
+    assert snapshot.status is expected_status
+    assert scheduler.fatal
+    assert not scheduler.accepting
+    with pytest.raises(SchedulerError) as raised:
+        scheduler.submit_youtube_video("https://example.test/watch?v=later")
+    assert raised.value.code == "scheduler_unavailable"
 
 
 async def test_reserved_upload_requires_completed_matching_local_write(
@@ -518,14 +545,34 @@ async def test_telegram_unavailable_pauses_start_until_explicit_resume() -> None
             ErrorInfo("telegram_unavailable", "Telegram unavailable"), NOW
         ),
     )
-    scheduler.submit_youtube_video("https://example.test/watch?v=one")
-    await flush_pump()
+    assert not scheduler.accepting
+    unavailable_actions = [
+        lambda: scheduler.submit_youtube_video("https://example.test/watch?v=new"),
+        lambda: scheduler.submit_playlist_expansion("https://example.test/list"),
+        lambda: scheduler.reserve_local_upload("video.mp4", None, None),
+        lambda: scheduler.enqueue_reserved_upload(
+            StagedArtifact(
+                JOB_3,
+                ARTIFACT_1,
+                Path("/private/staged/video.mp4"),
+                "video.mp4",
+                None,
+                1,
+                None,
+            )
+        ),
+    ]
+    for action in unavailable_actions:
+        with pytest.raises(SchedulerError) as raised:
+            action()
+        assert raised.value.code == "scheduler_unavailable"
 
     assert scheduler.paused
     assert scheduler.active_id is None
-    assert scheduler.pending_count == 1
+    assert scheduler.pending_count == 0
 
     scheduler.resume()
+    scheduler.submit_youtube_video("https://example.test/watch?v=one")
     await flush_pump()
 
     assert not scheduler.paused
@@ -567,7 +614,7 @@ async def test_pause_keeps_active_owner_and_stop_prevents_future_start() -> None
 
     with pytest.raises(SchedulerError) as raised:
         scheduler.submit_youtube_video("https://example.test/watch?v=three")
-    assert raised.value.code == "scheduler_stopped"
+    assert raised.value.code == "scheduler_unavailable"
 
 
 @pytest.mark.parametrize("topic", [ARTIFACT_UPLOADED, ARTIFACT_UPLOAD_FAILED])

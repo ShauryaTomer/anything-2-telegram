@@ -5,7 +5,7 @@ from uuid import UUID
 import pytest
 import starlette.formparsers as formparsers
 from fastapi.testclient import TestClient
-from starlette.requests import ClientDisconnect
+from starlette.requests import ClientDisconnect, Request
 
 from anything2telegram.artifacts.storage import ArtifactStorageError
 from anything2telegram.domain import (
@@ -18,6 +18,7 @@ from anything2telegram.domain import (
     StagedArtifact,
     UploadReservation,
 )
+from anything2telegram.jobs.scheduler import SchedulerError
 from api.jobs import create_jobs_app
 
 
@@ -36,15 +37,22 @@ class FakeScheduler:
         self.calls: list[object] = []
         self.cancelled: list[UUID] = []
         self.reserve_error: Exception | None = None
+        self.submission_error: Exception | None = None
+        self.enqueue_error: Exception | None = None
         self.cancel_result = True
         self.cancel_error: Exception | None = None
+        self.accepting = True
 
     def submit_youtube_video(self, url: str) -> UUID:
         self.calls.append(("video", url))
+        if self.submission_error is not None:
+            raise self.submission_error
         return JOB_ID
 
     def submit_playlist_expansion(self, url: str) -> UUID:
         self.calls.append(("playlist", url))
+        if self.submission_error is not None:
+            raise self.submission_error
         return BATCH_ID
 
     def reserve_local_upload(
@@ -64,6 +72,9 @@ class FakeScheduler:
 
     def enqueue_reserved_upload(self, staged: StagedArtifact) -> UUID:
         self.calls.append(("enqueue", staged.size_bytes))
+        if self.enqueue_error is not None:
+            self.accepting = False
+            raise self.enqueue_error
         return staged.job_id
 
     def cancel_reserved_upload(self, job_id: UUID) -> bool:
@@ -78,18 +89,21 @@ class FakeStorage:
     def __init__(self, error: BaseException | None = None) -> None:
         self.error = error
         self.upload: object | None = None
+        self.lose_readiness = False
 
     async def stage(
         self, upload: object, reservation: UploadReservation, max_bytes: int
     ) -> StagedArtifact:
         scheduler.calls.append(("stage", max_bytes))
-        self.upload = upload
+        self.upload = getattr(upload, "_upload", upload)
         if self.error is not None:
             raise self.error
         chunks = []
         while chunk := await upload.read(2):
             chunks.append(chunk)
             scheduler.calls.append(("read", len(chunk)))
+        if self.lose_readiness:
+            readiness.accepting = False
         return StagedArtifact(
             reservation.job_id,
             reservation.artifact_id,
@@ -118,8 +132,11 @@ class FakeTracker:
 
 class FakeReadiness:
     accepting = True
+    responses: list[bool] = []
 
     def is_accepting(self) -> bool:
+        if self.responses:
+            return self.responses.pop(0)
         return self.accepting
 
 
@@ -216,6 +233,16 @@ def test_youtube_validation_and_readiness_have_stable_errors() -> None:
     }
     assert scheduler.calls == []
 
+    readiness.accepting = True
+    scheduler.submission_error = SchedulerError(
+        "scheduler_unavailable", "unsafe ignored"
+    )
+    response = client.post(
+        "/jobs/youtube", json={"url": "https://youtu.be/abcdefghijk"}
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "service_unavailable"
+
     framework_errors = [
         (client.get("/unknown"), 404, "not_found", "Resource not found"),
         (
@@ -288,6 +315,27 @@ def test_upload_streams_stage_before_enqueue_and_returns_exact_202() -> None:
     assert response.status_code == 422
     assert scheduler.calls == []
 
+    readiness.responses = [True, False]
+    response = client.post(
+        "/jobs/upload",
+        files={"file": ("video.mp4", b"small", "video/mp4")},
+    )
+    assert response.status_code == 503
+    assert scheduler.calls == []
+
+    readiness.accepting = True
+    storage.lose_readiness = True
+    response = client.post(
+        "/jobs/upload",
+        files={"file": ("video.mp4", b"small", "video/mp4")},
+    )
+    assert response.status_code == 503
+    assert scheduler.cancelled == [JOB_ID]
+    assert not any(call[0] == "enqueue" for call in scheduler.calls)
+
+    readiness.accepting = True
+    storage.lose_readiness = False
+    scheduler.calls.clear()
     response = client.post(
         "/jobs/upload",
         files={"file": ("large.mp4", b"01234567890", "video/mp4")},
@@ -347,17 +395,27 @@ def test_upload_streams_stage_before_enqueue_and_returns_exact_202() -> None:
             "upload_reservation_failed",
             "Upload could not be reserved",
         ),
+        (
+            "enqueue",
+            SchedulerError("scheduler_unavailable", "unsafe ignored"),
+            503,
+            "service_unavailable",
+            "Service is not ready",
+        ),
     ],
 )
 def test_upload_staging_failures_cancel_without_enqueue(
     phase: str,
-    error: ArtifactStorageError,
+    error: Exception,
     status: int,
     code: str,
     message: str,
 ) -> None:
     if phase == "reserve":
         scheduler.reserve_error = error
+    elif phase == "enqueue":
+        error.committed = True
+        scheduler.enqueue_error = error
     else:
         storage.error = error
 
@@ -368,17 +426,31 @@ def test_upload_staging_failures_cancel_without_enqueue(
     assert response.status_code == status
     assert response.json() == {"detail": {"code": code, "message": message}}
     assert scheduler.cancelled == ([JOB_ID] if phase == "stage" else [])
-    assert not any(call[0] == "enqueue" for call in scheduler.calls)
+    assert (phase == "enqueue") is any(
+        call[0] == "enqueue" for call in scheduler.calls
+    )
 
 
-@pytest.mark.parametrize("stage_error", [ClientDisconnect(), FatalStage()])
+@pytest.mark.parametrize("failure", ["post_stage_disconnect", "fatal_stage"])
 def test_upload_cancellation_cleans_reservation_and_reraises(
-    stage_error: BaseException, caplog: pytest.LogCaptureFixture
+    failure: str,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    storage.error = stage_error
+    if failure == "post_stage_disconnect":
+        disconnect_checks = iter((False, False, False, False, True))
+
+        async def disconnected(_request: Request) -> bool:
+            return next(disconnect_checks)
+
+        monkeypatch.setattr(Request, "is_disconnected", disconnected)
+        expected_error = ClientDisconnect
+    else:
+        storage.error = FatalStage()
+        expected_error = FatalStage
     scheduler.cancel_result = False
 
-    with pytest.raises(type(stage_error)):
+    with pytest.raises(expected_error):
         client.post(
             "/jobs/upload",
             files={"file": ("video.mp4", b"abcdef", "video/mp4")},
@@ -541,3 +613,19 @@ def test_health_is_exact_and_tracks_runtime_disconnect() -> None:
         "ready": False,
         "telegram_connected": True,
     }
+
+    readiness.accepting = True
+    scheduler.accepting = False
+    response = client.get("/health")
+    assert response.status_code == 503
+    assert response.json() == {
+        "ready": False,
+        "telegram_connected": True,
+    }
+    scheduler.calls.clear()
+    response = client.post(
+        "/jobs/upload",
+        files={"file": ("video.mp4", b"small", "video/mp4")},
+    )
+    assert response.status_code == 503
+    assert scheduler.calls == []

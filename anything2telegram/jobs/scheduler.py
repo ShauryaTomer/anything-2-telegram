@@ -94,9 +94,16 @@ class _ReservationStorage(Protocol):
 
 
 class SchedulerError(Exception):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        committed: bool = False,
+    ) -> None:
         self.code = code
         self.message = message
+        self.committed = committed
         super().__init__(message)
 
 
@@ -115,7 +122,6 @@ class JobScheduler:
         self._id_factory = id_factory
         self._clock = clock
         self._logger = logger if logger is not None else logging.getLogger(__name__)
-        bus.on("error", self._on_event_listener_error)
         self._queue: deque[_Work] = deque()
         self._active: _Work | None = None
         self._active_phase: JobPhase | None = None
@@ -126,6 +132,8 @@ class JobScheduler:
         self._pump_scheduled = False
         self._paused = False
         self._stopped = False
+        self._fatal = False
+        self._fatal_error: object | None = None
         bus.on(ARTIFACT_READY, self._on_artifact_ready)
         bus.on(ARTIFACT_PRODUCTION_FAILED, self._on_job_terminal)
         bus.on(ARTIFACT_UPLOADED, self._on_job_terminal)
@@ -159,6 +167,14 @@ class JobScheduler:
     def stopped(self) -> bool:
         return self._stopped
 
+    @property
+    def fatal(self) -> bool:
+        return self._fatal
+
+    @property
+    def accepting(self) -> bool:
+        return not (self._paused or self._stopped or self._fatal)
+
     def submit_youtube_video(self, source_url: str) -> UUID:
         asyncio.get_running_loop()
         self._require_accepting()
@@ -174,8 +190,8 @@ class JobScheduler:
             occurred_at,
         )
         self._queue.append(_YouTubeWork(job_id, source_url, occurred_at))
-        self._bus.emit(JOB_QUEUED, event)
-        self._request_pump()
+        self._emit_committed(JOB_QUEUED, event)
+        self._request_pump_after_commit()
         return job_id
 
     def submit_playlist_expansion(self, source_url: str) -> UUID:
@@ -186,8 +202,8 @@ class JobScheduler:
         occurred_at = self._clock()
         event = BatchCreated(batch_id, source_url, occurred_at)
         self._queue.append(_PlaylistWork(batch_id, source_url, occurred_at))
-        self._bus.emit(BATCH_CREATED, event)
-        self._request_pump()
+        self._emit_committed(BATCH_CREATED, event)
+        self._request_pump_after_commit()
         return batch_id
 
     def reserve_local_upload(
@@ -253,12 +269,12 @@ class JobScheduler:
         )
         del self._reservations[staged.job_id]
         self._queue.append(_StagedWork(staged, occurred_at, identity))
-        self._bus.emit(JOB_QUEUED, event)
+        self._emit_committed(JOB_QUEUED, event)
         self._request_pump_after_commit()
         return staged.job_id
 
     def resume(self) -> None:
-        if self._stopped or not self._paused:
+        if self._stopped or self._fatal or not self._paused:
             return
         self._paused = False
         self._request_pump()
@@ -272,6 +288,19 @@ class JobScheduler:
                 self._best_effort_cleanup(
                     self._release_waiting_staged_upload, work
                 )
+
+    def fail(self, error: object | None = None) -> None:
+        if self._fatal:
+            return
+        self._fatal = True
+        self._fatal_error = error
+        self._pump_scheduled = False
+        self.stop()
+        if isinstance(self._active, _StagedWork) and self._storage is not None:
+            self._best_effort_cleanup(
+                self._storage.delete_job_directory,
+                self._active.job_id,
+            )
 
     def cancel_reserved_upload(self, job_id: UUID) -> bool:
         if not isinstance(job_id, UUID):
@@ -304,16 +333,26 @@ class JobScheduler:
             except Exception:
                 pass
 
-    def _on_event_listener_error(self, _error: object) -> None:
-        try:
-            self._logger.error("Event listener failed")
-        except BaseException:
-            pass
-
     def _require_accepting(self) -> None:
-        if self._stopped:
+        if not self.accepting:
             raise SchedulerError(
-                "scheduler_stopped", "Scheduler has been stopped"
+                "scheduler_unavailable", "Scheduler is unavailable"
+            )
+
+    def _emit_committed(self, topic: str, event: object) -> None:
+        try:
+            self._bus.emit(topic, event)
+        except Exception as error:
+            self.fail(error)
+            raise
+        self._raise_if_fatal(committed=True)
+
+    def _raise_if_fatal(self, *, committed: bool) -> None:
+        if self._fatal:
+            raise SchedulerError(
+                "scheduler_unavailable",
+                "Scheduler is unavailable",
+                committed=committed,
             )
 
     @staticmethod
@@ -324,7 +363,7 @@ class JobScheduler:
             raise ValueError("source_url must not be blank")
 
     def _request_pump(self) -> None:
-        if self._stopped or self._pump_scheduled:
+        if self._stopped or self._fatal or self._pump_scheduled:
             return
         self._pump_scheduled = True
         asyncio.get_running_loop().call_soon(self._pump)
@@ -332,12 +371,13 @@ class JobScheduler:
     def _request_pump_after_commit(self) -> None:
         try:
             self._request_pump()
-        except Exception:
-            self._pump_scheduled = False
+        except Exception as error:
+            self.fail(error)
             try:
                 self._logger.error("Scheduler pump scheduling failed")
             except BaseException:
                 pass
+            raise
 
     def _on_job_terminal(
         self,
@@ -467,14 +507,26 @@ class JobScheduler:
         self._paused = True
 
     def _pump(self) -> None:
+        try:
+            self._run_pump()
+        except Exception as error:
+            self.fail(error)
+            raise
+
+    def _emit_pump(self, topic: str, event: object) -> None:
+        self._bus.emit(topic, event)
+        self._raise_if_fatal(committed=True)
+
+    def _run_pump(self) -> None:
         self._pump_scheduled = False
-        if self._stopped:
+        if self._stopped or self._fatal:
             return
         while self._deferred_facts:
             topic, event = self._deferred_facts.popleft()
-            self._bus.emit(topic, event)
+            self._emit_pump(topic, event)
         if (
             self._stopped
+            or self._fatal
             or self._paused
             or self._active is not None
             or not self._queue
@@ -487,7 +539,7 @@ class JobScheduler:
             self._active_artifact_id = None
             occurred_at = self._at_or_after(work.causal_at)
             self._active_causal_at = occurred_at
-            self._bus.emit(
+            self._emit_pump(
                 YOUTUBE_PLAYLIST_EXPANSION_REQUESTED,
                 PlaylistExpansionRequested(
                     work.batch_id, work.source_url, occurred_at
@@ -500,7 +552,7 @@ class JobScheduler:
             self._active_artifact_id = staged.artifact_id
             started_at = self._at_or_after(work.causal_at)
             self._active_causal_at = started_at
-            self._bus.emit(
+            self._emit_pump(
                 JOB_STARTED,
                 JobStarted(staged.job_id, JobPhase.UPLOADING, started_at),
             )
@@ -516,7 +568,7 @@ class JobScheduler:
                     staged, work.identity
                 )
             except ArtifactStorageError:
-                self._bus.emit(
+                self._emit_pump(
                     ARTIFACT_UPLOAD_FAILED,
                     ArtifactUploadFailed(
                         staged.job_id,
@@ -534,7 +586,7 @@ class JobScheduler:
                     except ArtifactStorageError:
                         pass
                 return
-            self._bus.emit(
+            self._emit_pump(
                 ARTIFACT_READY,
                 ArtifactReady(
                     staged.job_id,
@@ -552,13 +604,13 @@ class JobScheduler:
         self._active_artifact_id = None
         started_at = self._at_or_after(work.causal_at)
         self._active_causal_at = started_at
-        self._bus.emit(
+        self._emit_pump(
             JOB_STARTED,
             JobStarted(work.job_id, JobPhase.PRODUCING, started_at),
         )
         requested_at = self._at_or_after(started_at)
         self._active_causal_at = requested_at
-        self._bus.emit(
+        self._emit_pump(
             YOUTUBE_DOWNLOAD_REQUESTED,
             YouTubeDownloadRequested(
                 work.job_id, work.source_url, requested_at
