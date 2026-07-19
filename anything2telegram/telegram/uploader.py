@@ -2,7 +2,6 @@ import asyncio
 import logging
 import mimetypes
 import stat
-from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -75,10 +74,7 @@ class TelegramArtifactUploader:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         logger: object | None = None,
         progress_interval_seconds: float = 1.0,
-        recent_cache_size: int = 1024,
     ) -> None:
-        if type(recent_cache_size) is not int or recent_cache_size <= 0:
-            raise ValueError("recent_cache_size must be positive")
         self._bus = bus
         self._storage = storage
         self._client = client
@@ -89,8 +85,6 @@ class TelegramArtifactUploader:
         self._progress_interval = progress_interval_seconds
         self._claimed: set[tuple[UUID, UUID]] = set()
         self._terminal: set[tuple[UUID, UUID]] = set()
-        self._terminal_order: deque[tuple[UUID, UUID]] = deque()
-        self._recent_cache_size = recent_cache_size
         self._outcome_emitted: set[tuple[UUID, UUID]] = set()
         self._unavailable_emitted = False
         self._unavailable_pending = False
@@ -229,7 +223,7 @@ class TelegramArtifactUploader:
         finally:
             if key in self._claimed:
                 self._claimed.remove(key)
-                self._remember_terminal(key)
+                self._terminal.add(key)
             self._outcome_emitted.discard(key)
             if task is not None:
                 self._inflight.discard(task)
@@ -354,14 +348,6 @@ class TelegramArtifactUploader:
             return
         self._unavailable_pending = False
         self._emit_unavailable()
-
-    def _remember_terminal(self, key: tuple[UUID, UUID]) -> None:
-        if key in self._terminal:
-            return
-        self._terminal.add(key)
-        self._terminal_order.append(key)
-        while len(self._terminal_order) > self._recent_cache_size:
-            self._terminal.remove(self._terminal_order.popleft())
 
     def _register_listener(self) -> None:
         if self._listener_registered:

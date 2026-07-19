@@ -294,7 +294,13 @@ async def test_duplicate_artifact_event_uploads_once(tmp_path: Path) -> None:
         uploader.handle_artifact_ready(event),
     )
 
-    assert len(client.uploads) == 1
+    for value in range(1, 1025):
+        await uploader.handle_artifact_ready(
+            staged_event(storage, artifact_id=UUID(int=value))
+        )
+    await uploader.handle_artifact_ready(event)
+
+    assert len(client.uploads) == 1025
 
 
 async def test_started_monitor_defers_unavailable_until_active_failure(
