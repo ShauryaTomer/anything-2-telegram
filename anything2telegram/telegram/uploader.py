@@ -115,16 +115,11 @@ class TelegramArtifactUploader:
         self._register_listener()
         try:
             await self._client.connect()
-        except TelegramUnavailableError:
-            self._emit_unavailable()
-            self._accepting = False
-            self._remove_listener()
-            self._stopping = True
-            raise
-        except Exception:
-            self._accepting = False
-            self._remove_listener()
-            self._stopping = True
+        except BaseException:
+            try:
+                await self._stop(asyncio.current_task())
+            except BaseException:
+                self._safe_log("Telegram startup rollback failed")
             raise
         self._started = True
         self._monitor_task = asyncio.create_task(self._monitor_disconnect())
@@ -155,7 +150,7 @@ class TelegramArtifactUploader:
         try:
             await self._client.disconnect()
         except Exception:
-            pass
+            self._safe_log("Telegram disconnect failed")
         self._started = False
 
     async def handle_artifact_ready(self, event: ArtifactReady) -> None:
@@ -369,8 +364,17 @@ class TelegramArtifactUploader:
         remove = getattr(self._bus, "remove_listener", None)
         if not callable(remove):
             return
-        remove(ARTIFACT_READY, self._listener)
-        self._listener_registered = False
+        try:
+            remove(ARTIFACT_READY, self._listener)
+            self._listener_registered = False
+        except Exception:
+            self._safe_log("Telegram listener removal failed")
+
+    def _safe_log(self, message: str) -> None:
+        try:
+            self._logger.error(message)
+        except Exception:
+            pass
 
     def _causal_time(self, occurred_at: datetime) -> datetime:
         return max(self._clock(), occurred_at)

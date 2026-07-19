@@ -37,16 +37,22 @@ class FakeClient:
         self.disconnect_calls = 0
         self.connect_calls = 0
         self.actions: list[str] = []
+        self.connect_error: BaseException | None = None
+        self.disconnect_error: BaseException | None = None
 
     async def connect(self) -> None:
         self.connect_calls += 1
         self.is_connected = True
+        if self.connect_error is not None:
+            raise self.connect_error
 
     async def disconnect(self) -> None:
         self.disconnect_calls += 1
         self.actions.append("disconnect")
         self.is_connected = False
         self.disconnected.set()
+        if self.disconnect_error is not None:
+            raise self.disconnect_error
 
     async def wait_until_disconnected(self) -> None:
         await self.disconnected.wait()
@@ -352,3 +358,36 @@ async def test_stop_cancels_inflight_then_disconnects_and_ignores_late_events(
         assert facts == []
     finally:
         client.release_upload.set()
+
+
+async def test_partial_start_failure_rolls_back_and_remains_restartable(
+    tmp_path: Path,
+) -> None:
+    bus = AsyncIOEventEmitter()
+    storage = ArtifactStorage(tmp_path / "artifacts")
+    client = FakeClient()
+    primary = TelegramUnavailableError()
+    client.connect_error = primary
+    client.disconnect_error = RuntimeError("cleanup failed")
+    facts = capture(bus)
+    uploader = TelegramArtifactUploader(bus, storage, client, settings())
+
+    with pytest.raises(TelegramUnavailableError) as raised:
+        await uploader.start()
+
+    assert raised.value is primary
+    assert client.disconnect_calls == 1
+    assert not client.is_connected
+    assert facts == []
+    bus.emit(ARTIFACT_READY, staged_event(storage))
+    await asyncio.sleep(0)
+    assert client.uploads == []
+    await uploader.stop()
+    assert client.disconnect_calls == 1
+
+    client.connect_error = None
+    client.disconnect_error = None
+    await uploader.start()
+    assert client.connect_calls == 2
+    await uploader.stop()
+    assert client.disconnect_calls == 2
