@@ -2,6 +2,7 @@ import asyncio
 import logging
 import mimetypes
 import stat
+from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -74,7 +75,10 @@ class TelegramArtifactUploader:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         logger: object | None = None,
         progress_interval_seconds: float = 1.0,
+        recent_cache_size: int = 1024,
     ) -> None:
+        if type(recent_cache_size) is not int or recent_cache_size <= 0:
+            raise ValueError("recent_cache_size must be positive")
         self._bus = bus
         self._storage = storage
         self._client = client
@@ -85,41 +89,87 @@ class TelegramArtifactUploader:
         self._progress_interval = progress_interval_seconds
         self._claimed: set[tuple[UUID, UUID]] = set()
         self._terminal: set[tuple[UUID, UUID]] = set()
+        self._terminal_order: deque[tuple[UUID, UUID]] = deque()
+        self._recent_cache_size = recent_cache_size
         self._outcome_emitted: set[tuple[UUID, UUID]] = set()
         self._unavailable_emitted = False
+        self._unavailable_pending = False
+        self._accepting = True
+        self._stopping = False
+        self._started = False
         self._shutting_down = False
         self._monitor_task: asyncio.Task[None] | None = None
-        bus.on(ARTIFACT_READY, self.handle_artifact_ready)
+        self._inflight: set[asyncio.Task[object]] = set()
+        self._listener = self.handle_artifact_ready
+        self._listener_registered = False
+        self._register_listener()
 
     async def start(self) -> None:
+        if self._started:
+            return
+        self._stopping = False
         self._shutting_down = False
+        self._accepting = True
         self._unavailable_emitted = False
+        self._unavailable_pending = False
+        self._register_listener()
         try:
             await self._client.connect()
         except TelegramUnavailableError:
             self._emit_unavailable()
+            self._accepting = False
+            self._remove_listener()
+            self._stopping = True
             raise
+        except Exception:
+            self._accepting = False
+            self._remove_listener()
+            self._stopping = True
+            raise
+        self._started = True
         self._monitor_task = asyncio.create_task(self._monitor_disconnect())
         self._monitor_task.add_done_callback(self._monitor_done)
 
     async def stop(self) -> None:
+        if self._stopping:
+            return
+        await self._stop(asyncio.current_task())
+
+    async def _stop(self, current: asyncio.Task[object] | None) -> None:
+        self._stopping = True
         self._shutting_down = True
+        self._accepting = False
+        self._unavailable_pending = False
+        self._remove_listener()
+        inflight = [task for task in self._inflight if task is not current]
+        for task in inflight:
+            task.cancel()
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
         monitor = self._monitor_task
         self._monitor_task = None
         if monitor is not None and not monitor.done():
             monitor.cancel()
+        if monitor is not None:
+            await asyncio.gather(monitor, return_exceptions=True)
         try:
             await self._client.disconnect()
         except Exception:
             pass
-        if monitor is not None:
-            await asyncio.gather(monitor, return_exceptions=True)
+        self._started = False
 
     async def handle_artifact_ready(self, event: ArtifactReady) -> None:
         if not isinstance(event, ArtifactReady):
             raise TypeError("event must be ArtifactReady")
+        if not self._accepting or self._stopping:
+            return
+        task = asyncio.current_task()
+        if task is not None:
+            self._inflight.add(task)
         key = (event.job_id, event.artifact_id)
         if key in self._claimed or key in self._terminal:
+            if task is not None:
+                self._inflight.discard(task)
             return
         self._claimed.add(key)
         try:
@@ -139,11 +189,12 @@ class TelegramArtifactUploader:
                 )
             except asyncio.CancelledError:
                 self._claimed.discard(key)
-                await asyncio.shield(self.stop())
+                if not self._stopping:
+                    await self._stop(task)
                 raise
             except TelegramUnavailableError:
                 self._emit_failure(event, "telegram_unavailable")
-                self._emit_unavailable()
+                self._request_unavailable()
                 return
             except (asyncio.TimeoutError, TimeoutError):
                 self._emit_failure(event, "telegram_timeout")
@@ -172,7 +223,11 @@ class TelegramArtifactUploader:
         finally:
             if key in self._claimed:
                 self._claimed.remove(key)
-                self._terminal.add(key)
+                self._remember_terminal(key)
+            self._outcome_emitted.discard(key)
+            if task is not None:
+                self._inflight.discard(task)
+            self._flush_unavailable()
 
     def _validate(self, event: ArtifactReady) -> str | None:
         try:
@@ -240,7 +295,7 @@ class TelegramArtifactUploader:
         except TelegramClientError:
             pass
         if not self._shutting_down:
-            self._emit_unavailable()
+            self._request_unavailable()
 
     def _monitor_done(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():
@@ -279,6 +334,43 @@ class TelegramArtifactUploader:
                 self._clock(),
             ),
         )
+
+    def _request_unavailable(self) -> None:
+        if self._shutting_down or self._unavailable_emitted:
+            return
+        if self._claimed:
+            self._unavailable_pending = True
+            return
+        self._emit_unavailable()
+
+    def _flush_unavailable(self) -> None:
+        if not self._unavailable_pending or self._claimed:
+            return
+        self._unavailable_pending = False
+        self._emit_unavailable()
+
+    def _remember_terminal(self, key: tuple[UUID, UUID]) -> None:
+        if key in self._terminal:
+            return
+        self._terminal.add(key)
+        self._terminal_order.append(key)
+        while len(self._terminal_order) > self._recent_cache_size:
+            self._terminal.remove(self._terminal_order.popleft())
+
+    def _register_listener(self) -> None:
+        if self._listener_registered:
+            return
+        self._bus.on(ARTIFACT_READY, self._listener)
+        self._listener_registered = True
+
+    def _remove_listener(self) -> None:
+        if not self._listener_registered:
+            return
+        remove = getattr(self._bus, "remove_listener", None)
+        if not callable(remove):
+            return
+        remove(ARTIFACT_READY, self._listener)
+        self._listener_registered = False
 
     def _causal_time(self, occurred_at: datetime) -> datetime:
         return max(self._clock(), occurred_at)
