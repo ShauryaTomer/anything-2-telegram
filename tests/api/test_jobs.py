@@ -3,6 +3,7 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
+import starlette.formparsers as formparsers
 from fastapi.testclient import TestClient
 from starlette.requests import ClientDisconnect
 
@@ -34,6 +35,9 @@ class FakeScheduler:
     def __init__(self) -> None:
         self.calls: list[object] = []
         self.cancelled: list[UUID] = []
+        self.reserve_error: Exception | None = None
+        self.cancel_result = True
+        self.cancel_error: Exception | None = None
 
     def submit_youtube_video(self, url: str) -> UUID:
         self.calls.append(("video", url))
@@ -47,6 +51,8 @@ class FakeScheduler:
         self, filename: str, media_type: str | None, caption: str | None
     ) -> UploadReservation:
         self.calls.append(("reserve", filename, media_type, caption))
+        if self.reserve_error is not None:
+            raise self.reserve_error
         return UploadReservation(
             JOB_ID,
             ARTIFACT_ID,
@@ -63,17 +69,21 @@ class FakeScheduler:
     def cancel_reserved_upload(self, job_id: UUID) -> bool:
         self.calls.append(("cancel", job_id))
         self.cancelled.append(job_id)
-        return True
+        if self.cancel_error is not None:
+            raise self.cancel_error
+        return self.cancel_result
 
 
 class FakeStorage:
     def __init__(self, error: BaseException | None = None) -> None:
         self.error = error
+        self.upload: object | None = None
 
     async def stage(
         self, upload: object, reservation: UploadReservation, max_bytes: int
     ) -> StagedArtifact:
         scheduler.calls.append(("stage", max_bytes))
+        self.upload = upload
         if self.error is not None:
             raise self.error
         chunks = []
@@ -95,8 +105,11 @@ class FakeTracker:
     def __init__(self) -> None:
         self.jobs: dict[UUID, JobSnapshot] = {}
         self.batches: dict[UUID, BatchSnapshot] = {}
+        self.error: Exception | None = None
 
     def get_job(self, job_id: UUID) -> JobSnapshot | None:
+        if self.error is not None:
+            raise self.error
         return self.jobs.get(job_id)
 
     def get_batch(self, batch_id: UUID) -> BatchSnapshot | None:
@@ -119,22 +132,21 @@ class FakeTelegram:
 
 @pytest.fixture(autouse=True)
 def dependencies() -> None:
-    global scheduler, storage, tracker, readiness, telegram, client
+    global scheduler, storage, tracker, readiness, telegram, app, client
     scheduler = FakeScheduler()
     storage = FakeStorage()
     tracker = FakeTracker()
     readiness = FakeReadiness()
     telegram = FakeTelegram()
-    client = TestClient(
-        create_jobs_app(
-            scheduler=scheduler,
-            tracker=tracker,
-            storage=storage,
-            readiness=readiness,
-            telegram=telegram,
-            max_upload_bytes=10,
-        )
+    app = create_jobs_app(
+        scheduler=scheduler,
+        tracker=tracker,
+        storage=storage,
+        readiness=readiness,
+        telegram=telegram,
+        max_upload_bytes=10,
     )
+    client = TestClient(app)
 
 
 @pytest.mark.parametrize(
@@ -218,6 +230,28 @@ def test_youtube_validation_and_readiness_have_stable_errors() -> None:
         assert response.json() == {
             "detail": {"code": code, "message": message}
         }
+    assert framework_errors[1][0].headers["allow"] == "GET"
+
+    readiness.accepting = True
+    malformed = client.post(
+        "/jobs/upload",
+        content=b"broken",
+        headers={"content-type": "multipart/form-data"},
+    )
+    assert malformed.status_code == 422
+    assert malformed.json() == {
+        "detail": {"code": "invalid_request", "message": "Request is invalid"}
+    }
+
+    tracker.error = RuntimeError("/private/path must not leak")
+    response = TestClient(app, raise_server_exceptions=False).get(f"/jobs/{JOB_ID}")
+    assert response.status_code == 500
+    assert response.json() == {
+        "detail": {
+            "code": "internal_error",
+            "message": "Internal server error",
+        }
+    }
 
 
 def test_upload_streams_stage_before_enqueue_and_returns_exact_202() -> None:
@@ -241,35 +275,91 @@ def test_upload_streams_stage_before_enqueue_and_returns_exact_202() -> None:
         ("read", 2),
         ("enqueue", 6),
     ]
+    assert storage.upload.file.closed
+
+    scheduler.calls.clear()
+    response = client.post(
+        "/jobs/upload",
+        files=[
+            ("file", ("one.mp4", b"one", "video/mp4")),
+            ("file", ("two.mp4", b"two", "video/mp4")),
+        ],
+    )
+    assert response.status_code == 422
+    assert scheduler.calls == []
+
+    response = client.post(
+        "/jobs/upload",
+        files={"file": ("large.mp4", b"01234567890", "video/mp4")},
+    )
+    assert response.status_code == 413
+    assert response.json() == {
+        "detail": {
+            "code": "staging_oversize",
+            "message": "Upload exceeds maximum allowed size",
+        }
+    }
+    assert scheduler.calls == []
 
 
 @pytest.mark.parametrize(
-    ("error", "status", "code", "message"),
+    ("phase", "error", "status", "code", "message"),
     [
         (
+            "stage",
             ArtifactStorageError("staging_oversize", "unsafe ignored"),
             413,
             "staging_oversize",
             "Upload exceeds maximum allowed size",
         ),
         (
+            "stage",
             ArtifactStorageError("staging_disk_full", "unsafe ignored"),
             507,
             "staging_disk_full",
             "Artifact storage is full",
         ),
         (
+            "stage",
             ArtifactStorageError("staging_io_error", "/private/path leaked"),
             500,
             "upload_staging_failed",
             "Upload could not be stored",
         ),
+        (
+            "reserve",
+            ArtifactStorageError("invalid_filename", "unsafe ignored"),
+            422,
+            "invalid_filename",
+            "Artifact filename is invalid",
+        ),
+        (
+            "reserve",
+            ArtifactStorageError("staging_disk_full", "unsafe ignored"),
+            507,
+            "staging_disk_full",
+            "Artifact storage is full",
+        ),
+        (
+            "reserve",
+            ArtifactStorageError("storage_collision", "/private/path leaked"),
+            500,
+            "upload_reservation_failed",
+            "Upload could not be reserved",
+        ),
     ],
 )
 def test_upload_staging_failures_cancel_without_enqueue(
-    error: ArtifactStorageError, status: int, code: str, message: str
+    phase: str,
+    error: ArtifactStorageError,
+    status: int,
+    code: str,
+    message: str,
 ) -> None:
-    storage.error = error
+    if phase == "reserve":
+        scheduler.reserve_error = error
+    else:
+        storage.error = error
 
     response = client.post(
         "/jobs/upload", files={"file": ("video.mp4", b"abcdef", "video/mp4")}
@@ -277,15 +367,16 @@ def test_upload_staging_failures_cancel_without_enqueue(
 
     assert response.status_code == status
     assert response.json() == {"detail": {"code": code, "message": message}}
-    assert scheduler.cancelled == [JOB_ID]
+    assert scheduler.cancelled == ([JOB_ID] if phase == "stage" else [])
     assert not any(call[0] == "enqueue" for call in scheduler.calls)
 
 
 @pytest.mark.parametrize("stage_error", [ClientDisconnect(), FatalStage()])
 def test_upload_cancellation_cleans_reservation_and_reraises(
-    stage_error: BaseException,
+    stage_error: BaseException, caplog: pytest.LogCaptureFixture
 ) -> None:
     storage.error = stage_error
+    scheduler.cancel_result = False
 
     with pytest.raises(type(stage_error)):
         client.post(
@@ -295,6 +386,62 @@ def test_upload_cancellation_cleans_reservation_and_reraises(
 
     assert scheduler.cancelled == [JOB_ID]
     assert not any(call[0] == "enqueue" for call in scheduler.calls)
+    assert "Upload reservation cleanup failed" in caplog.text
+
+
+async def test_upload_request_disconnect_closes_parser_temp_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_files: list[object] = []
+    original = formparsers.SpooledTemporaryFile
+
+    def recording_temp_file(*args: object, **kwargs: object) -> object:
+        temporary_file = original(*args, **kwargs)
+        created_files.append(temporary_file)
+        return temporary_file
+
+    monkeypatch.setattr(formparsers, "SpooledTemporaryFile", recording_temp_file)
+    boundary = b"bounded-test"
+    partial_body = (
+        b"--" + boundary + b"\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="video.mp4"\r\n'
+        b"Content-Type: video/mp4\r\n\r\nabc"
+    )
+    messages = iter(
+        [
+            {"type": "http.request", "body": partial_body, "more_body": True},
+            {"type": "http.disconnect"},
+        ]
+    )
+
+    async def receive() -> dict[str, object]:
+        return next(messages)
+
+    async def send(_message: dict[str, object]) -> None:
+        pass
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/jobs/upload",
+        "raw_path": b"/jobs/upload",
+        "query_string": b"",
+        "headers": [
+            ("content-type".encode(), b"multipart/form-data; boundary=" + boundary)
+        ],
+        "client": ("test", 1),
+        "server": ("testserver", 80),
+    }
+
+    with pytest.raises(ClientDisconnect):
+        await app(scope, receive, send)
+
+    assert created_files
+    assert all(file.closed for file in created_files)
+    assert scheduler.calls == []
 
 
 def test_job_batch_snapshots_are_exact_and_bad_ids_are_404() -> None:

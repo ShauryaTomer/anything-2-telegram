@@ -413,6 +413,58 @@ async def test_reserved_staged_upload_waits_for_fifo_turn(tmp_path: Path) -> Non
     ]
 
 
+async def test_reserved_upload_listener_failure_is_contained_and_fact_delivered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecordingLogger:
+        def __init__(self) -> None:
+            self.errors: list[str] = []
+
+        def error(self, message: str) -> None:
+            self.errors.append(message)
+
+    bus = AsyncIOEventEmitter()
+    storage = ArtifactStorage(tmp_path / "artifacts")
+    logger = RecordingLogger()
+    scheduler = JobScheduler(
+        bus,
+        storage,
+        id_factory=iter((JOB_1, ARTIFACT_1)).__next__,
+        clock=lambda: NOW,
+        logger=logger,
+    )
+    bus.on(JOB_QUEUED, lambda _event: (_ for _ in ()).throw(RuntimeError("private")))
+    tracker = JobTracker()
+    tracker.register(bus)
+    reservation = scheduler.reserve_local_upload("video.mp4", None, None)
+    reservation.destination.write_bytes(b"done")
+    staged = StagedArtifact(
+        JOB_1,
+        ARTIFACT_1,
+        reservation.destination,
+        reservation.filename,
+        None,
+        4,
+        None,
+    )
+
+    def fail_pump_schedule() -> None:
+        raise RuntimeError("private loop detail")
+
+    monkeypatch.setattr(scheduler, "_request_pump", fail_pump_schedule)
+
+    assert scheduler.enqueue_reserved_upload(staged) == JOB_1
+    assert scheduler.pending_count == 1
+    snapshot = tracker.get_job(JOB_1)
+    assert snapshot is not None
+    assert snapshot.status is JobStatus.WAITING
+    assert logger.errors == [
+        "Event listener failed",
+        "Scheduler pump scheduling failed",
+    ]
+
+
 async def test_reserved_upload_requires_completed_matching_local_write(
     tmp_path: Path,
 ) -> None:

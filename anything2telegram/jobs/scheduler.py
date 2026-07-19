@@ -115,6 +115,7 @@ class JobScheduler:
         self._id_factory = id_factory
         self._clock = clock
         self._logger = logger if logger is not None else logging.getLogger(__name__)
+        bus.on("error", self._on_event_listener_error)
         self._queue: deque[_Work] = deque()
         self._active: _Work | None = None
         self._active_phase: JobPhase | None = None
@@ -253,7 +254,7 @@ class JobScheduler:
         del self._reservations[staged.job_id]
         self._queue.append(_StagedWork(staged, occurred_at, identity))
         self._bus.emit(JOB_QUEUED, event)
-        self._request_pump()
+        self._request_pump_after_commit()
         return staged.job_id
 
     def resume(self) -> None:
@@ -303,6 +304,12 @@ class JobScheduler:
             except Exception:
                 pass
 
+    def _on_event_listener_error(self, _error: object) -> None:
+        try:
+            self._logger.error("Event listener failed")
+        except BaseException:
+            pass
+
     def _require_accepting(self) -> None:
         if self._stopped:
             raise SchedulerError(
@@ -321,6 +328,16 @@ class JobScheduler:
             return
         self._pump_scheduled = True
         asyncio.get_running_loop().call_soon(self._pump)
+
+    def _request_pump_after_commit(self) -> None:
+        try:
+            self._request_pump()
+        except Exception:
+            self._pump_scheduled = False
+            try:
+                self._logger.error("Scheduler pump scheduling failed")
+            except BaseException:
+                pass
 
     def _on_job_terminal(
         self,

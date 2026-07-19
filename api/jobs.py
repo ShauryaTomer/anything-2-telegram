@@ -1,12 +1,17 @@
+import errno
+import logging
 from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from python_multipart.exceptions import MultipartParseError
 from pydantic import BaseModel, ConfigDict
+from starlette.datastructures import FormData, UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.formparsers import MultiPartException, MultiPartParser
 from starlette.requests import ClientDisconnect
 
 from anything2telegram.artifacts.storage import ArtifactStorageError
@@ -23,6 +28,10 @@ from anything2telegram.downloaders.youtube import (
     classify_youtube_url,
 )
 from anything2telegram.jobs.scheduler import SchedulerError
+
+
+_LOGGER = logging.getLogger(__name__)
+_MAX_FORM_FIELD_BYTES = 4096
 
 
 class Scheduler(Protocol):
@@ -71,10 +80,46 @@ class _YouTubeRequest(BaseModel):
     url: str
 
 
-def _error(status_code: int, code: str, message: str) -> JSONResponse:
+class _UploadTooLarge(MultiPartException):
+    pass
+
+
+class _BoundedMultiPartParser(MultiPartParser):
+    def __init__(self, *args: object, max_file_bytes: int, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._max_file_bytes = max_file_bytes
+        self._current_file_bytes = 0
+
+    def on_part_begin(self) -> None:
+        self._current_file_bytes = 0
+        super().on_part_begin()
+
+    def on_part_data(self, data: bytes, start: int, end: int) -> None:
+        if self._current_part.file is not None:
+            self._current_file_bytes += end - start
+            if self._current_file_bytes > self._max_file_bytes:
+                raise _UploadTooLarge("Upload exceeds maximum allowed size")
+        super().on_part_data(data, start, end)
+
+
+def _safe_log(message: str) -> None:
+    try:
+        _LOGGER.error(message)
+    except BaseException:
+        pass
+
+
+def _error(
+    status_code: int,
+    code: str,
+    message: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
         content={"detail": {"code": code, "message": message}},
+        headers=headers,
     )
 
 
@@ -149,9 +194,12 @@ def _submission_body(kind: str, identifier: UUID, path: str) -> dict[str, str]:
 
 def _cancel_reservation(scheduler: Scheduler, job_id: UUID) -> None:
     try:
-        scheduler.cancel_reserved_upload(job_id)
-    except Exception:
-        pass
+        cleaned = scheduler.cancel_reserved_upload(job_id)
+    except BaseException:
+        _safe_log("Upload reservation cleanup failed")
+        return
+    if not cleaned:
+        _safe_log("Upload reservation cleanup failed")
 
 
 def _storage_error(error: ArtifactStorageError) -> JSONResponse:
@@ -168,6 +216,75 @@ def _storage_error(error: ArtifactStorageError) -> JSONResponse:
         "upload_staging_failed",
         "Upload could not be stored",
     )
+
+
+def _reservation_error(error: ArtifactStorageError) -> JSONResponse:
+    if error.code == "invalid_filename":
+        return _error(
+            422,
+            "invalid_filename",
+            "Artifact filename is invalid",
+        )
+    if error.code == "staging_oversize":
+        return _storage_error(error)
+    if error.code == "staging_disk_full":
+        return _storage_error(error)
+    return _error(
+        500,
+        "upload_reservation_failed",
+        "Upload could not be reserved",
+    )
+
+
+def _close_parser_files(parser: _BoundedMultiPartParser) -> None:
+    for temporary_file in parser._files_to_close_on_error:
+        try:
+            temporary_file.close()
+        except BaseException:
+            _safe_log("Multipart temporary file cleanup failed")
+
+
+async def _parse_upload(
+    request: Request, max_upload_bytes: int
+) -> tuple[FormData, UploadFile, str | None]:
+    parser = _BoundedMultiPartParser(
+        request.headers,
+        request.stream(),
+        max_files=1,
+        max_fields=1,
+        max_part_size=_MAX_FORM_FIELD_BYTES,
+        max_file_bytes=max_upload_bytes,
+    )
+    try:
+        form = await parser.parse()
+    except BaseException:
+        _close_parser_files(parser)
+        raise
+
+    files: list[tuple[str, UploadFile]] = []
+    captions: list[str] = []
+    valid = True
+    for name, value in form.multi_items():
+        if isinstance(value, UploadFile):
+            files.append((name, value))
+            valid = valid and name == "file"
+        elif name == "caption":
+            captions.append(value)
+        else:
+            valid = False
+    if len(files) != 1 or len(captions) > 1 or not valid:
+        await _close_form(form)
+        raise MultiPartException("Invalid upload form")
+    return form, files[0][1], captions[0] if captions else None
+
+
+async def _close_form(form: FormData | None) -> None:
+    if form is None:
+        return
+    try:
+        await form.close()
+    except BaseException:
+        _safe_log("Multipart temporary file cleanup failed")
 
 
 def create_jobs_app(
@@ -200,15 +317,35 @@ def create_jobs_app(
         _request: object, error: StarletteHTTPException
     ) -> JSONResponse:
         if error.status_code == 404:
-            return _error(404, "not_found", "Resource not found")
+            return _error(
+                404,
+                "not_found",
+                "Resource not found",
+                headers=error.headers,
+            )
         if error.status_code == 405:
-            return _error(405, "method_not_allowed", "Method not allowed")
+            return _error(
+                405,
+                "method_not_allowed",
+                "Method not allowed",
+                headers=error.headers,
+            )
         if 400 <= error.status_code < 500:
             return _error(
                 error.status_code,
                 "invalid_request",
                 "Request is invalid",
+                headers=error.headers,
             )
+        return _error(500, "internal_error", "Internal server error")
+
+    @app.exception_handler(Exception)
+    async def internal_error(
+        _request: object, error: Exception
+    ) -> JSONResponse:
+        if isinstance(error, ClientDisconnect):
+            raise error
+        _safe_log("Unhandled API request failure")
         return _error(500, "internal_error", "Internal server error")
 
     @app.post("/jobs/youtube", status_code=202)
@@ -237,67 +374,97 @@ def create_jobs_app(
             return _error(500, "submission_failed", "Submission failed")
 
     @app.post("/jobs/upload", status_code=202)
-    async def submit_upload(
-        file: UploadFile = File(...), caption: str | None = Form(None)
-    ) -> object:
+    async def submit_upload(request: Request) -> object:
         if not accepting():
             return _service_unavailable()
-        if not file.filename:
-            return _error(422, "invalid_request", "Request is invalid")
         try:
-            reservation = scheduler.reserve_local_upload(
-                file.filename,
-                file.content_type,
-                caption,
+            form, file, caption = await _parse_upload(
+                request,
+                max_upload_bytes,
             )
-        except SchedulerError as error:
-            if error.code == "scheduler_stopped":
-                return _service_unavailable()
+        except _UploadTooLarge:
             return _error(
-                500,
-                "upload_reservation_failed",
-                "Upload could not be reserved",
+                413,
+                "staging_oversize",
+                "Upload exceeds maximum allowed size",
             )
-        except ArtifactStorageError:
-            return _error(422, "invalid_request", "Request is invalid")
-        except (TypeError, ValueError):
-            return _error(422, "invalid_request", "Request is invalid")
-        except Exception:
-            return _error(
-                500,
-                "upload_reservation_failed",
-                "Upload could not be reserved",
-            )
-
-        try:
-            staged = await storage.stage(file, reservation, max_upload_bytes)
-            job_id = scheduler.enqueue_reserved_upload(staged)
-        except ArtifactStorageError as error:
-            _cancel_reservation(scheduler, reservation.job_id)
-            return _storage_error(error)
-        except SchedulerError as error:
-            _cancel_reservation(scheduler, reservation.job_id)
-            if error.code == "scheduler_stopped":
-                return _service_unavailable()
-            return _error(
-                500,
-                "upload_enqueue_failed",
-                "Upload could not be queued",
-            )
-        except ClientDisconnect:
-            _cancel_reservation(scheduler, reservation.job_id)
-            raise
-        except Exception:
-            _cancel_reservation(scheduler, reservation.job_id)
+        except OSError as error:
+            if error.errno == errno.ENOSPC:
+                return _error(
+                    507,
+                    "staging_disk_full",
+                    "Artifact storage is full",
+                )
             return _error(
                 500,
                 "upload_staging_failed",
                 "Upload could not be stored",
             )
-        except BaseException:
-            _cancel_reservation(scheduler, reservation.job_id)
+        except (KeyError, MultiPartException, MultipartParseError):
+            return _error(422, "invalid_request", "Request is invalid")
+        except ClientDisconnect:
             raise
-        return _submission_body("job", job_id, "jobs")
+        if not file.filename:
+            await _close_form(form)
+            return _error(422, "invalid_request", "Request is invalid")
+
+        try:
+            try:
+                reservation = scheduler.reserve_local_upload(
+                    file.filename,
+                    file.content_type,
+                    caption,
+                )
+            except SchedulerError as error:
+                if error.code == "scheduler_stopped":
+                    return _service_unavailable()
+                return _error(
+                    500,
+                    "upload_reservation_failed",
+                    "Upload could not be reserved",
+                )
+            except ArtifactStorageError as error:
+                return _reservation_error(error)
+            except (TypeError, ValueError):
+                return _error(422, "invalid_request", "Request is invalid")
+            except Exception:
+                return _error(
+                    500,
+                    "upload_reservation_failed",
+                    "Upload could not be reserved",
+                )
+
+            try:
+                staged = await storage.stage(file, reservation, max_upload_bytes)
+                job_id = scheduler.enqueue_reserved_upload(staged)
+            except ArtifactStorageError as error:
+                _cancel_reservation(scheduler, reservation.job_id)
+                return _storage_error(error)
+            except SchedulerError as error:
+                _cancel_reservation(scheduler, reservation.job_id)
+                if error.code == "scheduler_stopped":
+                    return _service_unavailable()
+                return _error(
+                    500,
+                    "upload_enqueue_failed",
+                    "Upload could not be queued",
+                )
+            except ClientDisconnect:
+                _cancel_reservation(scheduler, reservation.job_id)
+                raise
+            except Exception:
+                _cancel_reservation(scheduler, reservation.job_id)
+                return _error(
+                    500,
+                    "upload_staging_failed",
+                    "Upload could not be stored",
+                )
+            except BaseException:
+                _cancel_reservation(scheduler, reservation.job_id)
+                raise
+            return _submission_body("job", job_id, "jobs")
+        finally:
+            await _close_form(form)
 
     @app.get("/jobs/{job_id}")
     async def get_job(job_id: str) -> object:
