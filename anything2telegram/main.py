@@ -25,6 +25,7 @@ from .telegram.uploader import TelegramArtifactUploader
 
 
 _LOGGER = logging.getLogger(__name__)
+APPLICATION_BASE = Path(__file__).parent.parent
 _STATE_NAMES = (
     "settings",
     "storage",
@@ -355,7 +356,7 @@ def create_app(
     async def lifespan(service: FastAPI):
         resolved = settings
         if resolved is None:
-            resolved = Settings.from_env(Path.cwd())
+            resolved = Settings.from_env(APPLICATION_BASE)
         service.state.settings = resolved
 
         try:
@@ -435,4 +436,10 @@ def create_app(
 app = create_app()
 
 
-__all__ = ["AdapterFactories", "Readiness", "app", "create_app"]
+__all__ = [
+    "APPLICATION_BASE",
+    "AdapterFactories",
+    "Readiness",
+    "app",
+    "create_app",
+]

@@ -5,6 +5,7 @@ from uuid import UUID
 import pytest
 from pyee.asyncio import AsyncIOEventEmitter
 
+import anything2telegram.main as main_module
 from anything2telegram.artifacts.storage import ArtifactStorage
 from anything2telegram.config import Settings
 from anything2telegram.events import (
@@ -190,17 +191,24 @@ def recording_adapters(
 async def test_lifespan_startup_is_lazy_and_orders_readiness(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config_calls = 0
+    config_bases: list[Path] = []
 
-    def reject_eager_config(_cls, _base_dir):
-        nonlocal config_calls
-        config_calls += 1
-        raise AssertionError("config loaded before lifespan")
+    def load_config(_cls, base_dir: Path) -> Settings:
+        config_bases.append(base_dir)
+        return make_settings(tmp_path / "loaded")
 
-    monkeypatch.setattr(Settings, "from_env", classmethod(reject_eager_config))
-    lazy_app = create_app()
-    assert config_calls == 0
+    monkeypatch.setattr(Settings, "from_env", classmethod(load_config))
+    lazy_actions: list[str] = []
+    lazy_app = create_app(adapters=recording_adapters(lazy_actions))
+    assert config_bases == []
     assert not hasattr(lazy_app.state, "bus")
+    caller_dir = tmp_path / "elsewhere"
+    caller_dir.mkdir()
+    monkeypatch.chdir(caller_dir)
+    async with lazy_app.router.lifespan_context(lazy_app):
+        assert lazy_app.state.readiness.is_accepting() is True
+    assert config_bases == [Path(main_module.__file__).resolve().parent.parent]
+    assert config_bases[0] != caller_dir
 
     actions: list[str] = []
     service = create_app(make_settings(tmp_path), recording_adapters(actions))
