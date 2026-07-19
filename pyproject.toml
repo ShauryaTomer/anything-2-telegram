@@ -13,6 +13,7 @@ dependencies = [
   "telethon>=1.44.0,<2",
   "python-dotenv>=1.2.2,<2",
   "python-multipart>=0.0.32,<1",
+  "yt-dlp>=2025.12.8,<2027",
 ]
 
 [project.optional-dependencies]

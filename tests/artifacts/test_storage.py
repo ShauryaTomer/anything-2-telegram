@@ -361,9 +361,14 @@ def test_allocate_download_directory_reuses_safe_directories(tmp_path: Path) -> 
     expected.mkdir(parents=True)
 
     allocated = storage.allocate_download_directory(job_id, artifact_id)
+    (allocated / "video.part").write_bytes(b"1234")
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"not-counted")
+    (allocated / "outside-link").symlink_to(outside)
 
     assert allocated == expected
     assert allocated.resolve().is_relative_to(storage.root.resolve())
+    assert storage.download_directory_size(job_id, artifact_id) == 4
 
 
 def test_allocate_parent_swap_fails_closed_without_creating_outside(

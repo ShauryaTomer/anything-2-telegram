@@ -29,3 +29,4 @@ Telethon==1.44.0
 typing-inspection==0.4.2
 typing_extensions==4.16.0
 uvicorn==0.51.0
+yt-dlp==2026.7.4

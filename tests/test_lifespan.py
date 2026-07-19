@@ -191,6 +191,17 @@ def recording_adapters(
 async def test_lifespan_startup_is_lazy_and_orders_readiness(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    producer_kwargs = {}
+
+    def capture_producer(*args, **kwargs):
+        producer_kwargs.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(main_module, "YouTubeArtifactProducer", capture_producer)
+    settings = make_settings(tmp_path / "wiring")
+    main_module._youtube(object(), object(), object(), settings)
+    assert producer_kwargs["max_artifact_bytes"] == settings.max_artifact_bytes
+
     config_bases: list[Path] = []
 
     def load_config(_cls, base_dir: Path) -> Settings:

@@ -131,13 +131,22 @@ class YouTubeArtifactProducer:
         process_runner: _ProcessRunner,
         *,
         timeout_seconds: float | int,
+        max_artifact_bytes: int = 2_000_000_000,
         cookies_path: Path | None = None,
         format_selector: str = YTDLP_FORMAT,
+        quota_poll_seconds: float | int = 0.05,
         id_factory: Callable[[], UUID] = uuid4,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if type(timeout_seconds) not in (int, float) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if type(max_artifact_bytes) is not int or max_artifact_bytes <= 0:
+            raise ValueError("max_artifact_bytes must be a positive int")
+        if (
+            type(quota_poll_seconds) not in (int, float)
+            or quota_poll_seconds <= 0
+        ):
+            raise ValueError("quota_poll_seconds must be positive")
         if cookies_path is not None and not isinstance(cookies_path, Path):
             raise TypeError("cookies_path must be Path or None")
         if not isinstance(format_selector, str) or not format_selector:
@@ -146,8 +155,10 @@ class YouTubeArtifactProducer:
         self._storage = storage
         self._runner = process_runner
         self._timeout_seconds = timeout_seconds
+        self._max_artifact_bytes = max_artifact_bytes
         self._cookies_path = cookies_path
         self._format_selector = format_selector
+        self._quota_poll_seconds = quota_poll_seconds
         self._id_factory = id_factory
         self._clock = clock
         bus.on(
@@ -209,9 +220,10 @@ class YouTubeArtifactProducer:
             directory = self._storage.allocate_download_directory(
                 event.job_id, artifact_id
             )
-            result = await self._runner.run(
+            result = await self._run_download(
                 self._download_args(event.source_url, directory),
-                self._timeout_seconds,
+                event.job_id,
+                artifact_id,
             )
             if result.exit_code != 0:
                 self._emit_artifact_failure(
@@ -244,6 +256,14 @@ class YouTubeArtifactProducer:
             self._emit_artifact_failure(
                 event, artifact_id, "youtube_timeout", "YouTube operation timed out"
             )
+        except _ArtifactOversize:
+            self._best_effort_cleanup(event.job_id)
+            self._emit_artifact_failure(
+                event,
+                artifact_id,
+                "artifact_oversize",
+                "Artifact exceeds maximum allowed size",
+            )
         except Exception:
             self._best_effort_cleanup(event.job_id)
             self._emit_artifact_failure(
@@ -271,6 +291,8 @@ class YouTubeArtifactProducer:
             self._format_selector,
             "--merge-output-format",
             "mp4",
+            "--max-filesize",
+            str(self._max_artifact_bytes),
             "--restrict-filenames",
             "--no-playlist",
             "--js-runtimes",
@@ -282,6 +304,41 @@ class YouTubeArtifactProducer:
             *self._cookie_args(),
             source_url,
         ]
+
+    async def _run_download(
+        self, args: Sequence[str], job_id: UUID, artifact_id: UUID
+    ) -> ProcessResult:
+        runner_task = asyncio.create_task(
+            self._runner.run(args, self._timeout_seconds)
+        )
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    (runner_task,), timeout=self._quota_poll_seconds
+                )
+                if done:
+                    result = await runner_task
+                    if (
+                        self._download_size(job_id, artifact_id)
+                        > self._max_artifact_bytes
+                    ):
+                        raise _ArtifactOversize()
+                    return result
+                if (
+                    self._download_size(job_id, artifact_id)
+                    > self._max_artifact_bytes
+                ):
+                    runner_task.cancel()
+                    await asyncio.gather(runner_task, return_exceptions=True)
+                    raise _ArtifactOversize()
+        except BaseException:
+            if not runner_task.done():
+                runner_task.cancel()
+                await asyncio.gather(runner_task, return_exceptions=True)
+            raise
+
+    def _download_size(self, job_id: UUID, artifact_id: UUID) -> int:
+        return self._storage.download_directory_size(job_id, artifact_id)
 
     def _cookie_args(self) -> list[str]:
         if self._cookies_path is None:
@@ -398,4 +455,8 @@ class YouTubeArtifactProducer:
 
 
 class _PlaylistParseError(ValueError):
+    pass
+
+
+class _ArtifactOversize(Exception):
     pass

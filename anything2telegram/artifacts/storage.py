@@ -121,6 +121,30 @@ class ArtifactStorage:
             )
         return self.root / job_name / artifact_name
 
+    def download_directory_size(self, job_id: UUID, artifact_id: UUID) -> int:
+        self._require_uuid(job_id)
+        self._require_uuid(artifact_id)
+        job_name = str(job_id)
+        artifact_name = str(artifact_id)
+        total = 0
+        with self._owned_root_fd() as root_fd, ExitStack() as stack:
+            job_fd = self._stage_directory_fd(root_fd, job_name)
+            stack.callback(os.close, job_fd)
+            artifact_fd = self._stage_directory_fd(job_fd, artifact_name)
+            stack.callback(os.close, artifact_fd)
+            try:
+                with os.scandir(artifact_fd) as entries:
+                    for entry in entries:
+                        status = entry.stat(follow_symlinks=False)
+                        if stat.S_ISREG(status.st_mode):
+                            total += status.st_size
+            except OSError:
+                raise _error("storage_io_error") from None
+            self._require_directory_tree_unchanged(
+                root_fd, job_name, job_fd, artifact_name, artifact_fd
+            )
+        return total
+
     async def stage(
         self,
         upload: AsyncUpload,

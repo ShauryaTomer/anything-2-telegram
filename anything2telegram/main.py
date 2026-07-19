@@ -48,6 +48,8 @@ class StorageAdapter(Protocol):
 
     def delete_job_directory(self, job_id: UUID) -> None: ...
 
+    def download_directory_size(self, job_id: UUID, artifact_id: UUID) -> int: ...
+
     async def stage(
         self, upload: object, reservation: UploadReservation, max_bytes: int
     ) -> StagedArtifact: ...
@@ -141,6 +143,7 @@ def _youtube(
         storage,
         runner,
         timeout_seconds=settings.ytdlp_timeout_seconds,
+        max_artifact_bytes=settings.max_artifact_bytes,
         cookies_path=settings.cookies_path,
     )
 

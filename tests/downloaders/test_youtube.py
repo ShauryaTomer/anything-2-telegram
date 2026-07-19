@@ -49,8 +49,8 @@ class Runner:
 
 
 async def settle() -> None:
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
+    for _ in range(5):
+        await asyncio.sleep(0)
 
 
 @pytest.mark.parametrize(
@@ -175,7 +175,13 @@ async def test_download_exact_args_and_ready_metadata(tmp_path) -> None:
     bus.on("error", lambda error: pytest.fail(str(error)))
     bus.on(ARTIFACT_READY, ready.append)
     YouTubeArtifactProducer(
-        bus, storage, runner, timeout_seconds=22, id_factory=lambda: ARTIFACT_ID, clock=lambda: NOW
+        bus,
+        storage,
+        runner,
+        timeout_seconds=22,
+        max_artifact_bytes=20,
+        id_factory=lambda: ARTIFACT_ID,
+        clock=lambda: NOW,
     )
     event = YouTubeDownloadRequested(uuid4(), "https://youtu.be/dQw4w9WgXcQ", NOW)
     bus.emit(YOUTUBE_DOWNLOAD_REQUESTED, event)
@@ -184,6 +190,7 @@ async def test_download_exact_args_and_ready_metadata(tmp_path) -> None:
     directory = storage.root / str(event.job_id) / str(ARTIFACT_ID)
     assert runner.calls[0] == ([
         "yt-dlp", "-f", YTDLP_FORMAT, "--merge-output-format", "mp4",
+        "--max-filesize", "20",
         "--restrict-filenames", "--no-playlist", "--js-runtimes", "node",
         "--remote-components", "ejs:github", "-o",
         str(directory / "%(title).80s.%(ext)s"), event.source_url,
@@ -227,24 +234,50 @@ async def test_download_rejects_unsafe_or_ambiguous_outputs_and_cleans(tmp_path,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("error", "result", "code"),
+    ("error", "result", "code", "oversize"),
     [
-        (ProcessTimeoutError(), None, "youtube_timeout"),
-        (None, ProcessResult(3, "", "safe"), "youtube_process_failed"),
-        (RuntimeError("URL and secret"), None, "internal_error"),
+        (ProcessTimeoutError(), None, "youtube_timeout", False),
+        (None, ProcessResult(3, "", "safe"), "youtube_process_failed", False),
+        (RuntimeError("URL and secret"), None, "internal_error", False),
+        (None, None, "artifact_oversize", True),
     ],
 )
-async def test_download_converts_errors_and_cleans(tmp_path, error, result, code) -> None:
+async def test_download_converts_errors_and_cleans(
+    tmp_path, error, result, code, oversize
+) -> None:
     storage = ArtifactStorage(tmp_path / "root")
-    runner = Runner(result=result, error=error)
+    cancelled = asyncio.Event()
+
+    class OversizeRunner:
+        async def run(self, args, timeout_seconds):
+            directory = Path(args[args.index("-o") + 1]).parent
+            (directory / "growing.part").write_bytes(b"12345")
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+    runner = OversizeRunner() if oversize else Runner(result=result, error=error)
     bus = AsyncIOEventEmitter()
-    failures = []
+    failures, ready = [], []
     bus.on("error", lambda value: pytest.fail(str(value)))
     bus.on(ARTIFACT_PRODUCTION_FAILED, failures.append)
+    bus.on(ARTIFACT_READY, ready.append)
     job_id = uuid4()
-    YouTubeArtifactProducer(bus, storage, runner, timeout_seconds=1, id_factory=lambda: ARTIFACT_ID)
+    YouTubeArtifactProducer(
+        bus,
+        storage,
+        runner,
+        timeout_seconds=1,
+        max_artifact_bytes=4,
+        id_factory=lambda: ARTIFACT_ID,
+    )
     bus.emit(YOUTUBE_DOWNLOAD_REQUESTED, YouTubeDownloadRequested(job_id, "https://youtu.be/dQw4w9WgXcQ", NOW))
+    if oversize:
+        await asyncio.wait_for(cancelled.wait(), 0.1)
     await settle()
+    assert ready == []
+    assert len(failures) == 1
     assert failures[0].artifact_id == ARTIFACT_ID
     assert failures[0].error.code == code
     assert "secret" not in failures[0].error.message.lower()
