@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from pathlib import Path
 
 import pytest
@@ -132,3 +133,40 @@ async def test_a_drain_that_overruns_its_grace_period_is_cancelled(
         service.state.bus.emit("slow", None)
 
     assert telegram.connected is False
+
+
+async def test_a_handler_crash_logs_the_real_traceback(
+    build_app, caplog: pytest.LogCaptureFixture
+) -> None:
+    service = build_app()
+
+    async with service.router.lifespan_context(service):
+        state = service.state
+
+        async def explode(_event: object) -> None:
+            raise RuntimeError("handler down")
+
+        state.bus.on("boom", explode)
+        with caplog.at_level("ERROR", logger="anything2telegram"):
+            state.bus.emit("boom", None)
+            for _ in range(4):
+                await asyncio.sleep(0)
+
+    # pyee re-emits from a done callback, so exc_info must be passed explicitly
+    # or logging records "NoneType: None" instead of the failure.
+    assert "handler down" in caplog.text
+    assert "Traceback" in caplog.text
+    assert "NoneType: None" not in caplog.text
+
+
+async def test_the_configured_log_level_is_applied_to_our_package_only(
+    build_app, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    quiet = settings_for(tmp_path, log_level="ERROR")
+    monkeypatch.setattr(main, "YouTubeProcessRunner", lambda: object())
+    monkeypatch.setattr(main, "TelegramClientAdapter", lambda _s: FakeTelegram())
+    service = main.create_app(quiet)
+
+    async with service.router.lifespan_context(service):
+        assert logging.getLogger("anything2telegram").level == logging.ERROR
+        assert logging.getLogger("telethon").level == logging.NOTSET

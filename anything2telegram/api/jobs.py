@@ -69,6 +69,7 @@ def _oversize() -> JSONResponse:
 
 
 def _storage_error(error: ArtifactStorageError) -> JSONResponse:
+    _LOGGER.warning("Upload staging failed: code=%s", error.code)
     if error.code == "invalid_filename":
         return _response(422, "invalid_filename", "Artifact filename is invalid")
     if error.code == "staging_oversize":
@@ -238,6 +239,7 @@ def create_jobs_app() -> FastAPI:
         try:
             form = await request.form(max_files=1, max_fields=1)
         except OSError as error:
+            _LOGGER.exception("Multipart body could not be buffered")
             if error.errno == errno.ENOSPC:
                 return _response(507, "staging_disk_full", "Artifact storage is full")
             return _response(500, "upload_staging_failed", "Upload could not be stored")

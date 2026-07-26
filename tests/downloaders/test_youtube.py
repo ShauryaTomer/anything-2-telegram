@@ -334,6 +334,20 @@ async def test_a_download_produces_a_ready_artifact_with_a_readable_caption(
     assert ready.local_path.parent.parent == storage.root / str(event.job_id)
 
 
+async def test_a_download_reports_its_progress(
+    bus, storage, settings, recorder, caplog
+) -> None:
+    runner = ScriptedRunner(writes_file("clip.mp4", b"x" * 1500))
+    make_producer(bus, storage, runner, settings)
+
+    with caplog.at_level("INFO", logger="anything2telegram"):
+        bus.emit("youtube.download.requested", download_request())
+        await settle(bus)
+
+    assert "Download progress: 0.0 MB" in caplog.text
+    assert len(recorder.ready) == 1
+
+
 async def test_the_download_command_bounds_size_and_uses_the_running_interpreter(
     bus, storage, settings, recorder
 ) -> None:
@@ -434,3 +448,65 @@ async def test_cancellation_cleans_up_and_propagates(
 
     assert recorder.failure_codes() == []
     assert not (storage.root / str(event.job_id)).exists()
+
+
+async def test_a_failed_download_logs_the_reason_yt_dlp_gave(
+    bus, storage, settings, recorder, caplog
+) -> None:
+    runner = ScriptedRunner(
+        ProcessResult(1, "", "ERROR: [youtube] Sign in to confirm your age")
+    )
+    make_producer(bus, storage, runner, settings)
+    event = download_request()
+
+    with caplog.at_level("WARNING", logger="anything2telegram"):
+        bus.emit("youtube.download.requested", event)
+        await settle(bus)
+
+    assert recorder.failure_codes() == ["youtube_process_failed"]
+    logged = caplog.text
+    assert str(event.job_id) in logged
+    assert "exit=1" in logged
+    assert "Sign in to confirm your age" in logged
+
+
+async def test_yt_dlp_stderr_never_reaches_the_emitted_event(
+    bus, storage, settings, recorder
+) -> None:
+    runner = ScriptedRunner(ProcessResult(1, "", "ERROR: cookies from /home/me/c.txt"))
+    make_producer(bus, storage, runner, settings)
+
+    bus.emit("youtube.download.requested", download_request())
+    await settle(bus)
+
+    assert recorder.production_failed[0].error.message == "YouTube process failed"
+    assert "cookies" not in recorder.production_failed[0].error.message
+
+
+async def test_an_unexpected_producer_crash_logs_a_traceback(
+    bus, storage, settings, recorder, caplog
+) -> None:
+    make_producer(bus, storage, ScriptedRunner(RuntimeError("runner exploded")), settings)
+
+    with caplog.at_level("WARNING", logger="anything2telegram"):
+        bus.emit("youtube.download.requested", download_request())
+        await settle(bus)
+
+    assert recorder.failure_codes() == ["internal_error"]
+    assert "runner exploded" in caplog.text
+    assert "Traceback" in caplog.text
+
+
+async def test_a_failed_playlist_expansion_logs_the_batch_and_reason(
+    bus, storage, settings, recorder, caplog
+) -> None:
+    runner = ScriptedRunner(ProcessResult(1, "", "ERROR: playlist does not exist"))
+    make_producer(bus, storage, runner, settings)
+    event = expansion_request()
+
+    with caplog.at_level("WARNING", logger="anything2telegram"):
+        bus.emit("youtube.playlist.expansion.requested", event)
+        await settle(bus)
+
+    assert str(event.batch_id) in caplog.text
+    assert "playlist does not exist" in caplog.text

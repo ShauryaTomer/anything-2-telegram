@@ -109,7 +109,9 @@ class UploadReservation:
 class ProcessResult:
     exit_code: int
     stdout: str
-    stderr_safe_summary: str
+    # For operator logs only. Never put this in an event payload or an HTTP
+    # response: yt-dlp stderr can contain cookie paths and signed URLs.
+    stderr_tail: str
 
 
 @dataclass(frozen=True)

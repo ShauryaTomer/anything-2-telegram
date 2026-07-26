@@ -428,3 +428,63 @@ async def test_stop_cancels_an_upload_that_is_still_running(
 
     assert recorder.uploaded == []
     assert telegram.connected is False
+
+
+async def test_a_failed_upload_logs_the_job_and_the_reason(
+    uploader, bus, storage, telegram, recorder, caplog
+) -> None:
+    telegram.upload_errors = [TelegramUploadError()]
+    event = ready_artifact(storage)
+
+    with caplog.at_level("WARNING", logger="anything2telegram"):
+        bus.emit("artifact.ready", event)
+        await settle(bus)
+
+    assert recorder.failure_codes() == ["telegram_upload_failed"]
+    logged = caplog.text
+    assert str(event.job_id) in logged
+    assert str(event.artifact_id) in logged
+    assert "telegram_upload_failed" in logged
+    assert "clip.mp4" in logged
+
+
+async def test_an_unexpected_upload_crash_logs_a_traceback(
+    uploader, bus, storage, telegram, recorder, caplog
+) -> None:
+    telegram.upload_errors = [RuntimeError("client exploded")]
+
+    with caplog.at_level("WARNING", logger="anything2telegram"):
+        bus.emit("artifact.ready", ready_artifact(storage))
+        await settle(bus)
+
+    assert recorder.failure_codes() == ["internal_error"]
+    assert "client exploded" in caplog.text
+    assert "Traceback" in caplog.text
+
+
+async def test_a_validation_rejection_logs_without_a_bogus_traceback(
+    uploader, bus, storage, recorder, caplog
+) -> None:
+    event = ready_artifact(storage)
+    event.local_path.unlink()
+
+    with caplog.at_level("WARNING", logger="anything2telegram"):
+        bus.emit("artifact.ready", event)
+        await settle(bus)
+
+    assert recorder.failure_codes() == ["artifact_missing"]
+    assert "artifact_missing" in caplog.text
+    assert "NoneType: None" not in caplog.text
+
+
+async def test_losing_telegram_says_so_at_error_level(
+    uploader, bus, storage, telegram, recorder, caplog
+) -> None:
+    telegram.upload_errors = [TelegramUnavailableError()]
+
+    with caplog.at_level("WARNING", logger="anything2telegram"):
+        bus.emit("artifact.ready", ready_artifact(storage))
+        await settle(bus)
+
+    assert "Telegram is unavailable" in caplog.text
+    assert [r.levelname for r in caplog.records if "pausing" in r.message] == ["ERROR"]

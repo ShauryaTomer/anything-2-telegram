@@ -60,8 +60,10 @@ async def test_runner_uses_argument_vector_new_session_and_bounds_output(monkeyp
 
     assert spawned[0][0] == ("yt-dlp", "--version")
     assert spawned[0][1]["start_new_session"] is True
-    assert result == ProcessResult(0, "abcd", "process stderr suppressed (22 bytes)")
-    assert "secret" not in result.stderr_safe_summary
+    # Both streams are bounded by _MAX_OUTPUT_BYTES, patched to 4 here. stderr
+    # is now kept as text so the operator log can explain a failure; it must
+    # never reach an event or an HTTP response.
+    assert result == ProcessResult(0, "abcd", "secr")
 
 
 @pytest.mark.asyncio

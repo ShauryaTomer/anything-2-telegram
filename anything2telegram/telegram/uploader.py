@@ -4,7 +4,7 @@ import asyncio
 import logging
 import mimetypes
 import stat
-from collections.abc import Callable
+import sys
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -24,6 +24,7 @@ from ..events import (
     PlaylistExpanded,
     TelegramUnavailable,
 )
+from ..tui import transfer
 from .client import (
     TelegramClientError,
     TelegramUnavailableError,
@@ -32,7 +33,6 @@ from .client import (
 
 
 _LOGGER = logging.getLogger(__name__)
-_PROGRESS_INTERVAL_SECONDS = 1.0
 
 _ERRORS = {
     "artifact_missing": "Artifact is unavailable",
@@ -133,9 +133,13 @@ class TelegramArtifactUploader:
         # ponytail: the header is cosmetic, so a failed post never fails the
         # batch. Emit a job failure instead if it ever has to be delivered.
         except TelegramClientError:
-            _LOGGER.warning("Playlist header message failed")
+            _LOGGER.warning(
+                "Playlist header message failed: batch=%s", event.batch_id
+            )
         except Exception:
-            _LOGGER.exception("Playlist header message failed")
+            _LOGGER.exception(
+                "Playlist header message failed: batch=%s", event.batch_id
+            )
         finally:
             if task is not None:
                 self._inflight.discard(task)
@@ -169,16 +173,17 @@ class TelegramArtifactUploader:
             self._emit_failure(event, failure)
             return
         try:
-            result = await asyncio.wait_for(
-                self._client.upload(
-                    event.local_path,
-                    caption=event.caption,
-                    supports_streaming=_supports_streaming(event),
-                    progress_callback=_progress_callback(),
-                    file_size=event.size_bytes,
-                ),
-                timeout=self._timeout_seconds,
-            )
+            with transfer("Upload", event.filename, event.size_bytes) as progress:
+                result = await asyncio.wait_for(
+                    self._client.upload(
+                        event.local_path,
+                        caption=event.caption,
+                        supports_streaming=_supports_streaming(event),
+                        progress_callback=progress,
+                        file_size=event.size_bytes,
+                    ),
+                    timeout=self._timeout_seconds,
+                )
         except asyncio.CancelledError:
             if not self._shutting_down:
                 await self._stop(asyncio.current_task())
@@ -194,6 +199,13 @@ class TelegramArtifactUploader:
             self._emit_failure(event, "telegram_upload_failed")
             return
         self._emitted.add(key)
+        _LOGGER.info(
+            "Artifact uploaded: job=%s artifact=%s chat=%s message=%s",
+            event.job_id,
+            event.artifact_id,
+            result.chat_id,
+            result.message_id,
+        )
         self._bus.emit(
             ARTIFACT_UPLOADED,
             ArtifactUploaded(
@@ -256,6 +268,17 @@ class TelegramArtifactUploader:
         if key in self._emitted:
             return
         self._emitted.add(key)
+        _LOGGER.warning(
+            "Artifact upload failed: job=%s artifact=%s code=%s file=%s bytes=%d",
+            event.job_id,
+            event.artifact_id,
+            code,
+            event.filename,
+            event.size_bytes,
+            # Set when called from an except block, None from a validation
+            # rejection; either way the traceback is not lost.
+            exc_info=sys.exc_info()[1],
+        )
         self._bus.emit(
             ARTIFACT_UPLOAD_FAILED,
             ArtifactUploadFailed(
@@ -284,6 +307,9 @@ class TelegramArtifactUploader:
         if self._shutting_down or self._unavailable_emitted:
             return
         self._unavailable_emitted = True
+        _LOGGER.error(
+            "Telegram is unavailable, pausing the queue; restart to resume"
+        )
         self._bus.emit(
             TELEGRAM_UNAVAILABLE,
             TelegramUnavailable(
@@ -299,23 +325,6 @@ def _supports_streaming(event: ArtifactReady) -> bool:
         return True
     guessed, _ = mimetypes.guess_type(event.filename)
     return guessed is not None and guessed.startswith("video/")
-
-
-def _progress_callback() -> Callable[[int, int], None]:
-    last_reported = 0.0
-
-    def report(sent: int, total: int) -> None:
-        nonlocal last_reported
-        now = asyncio.get_running_loop().time()
-        complete = total > 0 and sent >= total
-        if not complete and now - last_reported < _PROGRESS_INTERVAL_SECONDS:
-            return
-        last_reported = now
-        _LOGGER.info(
-            "Telegram upload progress: %d%%", sent * 100 // total if total else 0
-        )
-
-    return report
 
 
 def _now() -> datetime:

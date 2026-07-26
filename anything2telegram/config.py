@@ -7,6 +7,9 @@ from pathlib import Path
 from dotenv import dotenv_values
 
 
+_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+
+
 class ConfigError(ValueError):
     """Configuration is missing, invalid, or unsafe."""
 
@@ -24,6 +27,7 @@ class Settings:
     ytdlp_timeout_seconds: float
     tg_upload_timeout_seconds: float
     shutdown_grace_seconds: float
+    log_level: str = "INFO"
 
     @classmethod
     def from_env(cls, base_dir: Path) -> "Settings":
@@ -56,6 +60,7 @@ class Settings:
                 values, "TG_UPLOAD_TIMEOUT_SECONDS", "3600"
             ),
             shutdown_grace_seconds=_seconds(values, "SHUTDOWN_GRACE_SECONDS", "30"),
+            log_level=_log_level(values),
         )
 
 
@@ -99,6 +104,13 @@ def _seconds(values: Mapping[str, str], key: str, default: str) -> float:
     if parsed <= 0 or not math.isfinite(parsed):
         raise ConfigError(f"{key} must be positive and finite")
     return parsed
+
+
+def _log_level(values: Mapping[str, str]) -> str:
+    level = _value(values, "LOG_LEVEL", "INFO").upper()
+    if level not in _LOG_LEVELS:
+        raise ConfigError(f"LOG_LEVEL must be one of {', '.join(sorted(_LOG_LEVELS))}")
+    return level
 
 
 def _path(base_dir: Path, value: str) -> Path:

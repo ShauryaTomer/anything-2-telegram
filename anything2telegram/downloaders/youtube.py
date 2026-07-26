@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import mimetypes
 import re
 import sys
@@ -28,8 +29,11 @@ from ..events import (
     PlaylistExpansionRequested,
     YouTubeDownloadRequested,
 )
+from ..tui import transfer
 from .process import ProcessResult, ProcessTimeoutError
 
+
+_LOGGER = logging.getLogger(__name__)
 
 YTDLP_FORMAT = (
     "bv*[ext=mp4][vcodec^=avc1][height<=1080]+ba[ext=m4a]/"
@@ -146,7 +150,10 @@ class YouTubeArtifactProducer:
             )
             if result.exit_code != 0:
                 self._emit_playlist_failure(
-                    event, "youtube_process_failed", "YouTube process failed"
+                    event,
+                    "youtube_process_failed",
+                    "YouTube process failed",
+                    _process_detail(result),
                 )
                 return
             targets, skipped, playlist_title = self._parse_playlist(result.stdout)
@@ -195,6 +202,7 @@ class YouTubeArtifactProducer:
                 self._download_args(event.source_url, directory),
                 event.job_id,
                 artifact_id,
+                _source_label(event.source_url),
             )
             if result.exit_code != 0:
                 self._emit_artifact_failure(
@@ -202,11 +210,19 @@ class YouTubeArtifactProducer:
                     artifact_id,
                     "youtube_process_failed",
                     "YouTube process failed",
+                    _process_detail(result),
                 )
                 self._storage.delete_job_directory(event.job_id)
                 return
             artifact = self._discover_artifact(
                 event.job_id, artifact_id, directory, event.caption_prefix
+            )
+            _LOGGER.info(
+                "Artifact produced: job=%s artifact=%s file=%s bytes=%d",
+                artifact.job_id,
+                artifact.artifact_id,
+                artifact.filename,
+                artifact.size_bytes,
             )
             self._bus.emit(
                 ARTIFACT_READY,
@@ -282,22 +298,27 @@ class YouTubeArtifactProducer:
         ]
 
     async def _run_download(
-        self, args: Sequence[str], job_id: UUID, artifact_id: UUID
+        self, args: Sequence[str], job_id: UUID, artifact_id: UUID, label: str
     ) -> ProcessResult:
         """Waits for yt-dlp, stopping it if the partial download outgrows its quota."""
         runner_task = asyncio.create_task(
             self._runner.run(args, self._timeout_seconds)
         )
         try:
-            while True:
-                done, _ = await asyncio.wait(
-                    (runner_task,), timeout=_QUOTA_POLL_SECONDS
-                )
-                size = self._storage.download_directory_size(job_id, artifact_id)
-                if size > self._max_artifact_bytes:
-                    raise _ArtifactOversize()
-                if done:
-                    return await runner_task
+            # ponytail: bytes on disk, so no percentage — the final size is
+            # unknown until yt-dlp merges. Parse --progress-template if a
+            # percentage is ever worth streaming yt-dlp's stdout for.
+            with transfer("Download", label, 0) as report:
+                while True:
+                    done, _ = await asyncio.wait(
+                        (runner_task,), timeout=_QUOTA_POLL_SECONDS
+                    )
+                    size = self._storage.download_directory_size(job_id, artifact_id)
+                    report(size, 0)
+                    if size > self._max_artifact_bytes:
+                        raise _ArtifactOversize()
+                    if done:
+                        return await runner_task
         finally:
             if not runner_task.done():
                 runner_task.cancel()
@@ -374,8 +395,20 @@ class YouTubeArtifactProducer:
         )
 
     def _emit_playlist_failure(
-        self, event: PlaylistExpansionRequested, code: str, message: str
+        self,
+        event: PlaylistExpansionRequested,
+        code: str,
+        message: str,
+        detail: str = "",
     ) -> None:
+        _LOGGER.warning(
+            "Playlist expansion failed: batch=%s code=%s url=%s%s",
+            event.batch_id,
+            code,
+            event.source_url,
+            f" {detail}" if detail else "",
+            exc_info=sys.exc_info()[1],
+        )
         self._bus.emit(
             YOUTUBE_PLAYLIST_EXPANSION_FAILED,
             PlaylistExpansionFailed(
@@ -391,7 +424,17 @@ class YouTubeArtifactProducer:
         artifact_id: UUID | None,
         code: str,
         message: str,
+        detail: str = "",
     ) -> None:
+        _LOGGER.warning(
+            "Artifact production failed: job=%s artifact=%s code=%s url=%s%s",
+            event.job_id,
+            artifact_id,
+            code,
+            event.source_url,
+            f" {detail}" if detail else "",
+            exc_info=sys.exc_info()[1],
+        )
         self._bus.emit(
             ARTIFACT_PRODUCTION_FAILED,
             ArtifactProductionFailed(
@@ -401,6 +444,16 @@ class YouTubeArtifactProducer:
                 _now(),
             ),
         )
+
+def _process_detail(result: ProcessResult) -> str:
+    """yt-dlp's own explanation, for the operator log only."""
+    return f"exit={result.exit_code} stderr={result.stderr_tail!r}"
+
+
+def _source_label(source_url: str) -> str:
+    """The video id, which is all a progress bar has before the file exists."""
+    return source_url.rsplit("/", 1)[-1].rsplit("=", 1)[-1]
+
 
 def _playlist_title(entry: dict) -> str | None:
     title = entry.get("playlist_title") or entry.get("playlist")

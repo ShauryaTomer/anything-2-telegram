@@ -63,21 +63,23 @@ each component knows only which facts it consumes and which it produces.
 
 ## 2. Files
 
-| File | Lines | Responsibility |
+| File | Lines* | Responsibility |
 |---|---:|---|
-| [main.py](../anything2telegram/main.py) | 118 | Wiring. Builds every component in the FastAPI lifespan, connects them to one bus, owns readiness and shutdown drain. |
-| [config.py](../anything2telegram/config.py) | 140 | `Settings` frozen dataclass, parsed from `.env` + environment. Fails loudly at startup on bad config. |
-| [domain.py](../anything2telegram/domain.py) | 118 | Vocabulary: enums, refs, snapshots, `StagedArtifact`, `UploadReservation`. Pure data, zero behaviour. |
-| [events.py](../anything2telegram/events.py) | 133 | The 14 topic-name constants and one frozen dataclass per event. The contract between components. |
-| [api/jobs.py](../anything2telegram/api/jobs.py) | 322 | HTTP surface. Validates input, translates exceptions to status codes, renders snapshots to JSON. |
-| [jobs/scheduler.py](../anything2telegram/jobs/scheduler.py) | 386 | The only stateful decision-maker: one work item active at a time, queue of the rest. |
+| [main.py](../anything2telegram/main.py) | 138 | Wiring. Builds every component in the FastAPI lifespan, connects them to one bus, owns readiness and shutdown drain. |
+| [config.py](../anything2telegram/config.py) | 152 | `Settings` frozen dataclass, parsed from `.env` + environment. Fails loudly at startup on bad config. |
+| [domain.py](../anything2telegram/domain.py) | 120 | Vocabulary: enums, refs, snapshots, `StagedArtifact`, `UploadReservation`. Pure data, zero behaviour. |
+| [events.py](../anything2telegram/events.py) | 136 | The 14 topic-name constants and one frozen dataclass per event. The contract between components. |
+| [api/jobs.py](../anything2telegram/api/jobs.py) | 324 | HTTP surface. Validates input, translates exceptions to status codes, renders snapshots to JSON. |
+| [jobs/scheduler.py](../anything2telegram/jobs/scheduler.py) | 399 | The only stateful decision-maker: one work item active at a time, queue of the rest. |
 | [jobs/tracker.py](../anything2telegram/jobs/tracker.py) | 344 | Read model. Folds lifecycle facts into in-memory job/batch records for `GET /jobs/{id}`. |
-| [downloaders/youtube.py](../anything2telegram/downloaders/youtube.py) | 403 | URL classification (pure functions) + the producer that drives yt-dlp and announces artifacts. |
-| [downloaders/process.py](../anything2telegram/downloaders/process.py) | 155 | Subprocess mechanics: own process group, bounded output capture, SIGTERM→SIGKILL on timeout. |
-| [telegram/client.py](../anything2telegram/telegram/client.py) | 107 | Telethon adapter. Maps every Telethon failure onto three of our own exceptions. |
-| [telegram/uploader.py](../anything2telegram/telegram/uploader.py) | 295 | Bus handler for `artifact.ready`: revalidates, uploads, announces the outcome. |
+| [downloaders/youtube.py](../anything2telegram/downloaders/youtube.py) | 476 | URL classification (pure functions) + the producer that drives yt-dlp and announces artifacts. |
+| [downloaders/process.py](../anything2telegram/downloaders/process.py) | 158 | Subprocess mechanics: own process group, bounded output capture, SIGTERM→SIGKILL on timeout. |
+| [telegram/client.py](../anything2telegram/telegram/client.py) | 115 | Telethon adapter. Maps every Telethon failure onto three of our own exceptions. |
+| [telegram/uploader.py](../anything2telegram/telegram/uploader.py) | 348 | Bus handler for `artifact.ready`: revalidates, uploads, announces the outcome. |
 | [artifacts/storage.py](../anything2telegram/artifacts/storage.py) | 149 | Disk layout `root/<job_id>/<artifact_id>/<filename>`, streaming staging, deletion. |
 | [artifacts/cleanup.py](../anything2telegram/artifacts/cleanup.py) | 28 | Deletes a job's directory when the job reaches any terminal fact. |
+
+\* Line counts are for orientation only — expect them to drift.
 
 **Dependency direction.** `domain.py` imports nothing of ours. `events.py` imports only `domain`.
 Everything else imports inward toward those two and never sideways into a peer's internals — the
@@ -248,9 +250,10 @@ Two things in this system can fail in ways we don't control, and each gets exact
 
 **yt-dlp** — `YouTubeProcessRunner` starts it with `start_new_session=True` so the whole process
 tree (yt-dlp plus its ffmpeg children) is one process group that a timeout can kill with `killpg`,
-SIGTERM then SIGKILL after a grace period. stdout is captured up to 1 MB; stderr is *counted, not
-kept*, and surfaces as `"process stderr suppressed (N bytes)"` — yt-dlp errors can contain cookies
-and URLs, so they never enter an event or an HTTP response.
+SIGTERM then SIGKILL after a grace period. Both streams are captured up to 1 MB, and the last 2000
+characters of stderr travel back as `ProcessResult.stderr_tail` so the producer can log *why* yt-dlp
+gave up. That text is for the operator log only — it can contain cookie paths and signed URLs, so it
+never enters an event payload or an HTTP response.
 
 Above that, `YouTubeArtifactProducer` polls the download directory once a second while yt-dlp runs
 and aborts if the partial download outgrows `max_artifact_bytes`. `--max-filesize` alone is not
@@ -312,7 +315,31 @@ Shutdown is ordered so nothing is lost silently:
 
 ---
 
-## 9. What the parts follow
+## 9. Logging and diagnosis
+
+`LOG_LEVEL` (default `INFO`) is a normal setting, so it works from `.env`. `_configure_logging` in
+[main.py](../anything2telegram/main.py) gives the **root** logger a handler at `WARNING` and then sets
+the level on the `anything2telegram` logger alone — without a root handler, logging's last-resort
+fallback silently drops everything below `WARNING`, and setting the level on root instead would also
+unleash Telethon's internals.
+
+Two rules make failures diagnosable:
+
+- **Every terminal failure logs once, with its ids.** The producer logs `job=… code=… url=… exit=…
+  stderr=…`, the uploader logs `job=… artifact=… code=… file=…`. So a failed job in a 200-video batch
+  is greppable by id.
+- **`exc_info` is passed explicitly, never inferred.** pyee re-emits async handler exceptions from a
+  done callback, so there is no active exception context in the `error` listener — `logger.exception`
+  there records `NoneType: None` and throws the traceback away. Handlers that log from inside an
+  `except` block use `exc_info=sys.exc_info()[1]`, which yields the exception when there is one and
+  `None` when the failure was a validation rejection rather than a crash.
+
+At `INFO` you get one line per produced artifact and one per upload, which is enough to follow a
+batch. The queue also announces its own state changes: `Scheduler paused` (Telegram went away, work is
+still queued but will not move until restart) and `Scheduler failed` (a handler crashed; queued work
+was discarded).
+
+## 10. What the parts follow
 
 | Part | Pattern / principle it follows |
 |---|---|
@@ -328,7 +355,7 @@ Shutdown is ordered so nothing is lost silently:
 | `app.state` | Use the platform's DI. No custom container, no factories, no protocols. |
 | readiness | Fail closed. Degrade to refusing work rather than accepting and dropping it. |
 | `cleanup.py` | Cleanup driven by a terminal fact, not by a lexical scope. |
-| errors | Stable `{code, message}` pairs; internal detail (stderr, tracebacks) never crosses the boundary. |
+| errors | Stable `{code, message}` pairs over HTTP; the diagnostic detail (stderr, tracebacks) goes to the log instead of the response. |
 | tests | No production code exists to serve a test. Tests monkeypatch module attributes at the two real seams — `YouTubeProcessRunner` and `TelegramClientAdapter`. |
 
 The last row is the deliberate constraint behind the current shape. Earlier revisions carried an
@@ -339,7 +366,7 @@ on two module attributes in [tests/conftest.py](../tests/conftest.py).
 
 ---
 
-## 10. Known limits
+## 11. Known limits
 
 Deliberate, with the upgrade path if they ever bite:
 

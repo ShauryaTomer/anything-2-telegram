@@ -190,6 +190,10 @@ class JobScheduler:
         return True
 
     def pause(self) -> None:
+        if not self._paused:
+            _LOGGER.warning(
+                "Scheduler paused, %d job(s) left waiting", len(self._queue)
+            )
         self._paused = True
 
     def stop(self) -> None:
@@ -204,6 +208,11 @@ class JobScheduler:
     def fail(self) -> None:
         if self._stopped:
             return
+        _LOGGER.error(
+            "Scheduler failed, discarding %d queued job(s); active=%s",
+            len(self._queue),
+            getattr(self._active, "job_id", None),
+        )
         self._pump_scheduled = False
         self.stop()
         if isinstance(self._active, _StagedWork):

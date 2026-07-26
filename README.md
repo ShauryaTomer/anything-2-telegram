@@ -45,12 +45,17 @@ MAX_ARTIFACT_BYTES=2000000000         # hard cap per artifact (~2 GB)
 YTDLP_TIMEOUT_SECONDS=3600
 TG_UPLOAD_TIMEOUT_SECONDS=3600
 SHUTDOWN_GRACE_SECONDS=30
+LOG_LEVEL=INFO                        # DEBUG, INFO, WARNING, ERROR, CRITICAL
 ```
 
 Notes:
 
 - The session file is created with `0600` and its parent directory must not be group/world-writable — the server refuses to start otherwise.
 - `ARTIFACT_ROOT` cannot be a filesystem root or the repo root.
+- `LOG_LEVEL` applies to this application's loggers only, so `DEBUG` will not also
+  turn on Telethon's internal chatter. When a job fails, the log line carries the job
+  id and yt-dlp's own error text; the HTTP response deliberately keeps only a generic
+  code, since stderr can contain cookie paths and signed URLs.
 
 ## 4. YouTube cookies
 

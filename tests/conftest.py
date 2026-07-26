@@ -123,6 +123,7 @@ def settings_for(tmp_path: Path, **overrides: object) -> Settings:
         "ytdlp_timeout_seconds": 2,
         "tg_upload_timeout_seconds": 2,
         "shutdown_grace_seconds": 1,
+        "log_level": "DEBUG",
     }
     return Settings(**(values | overrides))
 

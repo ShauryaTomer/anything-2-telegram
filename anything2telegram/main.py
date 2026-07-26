@@ -19,10 +19,28 @@ from .jobs.scheduler import JobScheduler
 from .jobs.tracker import JobTracker
 from .telegram.client import TelegramClientAdapter
 from .telegram.uploader import TelegramArtifactUploader
+from .tui import install_log_handler
 
 
 _LOGGER = logging.getLogger(__name__)
 APPLICATION_BASE = Path(__file__).parent.parent
+_LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s %(message)s"
+
+
+def _configure_logging(level: str) -> None:
+    """Give the root logger a handler, then set our level only.
+
+    Without a root handler, logging's last-resort fallback drops everything
+    below WARNING. basicConfig is a no-op if handlers already exist, so an
+    outer process that configured logging keeps its own setup. The level is
+    set on our package alone so DEBUG does not also unleash Telethon.
+
+    On a terminal, rich takes the handler so records render above a live
+    progress bar instead of tearing through it.
+    """
+    if not install_log_handler(logging.WARNING):
+        logging.basicConfig(format=_LOG_FORMAT, level=logging.WARNING)
+    logging.getLogger("anything2telegram").setLevel(level)
 
 
 class Readiness:
@@ -72,6 +90,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         resolved = settings if settings is not None else Settings.from_env(
             APPLICATION_BASE
         )
+        _configure_logging(resolved.log_level)
         state = service.state
         state.settings = resolved
         state.readiness = Readiness()
@@ -91,8 +110,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             state.bus, state.storage, state.telegram, resolved
         )
 
-        def on_event_error(_error: object) -> None:
-            _LOGGER.exception("Application event handler failed")
+        def on_event_error(error: object) -> None:
+            # pyee re-emits handler exceptions from a done callback, so there is
+            # no active exception context here — exc_info must be passed in or
+            # the traceback is lost.
+            _LOGGER.error(
+                "Application event handler failed, closing admission",
+                exc_info=error if isinstance(error, BaseException) else None,
+            )
             state.readiness.close()
             state.scheduler.fail()
 

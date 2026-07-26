@@ -9,6 +9,7 @@ from ..domain import ProcessResult
 
 _MAX_OUTPUT_BYTES = 1024 * 1024
 _SHUTDOWN_GRACE_SECONDS = 1.0
+_STDERR_TAIL_CHARS = 2000
 
 
 class ProcessTimeoutError(TimeoutError):
@@ -39,12 +40,12 @@ class YouTubeProcessRunner:
             if pending:
                 await self._terminate(process_group_id, wait_task)
                 raise ProcessTimeoutError() from None
-            stdout, stdout_count = await stdout_task
-            _, stderr_count = await stderr_task
+            stdout, _ = await stdout_task
+            stderr, _ = await stderr_task
             return ProcessResult(
                 process.returncode,
                 stdout.decode("utf-8", errors="replace"),
-                self._safe_stderr_summary(stderr_count),
+                self._stderr_tail(stderr),
             )
         except asyncio.CancelledError:
             await self._cleanup_after_interrupt(process_group_id, wait_task)
@@ -149,7 +150,9 @@ class YouTubeProcessRunner:
             raise
 
     @staticmethod
-    def _safe_stderr_summary(byte_count: int) -> str:
-        if byte_count == 0:
-            return ""
-        return f"process stderr suppressed ({byte_count} bytes)"
+    def _stderr_tail(raw: bytes) -> str:
+        """The end of stderr, where yt-dlp puts the reason it gave up."""
+        # ponytail: _read_bounded keeps the first _MAX_OUTPUT_BYTES, so on
+        # stderr larger than that this is the tail of the head. Fine for
+        # yt-dlp; revisit if a runner ever produces megabytes of stderr.
+        return raw.decode("utf-8", errors="replace").strip()[-_STDERR_TAIL_CHARS:]
