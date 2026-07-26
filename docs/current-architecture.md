@@ -1,5 +1,9 @@
 # Current Architecture
 
+C4-style views of the running system. For module-by-module detail, bus dispatch mechanics, and the
+principles each part follows, see [ARCHITECTURE.md](ARCHITECTURE.md). For step-by-step flows, see
+[HAPPY-PATHS.md](HAPPY-PATHS.md).
+
 ## Scope
 
 - Local Python server accepting YouTube URLs and multipart file uploads.
@@ -45,7 +49,7 @@ flowchart TB
   server -->|"Starts, times out, and cancels<br/>Subprocess argv"| process
   process -->|"Fetches metadata/media<br/>HTTPS"| youtube
   process -->|"Writes bounded temporary media"| artifacts
-  server -->|"Stages, validates, and deletes<br/>FD-relative filesystem ops"| artifacts
+  server -->|"Stages, validates, and deletes<br/>Filesystem path operations"| artifacts
   server -->|"Uploads validated artifacts<br/>Telethon/MTProto"| telegram
 
   classDef ext fill:#8a8a8a,stroke:#666,color:#fff
@@ -65,7 +69,7 @@ flowchart TB
     youtubeProducer["YouTube producer<br/><small>yt-dlp adapter</small><br/><small>Expands playlists, produces local artifacts</small>"]
     telegramUploader["Telegram uploader<br/><small>Telethon adapter</small><br/><small>Consumes generic artifacts and uploads them</small>"]
     tracker["Lifecycle tracker<br/><small>In-memory projections</small><br/><small>Builds immutable job and batch snapshots</small>"]
-    storage["Artifact storage<br/><small>FD-relative filesystem API</small><br/><small>Reserves, stages, validates, measures, deletes</small>"]
+    storage["Artifact storage<br/><small>Filesystem API</small><br/><small>Reserves, stages, validates, measures, deletes</small>"]
     cleanup["Artifact cleanup<br/><small>Event listener</small><br/><small>Deletes job directories after terminal events</small>"]
     lifecycle["Application lifecycle<br/><small>FastAPI lifespan</small><br/><small>Builds components — readiness, rollback, shutdown</small>"]
   end
@@ -123,15 +127,17 @@ sequenceDiagram
 ### Playlist
 
 - Playlist submission creates a batch and occupies the active scheduler slot during expansion.
-- YouTube emits ordered targets plus skipped-entry count.
-- Scheduler deduplicates targets, creates one child job per target, and inserts children at queue front.
+- The YouTube producer deduplicates entries while parsing, and emits ordered targets plus a
+  skipped-entry count.
+- Scheduler creates one child job per target and inserts children at queue front.
 - Later standalone submissions wait until playlist children finish.
 - Batch status derives from child projections: completed, failed, or partially completed.
 
 ### Direct upload
 
 - API reserves job/artifact IDs and a safe destination.
-- Multipart bytes are bounded during parsing, then streamed into artifact storage.
+- A declared `Content-Length` over the limit is rejected before any body is read; the streaming
+  writer then bounds the actual bytes regardless of what the header claimed.
 - Scheduler queues the staged artifact only after staging succeeds.
 - When its FIFO turn arrives, scheduler emits `artifact.ready`; Telegram remains source-agnostic.
 
@@ -155,19 +161,23 @@ Facts:
 - `artifact.uploaded`
 - `artifact.upload.failed`
 - `telegram.unavailable`
+- `error` (an unhandled handler failure; pyee re-emits async listener exceptions here)
 
-All event payloads are frozen domain objects with timezone-aware timestamps. Producers and consumers depend only on shared contracts, not on each other.
+Every payload except `error` is a frozen domain object with a timezone-aware timestamp; `error`
+carries the raw exception. Producers and consumers depend only on shared contracts, not on each other.
 
 ## Runtime and lifecycle
 
 Startup order:
 
 1. Load settings from the application base directory.
-2. Validate/claim artifact storage and clear startup orphans.
-3. Create one event bus and register global/error listeners.
-4. Register tracker, scheduler, cleanup, YouTube, and Telegram components.
-5. Connect Telegram and start its disconnect monitor.
-6. Open readiness and accept submissions.
+2. Create artifact storage and clear startup orphans.
+3. Create one event bus.
+4. Register tracker, scheduler, cleanup, YouTube, and Telegram components — in that order, which
+   fixes listener dispatch order.
+5. Register the `error` and `telegram.unavailable` listeners.
+6. Connect Telegram and start its disconnect monitor.
+7. Open readiness and accept submissions.
 
 Shutdown order:
 
@@ -182,10 +192,11 @@ Shutdown order:
 ## Failure boundaries
 
 - Scheduler owns queue state; tracker only observes facts.
-- Listener/programming failures mark scheduler fatal and readiness false.
+- Listener/programming failures call `scheduler.fail()` and close readiness.
 - Telegram disconnection fails the current upload, emits `telegram.unavailable`, pauses scheduling, and rejects new submissions.
 - yt-dlp runs in its own process group; timeout/cancellation sends terminate, then kill if still alive.
-- Known and unknown YouTube sizes are bounded using `--max-filesize` plus FD-relative directory-size monitoring.
+- Known and unknown YouTube sizes are bounded using `--max-filesize` plus one-second polling of the
+  download directory's size while yt-dlp runs.
 - Terminal upload events trigger idempotent artifact cleanup.
 - All queues, projections, dedupe registries, and events are process-local and non-durable.
 

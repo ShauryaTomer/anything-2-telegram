@@ -1,21 +1,18 @@
-"""HTTP job API."""
+"""HTTP job API. Components are read from ``app.state`` per request."""
 
-import asyncio
 import errno
 import logging
-from collections.abc import Callable
 from datetime import datetime
-from typing import Protocol
 from uuid import UUID
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 from python_multipart.exceptions import MultipartParseError
-from pydantic import BaseModel, ConfigDict
-from starlette.datastructures import FormData, UploadFile
+from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.formparsers import MultiPartException, MultiPartParser
+from starlette.formparsers import MultiPartException
 from starlette.requests import ClientDisconnect
 
 from anything2telegram.artifacts.storage import ArtifactStorageError
@@ -25,8 +22,6 @@ from anything2telegram.domain import (
     ErrorInfo,
     JobRef,
     JobSnapshot,
-    StagedArtifact,
-    UploadReservation,
 )
 from anything2telegram.downloaders.youtube import (
     UnsupportedYouTubeUrl,
@@ -37,112 +32,17 @@ from anything2telegram.jobs.scheduler import SchedulerError
 
 
 _LOGGER = logging.getLogger(__name__)
-_MAX_FORM_FIELD_BYTES = 4096
-
-
-class Scheduler(Protocol):
-    @property
-    def accepting(self) -> bool: ...
-
-    @property
-    def active_id(self) -> UUID | None: ...
-
-    def submit_video(self, source_url: str) -> JobRef: ...
-
-    def submit_playlist(self, source_url: str) -> BatchRef: ...
-
-    def reserve_local_upload(
-        self,
-        filename: str,
-        media_type: str | None,
-        caption: str | None,
-    ) -> UploadReservation: ...
-
-    def enqueue_reserved_upload(
-        self, reservation: UploadReservation, size_bytes: int
-    ) -> JobRef: ...
-
-    def cancel_reserved_upload(self, job_id: UUID) -> bool: ...
-
-    def pause(self) -> None: ...
-
-    def stop(self) -> None: ...
-
-
-class Tracker(Protocol):
-    def get_job(self, job_id: UUID) -> JobSnapshot | None: ...
-
-    def get_batch(self, batch_id: UUID) -> BatchSnapshot | None: ...
-
-
-class UploadSource(Protocol):
-    async def read(self, size: int) -> bytes: ...
-
-
-class Storage(Protocol):
-    async def stage(
-        self,
-        upload: UploadSource,
-        reservation: UploadReservation,
-        max_bytes: int,
-    ) -> StagedArtifact: ...
-
-
-class Readiness(Protocol):
-    def is_accepting(self) -> bool: ...
-
-
-class TelegramConnectivity(Protocol):
-    def is_connected(self) -> bool: ...
+_UPLOAD_FIELDS = {"file", "caption"}
 
 
 class _YouTubeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     url: str
+    offset: int = Field(default=0, ge=0)
 
 
-class _UploadTooLarge(MultiPartException):
-    pass
-
-
-class _BoundedMultiPartParser(MultiPartParser):
-    def __init__(self, *args: object, max_file_bytes: int, **kwargs: object) -> None:
-        super().__init__(*args, **kwargs)
-        self._max_file_bytes = max_file_bytes
-        self._current_file_bytes = 0
-
-    def on_part_begin(self) -> None:
-        self._current_file_bytes = 0
-        super().on_part_begin()
-
-    def on_part_data(self, data: bytes, start: int, end: int) -> None:
-        if self._current_part.file is not None:
-            self._current_file_bytes += end - start
-            if self._current_file_bytes > self._max_file_bytes:
-                raise _UploadTooLarge("Upload exceeds maximum allowed size")
-        super().on_part_data(data, start, end)
-
-
-class _DisconnectAwareUpload:
-    def __init__(self, request: Request, upload: UploadFile) -> None:
-        self._request = request
-        self._upload = upload
-
-    async def read(self, size: int) -> bytes:
-        if await self._request.is_disconnected():
-            raise ClientDisconnect()
-        return await self._upload.read(size)
-
-
-def _safe_log(message: str) -> None:
-    try:
-        _LOGGER.error(message)
-    except BaseException:
-        pass
-
-
-def _error(
+def _response(
     status_code: int,
     code: str,
     message: str,
@@ -157,22 +57,25 @@ def _error(
 
 
 def _service_unavailable() -> JSONResponse:
-    return _error(503, "service_unavailable", "Service is not ready")
+    return _response(503, "service_unavailable", "Service is not ready")
 
 
-def _safe_bool(check: object, method_name: str) -> bool:
-    try:
-        method = getattr(check, method_name)
-        return method() is True
-    except Exception:
-        return False
+def _invalid_request() -> JSONResponse:
+    return _response(422, "invalid_request", "Request is invalid")
 
 
-def _scheduler_accepting(scheduler: Scheduler) -> bool:
-    try:
-        return scheduler.accepting is True
-    except Exception:
-        return False
+def _oversize() -> JSONResponse:
+    return _response(413, "staging_oversize", "Upload exceeds maximum allowed size")
+
+
+def _storage_error(error: ArtifactStorageError) -> JSONResponse:
+    if error.code == "invalid_filename":
+        return _response(422, "invalid_filename", "Artifact filename is invalid")
+    if error.code == "staging_oversize":
+        return _oversize()
+    if error.code == "staging_disk_full":
+        return _response(507, "staging_disk_full", "Artifact storage is full")
+    return _response(500, "upload_staging_failed", "Upload could not be stored")
 
 
 def _timestamp(value: datetime) -> str:
@@ -225,355 +128,195 @@ def _batch_body(snapshot: BatchSnapshot) -> dict[str, object]:
 
 
 def _submission_body(kind: str, ref: JobRef | BatchRef) -> dict[str, str]:
-    return {
-        "type": kind,
-        "id": str(ref.id),
-        "status_url": ref.status_url,
-    }
+    return {"type": kind, "id": str(ref.id), "status_url": ref.status_url}
 
 
-def _cancel_reservation(scheduler: Scheduler, job_id: UUID) -> None:
+def _identifier(value: str) -> UUID | None:
     try:
-        cleaned = scheduler.cancel_reserved_upload(job_id)
-    except BaseException:
-        _safe_log("Upload reservation cleanup failed")
-        return
-    if not cleaned:
-        _safe_log("Upload reservation cleanup failed")
+        return UUID(value)
+    except ValueError:
+        return None
 
 
-def _storage_error(error: ArtifactStorageError) -> JSONResponse:
-    if error.code == "staging_oversize":
-        return _error(
-            413,
-            "staging_oversize",
-            "Upload exceeds maximum allowed size",
-        )
-    if error.code == "staging_disk_full":
-        return _error(507, "staging_disk_full", "Artifact storage is full")
-    return _error(
-        500,
-        "upload_staging_failed",
-        "Upload could not be stored",
+class _DisconnectAwareUpload:
+    """Stops feeding the staging writer as soon as the client goes away."""
+
+    def __init__(self, request: Request, upload: UploadFile) -> None:
+        self._request = request
+        self._upload = upload
+
+    async def read(self, size: int) -> bytes:
+        if await self._request.is_disconnected():
+            raise ClientDisconnect()
+        return await self._upload.read(size)
+
+
+def _is_ready(request: Request) -> bool:
+    state = request.app.state
+    if getattr(state, "readiness", None) is None:
+        return False
+    return (
+        state.readiness.is_accepting()
+        and state.telegram.is_connected
+        and state.scheduler.accepting
     )
 
 
-def _reservation_error(error: ArtifactStorageError) -> JSONResponse:
-    if error.code == "invalid_filename":
-        return _error(
-            422,
-            "invalid_filename",
-            "Artifact filename is invalid",
-        )
-    if error.code == "staging_oversize":
-        return _storage_error(error)
-    if error.code == "staging_disk_full":
-        return _storage_error(error)
-    return _error(
-        500,
-        "upload_reservation_failed",
-        "Upload could not be reserved",
-    )
+def _declared_size(request: Request) -> int:
+    declared = request.headers.get("content-length", "")
+    return int(declared) if declared.isdigit() else 0
 
 
-def _close_parser_files(parser: _BoundedMultiPartParser) -> None:
-    for temporary_file in parser._files_to_close_on_error:
-        try:
-            temporary_file.close()
-        except BaseException:
-            _safe_log("Multipart temporary file cleanup failed")
-
-
-async def _parse_upload(
-    request: Request, max_upload_bytes: int
-) -> tuple[FormData, UploadFile, str | None]:
-    parser = _BoundedMultiPartParser(
-        request.headers,
-        request.stream(),
-        max_files=1,
-        max_fields=1,
-        max_part_size=_MAX_FORM_FIELD_BYTES,
-        max_file_bytes=max_upload_bytes,
-    )
-    try:
-        form = await parser.parse()
-    except BaseException:
-        _close_parser_files(parser)
-        raise
-
-    files: list[tuple[str, UploadFile]] = []
-    captions: list[str] = []
-    valid = True
-    for name, value in form.multi_items():
-        if isinstance(value, UploadFile):
-            files.append((name, value))
-            valid = valid and name == "file"
-        elif name == "caption":
-            captions.append(value)
-        else:
-            valid = False
-    if len(files) != 1 or len(captions) > 1 or not valid:
-        await _close_form(form)
-        raise MultiPartException("Invalid upload form")
-    return form, files[0][1], captions[0] if captions else None
-
-
-async def _close_form(form: FormData | None) -> None:
-    if form is None:
-        return
-    try:
-        await form.close()
-    except Exception:
-        _safe_log("Multipart temporary file cleanup failed")
-
-
-def _scheduler_unavailable(error: SchedulerError) -> bool:
-    return error.code in {"scheduler_unavailable", "scheduler_stopped"}
-
-
-def create_jobs_app(
-    *,
-    scheduler: Scheduler,
-    tracker: Tracker,
-    storage: Storage,
-    readiness: Readiness,
-    telegram: TelegramConnectivity,
-    max_upload_bytes: int | Callable[[], int],
-) -> FastAPI:
-    if not callable(max_upload_bytes) and (
-        type(max_upload_bytes) is not int or max_upload_bytes < 0
-    ):
-        raise ValueError("max_upload_bytes must be a nonnegative int")
-
+def create_jobs_app() -> FastAPI:
     app = FastAPI()
 
-    def upload_limit() -> int:
-        value = max_upload_bytes() if callable(max_upload_bytes) else max_upload_bytes
-        if type(value) is not int or value < 0:
-            return 0
-        return value
-
-    def accepting() -> bool:
-        return (
-            _safe_bool(readiness, "is_accepting")
-            and _safe_bool(telegram, "is_connected")
-            and _scheduler_accepting(scheduler)
-        )
-
     @app.exception_handler(RequestValidationError)
-    async def invalid_request(
-        _request: object, _error_value: RequestValidationError
-    ) -> JSONResponse:
-        return _error(422, "invalid_request", "Request is invalid")
+    async def invalid_body(_request: object, _exception: object) -> JSONResponse:
+        return _invalid_request()
 
     @app.exception_handler(StarletteHTTPException)
     async def framework_http_error(
-        _request: object, error: StarletteHTTPException
+        _request: object, exception: StarletteHTTPException
     ) -> JSONResponse:
-        if error.status_code == 404:
-            return _error(
-                404,
-                "not_found",
-                "Resource not found",
-                headers=error.headers,
+        status_code = exception.status_code
+        if status_code == 404:
+            return _response(
+                404, "not_found", "Resource not found", headers=exception.headers
             )
-        if error.status_code == 405:
-            return _error(
+        if status_code == 405:
+            return _response(
                 405,
                 "method_not_allowed",
                 "Method not allowed",
-                headers=error.headers,
+                headers=exception.headers,
             )
-        if 400 <= error.status_code < 500:
-            return _error(
-                error.status_code,
+        if 400 <= status_code < 500:
+            return _response(
+                status_code,
                 "invalid_request",
                 "Request is invalid",
-                headers=error.headers,
+                headers=exception.headers,
             )
-        return _error(500, "internal_error", "Internal server error")
+        return _response(500, "internal_error", "Internal server error")
 
     @app.exception_handler(Exception)
-    async def internal_error(
-        _request: object, error: Exception
-    ) -> JSONResponse:
-        if isinstance(error, ClientDisconnect):
-            raise error
-        _safe_log("Unhandled API request failure")
-        return _error(500, "internal_error", "Internal server error")
+    async def internal_error(_request: object, exception: Exception) -> JSONResponse:
+        if isinstance(exception, ClientDisconnect):
+            raise exception
+        _LOGGER.exception("Unhandled API request failure")
+        return _response(500, "internal_error", "Internal server error")
 
     @app.post("/jobs/youtube", status_code=202)
-    async def submit_youtube(request: _YouTubeRequest) -> object:
+    async def submit_youtube(request: Request, body: _YouTubeRequest) -> object:
         try:
-            kind = classify_youtube_url(request.url)
+            kind = classify_youtube_url(body.url)
         except UnsupportedYouTubeUrl:
-            return _error(
-                422,
-                "unsupported_youtube_url",
-                "YouTube URL is unsupported",
+            return _response(
+                422, "unsupported_youtube_url", "YouTube URL is unsupported"
             )
-        if not accepting():
+        if not _is_ready(request):
             return _service_unavailable()
+        scheduler = request.app.state.scheduler
         try:
             if kind is YouTubeUrlKind.VIDEO:
-                job = scheduler.submit_video(request.url)
-                return _submission_body("job", job)
-            batch = scheduler.submit_playlist(request.url)
-            return _submission_body("batch", batch)
-        except SchedulerError as error:
-            if _scheduler_unavailable(error):
-                return _service_unavailable()
-            return _error(500, "submission_failed", "Submission failed")
-        except Exception:
-            return _error(500, "submission_failed", "Submission failed")
+                return _submission_body("job", scheduler.submit_video(body.url))
+            return _submission_body(
+                "batch", scheduler.submit_playlist(body.url, body.offset)
+            )
+        except SchedulerError:
+            return _service_unavailable()
 
     @app.post("/jobs/upload", status_code=202)
     async def submit_upload(request: Request) -> object:
-        if not accepting():
+        if not _is_ready(request):
             return _service_unavailable()
+        state = request.app.state
+        max_bytes = state.settings.max_artifact_bytes
+        if _declared_size(request) > max_bytes:
+            return _oversize()
+
         try:
-            form, file, caption = await _parse_upload(
-                request,
-                upload_limit(),
-            )
-        except _UploadTooLarge:
-            return _error(
-                413,
-                "staging_oversize",
-                "Upload exceeds maximum allowed size",
-            )
+            form = await request.form(max_files=1, max_fields=1)
         except OSError as error:
             if error.errno == errno.ENOSPC:
-                return _error(
-                    507,
-                    "staging_disk_full",
-                    "Artifact storage is full",
-                )
-            return _error(
-                500,
-                "upload_staging_failed",
-                "Upload could not be stored",
-            )
-        except (KeyError, MultiPartException, MultipartParseError):
-            return _error(422, "invalid_request", "Request is invalid")
-        except ClientDisconnect:
-            raise
-        if not file.filename:
-            await _close_form(form)
-            return _error(422, "invalid_request", "Request is invalid")
-        if not accepting():
-            await _close_form(form)
-            return _service_unavailable()
+                return _response(507, "staging_disk_full", "Artifact storage is full")
+            return _response(500, "upload_staging_failed", "Upload could not be stored")
+        except (MultiPartException, MultipartParseError):
+            return _invalid_request()
 
         try:
-            try:
-                reservation = scheduler.reserve_local_upload(
-                    file.filename,
-                    file.content_type,
-                    caption,
-                )
-            except SchedulerError as error:
-                if _scheduler_unavailable(error):
-                    return _service_unavailable()
-                return _error(
-                    500,
-                    "upload_reservation_failed",
-                    "Upload could not be reserved",
-                )
-            except ArtifactStorageError as error:
-                return _reservation_error(error)
-            except (TypeError, ValueError):
-                return _error(422, "invalid_request", "Request is invalid")
-            except Exception:
-                return _error(
-                    500,
-                    "upload_reservation_failed",
-                    "Upload could not be reserved",
-                )
+            file = form.get("file")
+            caption = form.get("caption")
+            if (
+                not isinstance(file, UploadFile)
+                or not file.filename
+                or not isinstance(caption, (str, type(None)))
+                or set(form.keys()) - _UPLOAD_FIELDS
+            ):
+                return _invalid_request()
 
             try:
-                staged = await storage.stage(
-                    _DisconnectAwareUpload(request, file),
-                    reservation,
-                    upload_limit(),
+                reservation = state.scheduler.reserve_local_upload(
+                    file.filename, file.content_type, caption
                 )
-                await asyncio.sleep(0)
-                if await request.is_disconnected():
-                    raise ClientDisconnect()
-                if not accepting():
-                    _cancel_reservation(scheduler, reservation.job_id)
-                    return _service_unavailable()
-                job = scheduler.enqueue_reserved_upload(
-                    reservation, staged.size_bytes
+            except SchedulerError:
+                return _service_unavailable()
+            except ArtifactStorageError as error:
+                return _storage_error(error)
+
+            try:
+                staged = await state.storage.stage(
+                    _DisconnectAwareUpload(request, file), reservation, max_bytes
+                )
+                return _submission_body(
+                    "job",
+                    state.scheduler.enqueue_reserved_upload(
+                        reservation, staged.size_bytes
+                    ),
                 )
             except ArtifactStorageError as error:
-                _cancel_reservation(scheduler, reservation.job_id)
                 return _storage_error(error)
-            except SchedulerError as error:
-                if _scheduler_unavailable(error):
-                    if not error.committed:
-                        _cancel_reservation(scheduler, reservation.job_id)
-                    return _service_unavailable()
-                _cancel_reservation(scheduler, reservation.job_id)
-                return _error(
-                    500,
-                    "upload_enqueue_failed",
-                    "Upload could not be queued",
-                )
-            except ClientDisconnect:
-                _cancel_reservation(scheduler, reservation.job_id)
-                raise
-            except Exception:
-                if _scheduler_accepting(scheduler):
-                    _cancel_reservation(scheduler, reservation.job_id)
-                return _error(
-                    500,
-                    "upload_staging_failed",
-                    "Upload could not be stored",
-                )
+            except SchedulerError:
+                state.scheduler.cancel_reserved_upload(reservation.job_id)
+                return _service_unavailable()
             except BaseException:
-                _cancel_reservation(scheduler, reservation.job_id)
+                state.scheduler.cancel_reserved_upload(reservation.job_id)
                 raise
-            return _submission_body("job", job)
         finally:
-            await _close_form(form)
+            await form.close()
 
     @app.get("/jobs/{job_id}")
-    async def get_job(job_id: str) -> object:
-        try:
-            identifier = UUID(job_id)
-        except (TypeError, ValueError):
-            return _error(404, "job_not_found", "Job not found")
-        snapshot = tracker.get_job(identifier)
+    async def get_job(request: Request, job_id: str) -> object:
+        identifier = _identifier(job_id)
+        snapshot = (
+            None
+            if identifier is None
+            else request.app.state.tracker.get_job(identifier)
+        )
         if snapshot is None:
-            return _error(404, "job_not_found", "Job not found")
+            return _response(404, "job_not_found", "Job not found")
         return _job_body(snapshot)
 
     @app.get("/batches/{batch_id}")
-    async def get_batch(batch_id: str) -> object:
-        try:
-            identifier = UUID(batch_id)
-        except (TypeError, ValueError):
-            return _error(404, "batch_not_found", "Batch not found")
-        snapshot = tracker.get_batch(identifier)
+    async def get_batch(request: Request, batch_id: str) -> object:
+        identifier = _identifier(batch_id)
+        snapshot = (
+            None
+            if identifier is None
+            else request.app.state.tracker.get_batch(identifier)
+        )
         if snapshot is None:
-            return _error(404, "batch_not_found", "Batch not found")
+            return _response(404, "batch_not_found", "Batch not found")
         return _batch_body(snapshot)
 
     @app.get("/health")
-    async def health() -> JSONResponse:
-        telegram_connected = _safe_bool(telegram, "is_connected")
-        ready = (
-            _safe_bool(readiness, "is_accepting")
-            and telegram_connected
-            and _scheduler_accepting(scheduler)
-        )
+    async def health(request: Request) -> JSONResponse:
+        telegram = getattr(request.app.state, "telegram", None)
+        connected = telegram is not None and telegram.is_connected
+        ready = _is_ready(request)
         return JSONResponse(
             status_code=200 if ready else 503,
-            content={
-                "ready": ready,
-                "telegram_connected": telegram_connected,
-            },
+            content={"ready": ready, "telegram_connected": connected},
         )
 
     return app

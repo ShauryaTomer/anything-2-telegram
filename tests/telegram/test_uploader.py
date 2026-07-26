@@ -1,399 +1,430 @@
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
-from uuid import UUID
+from uuid import uuid4
 
 import pytest
 from pyee.asyncio import AsyncIOEventEmitter
 
 from anything2telegram.artifacts.storage import ArtifactStorage
-from anything2telegram.domain import TelegramUploadResult
+from anything2telegram.config import Settings
 from anything2telegram.events import (
-    ARTIFACT_READY,
     ARTIFACT_UPLOAD_FAILED,
     ARTIFACT_UPLOADED,
+    ERROR,
     TELEGRAM_UNAVAILABLE,
     ArtifactReady,
+    DownloadTarget,
+    PlaylistExpanded,
 )
-from anything2telegram.telegram.client import TelegramUnavailableError
+from anything2telegram.telegram.client import (
+    TelegramClientError,
+    TelegramUnavailableError,
+    TelegramUploadError,
+)
 from anything2telegram.telegram.uploader import TelegramArtifactUploader
+from tests.conftest import FakeTelegram, settings_for
 
 
-NOW = datetime(2026, 7, 19, 10, 0, tzinfo=UTC)
-JOB = UUID("10000000-0000-0000-0000-000000000001")
-ARTIFACT = UUID("30000000-0000-0000-0000-000000000001")
+class Recorder:
+    def __init__(self, bus: AsyncIOEventEmitter) -> None:
+        self.uploaded: list[object] = []
+        self.failed: list[object] = []
+        self.unavailable: list[object] = []
+        self.errors: list[object] = []
+        bus.on(ARTIFACT_UPLOADED, self.uploaded.append)
+        bus.on(ARTIFACT_UPLOAD_FAILED, self.failed.append)
+        bus.on(TELEGRAM_UNAVAILABLE, self.unavailable.append)
+        bus.on(ERROR, self.errors.append)
+
+    def failure_codes(self) -> list[str]:
+        return [event.error.code for event in self.failed]
 
 
-class FakeClient:
-    def __init__(self) -> None:
-        self.is_connected = False
-        self.uploads: list[dict[str, object]] = []
-        self.upload_error: BaseException | None = None
-        self.block_upload = False
-        self.disconnected = asyncio.Event()
-        self.release_upload = asyncio.Event()
-        self.upload_started = asyncio.Event()
-        self.disconnect_calls = 0
-        self.connect_calls = 0
-        self.actions: list[str] = []
-        self.connect_error: BaseException | None = None
-        self.disconnect_error: BaseException | None = None
-
-    async def connect(self) -> None:
-        self.connect_calls += 1
-        self.is_connected = True
-        if self.connect_error is not None:
-            raise self.connect_error
-
-    async def disconnect(self) -> None:
-        self.disconnect_calls += 1
-        self.actions.append("disconnect")
-        self.is_connected = False
-        self.disconnected.set()
-        if self.disconnect_error is not None:
-            raise self.disconnect_error
-
-    async def wait_until_disconnected(self) -> None:
-        await self.disconnected.wait()
-
-    async def upload(self, path: Path, **kwargs: object) -> TelegramUploadResult:
-        self.uploads.append({"path": path, **kwargs})
-        self.upload_started.set()
-        callback = kwargs["progress_callback"]
-        assert callable(callback)
-        callback(1, 10)
-        callback(10, 10)
-        if self.block_upload:
-            try:
-                await self.release_upload.wait()
-            except asyncio.CancelledError:
-                self.actions.append("upload_cancelled")
-                raise
-        if self.upload_error is not None:
-            raise self.upload_error
-        return TelegramUploadResult(-100123, 91)
+@pytest.fixture
+def bus() -> AsyncIOEventEmitter:
+    return AsyncIOEventEmitter()
 
 
-def settings(*, max_bytes: int = 100, timeout: float = 1) -> object:
-    return SimpleNamespace(
-        max_artifact_bytes=max_bytes,
-        tg_upload_timeout_seconds=timeout,
-    )
+@pytest.fixture
+def recorder(bus: AsyncIOEventEmitter) -> Recorder:
+    return Recorder(bus)
 
 
-def staged_event(
+@pytest.fixture
+def storage(tmp_path: Path) -> ArtifactStorage:
+    return ArtifactStorage(tmp_path / "artifacts")
+
+
+@pytest.fixture
+def telegram() -> FakeTelegram:
+    return FakeTelegram()
+
+
+@pytest.fixture
+async def uploader(
+    bus: AsyncIOEventEmitter,
     storage: ArtifactStorage,
-    *,
-    artifact_id: UUID = ARTIFACT,
-    content: bytes = b"video",
-    media_type: str | None = "video/mp4",
-    caption: str | None = "hello",
+    telegram: FakeTelegram,
+    settings: Settings,
+):
+    instance = TelegramArtifactUploader(bus, storage, telegram, settings)
+    await instance.start()
+    yield instance
+    await instance.stop()
+
+
+def ready_artifact(
+    storage: ArtifactStorage, *, payload: bytes = b"payload", caption: str | None = "hi"
 ) -> ArtifactReady:
-    directory = storage.allocate_download_directory(JOB, artifact_id)
+    job_id, artifact_id = uuid4(), uuid4()
+    directory = storage.allocate_download_directory(job_id, artifact_id)
     path = directory / "clip.mp4"
-    path.write_bytes(content)
+    path.write_bytes(payload)
     return ArtifactReady(
-        JOB,
+        job_id,
         artifact_id,
         path,
-        path.name,
-        media_type,
-        len(content),
+        "clip.mp4",
+        "video/mp4",
+        len(payload),
         caption,
-        NOW,
+        datetime.now(UTC),
     )
 
 
-def capture(bus: AsyncIOEventEmitter) -> list[tuple[str, object]]:
-    facts: list[tuple[str, object]] = []
-    for topic in (ARTIFACT_UPLOADED, ARTIFACT_UPLOAD_FAILED, TELEGRAM_UNAVAILABLE):
-        bus.on(topic, lambda event, topic=topic: facts.append((topic, event)))
-    return facts
+async def settle(bus: AsyncIOEventEmitter) -> None:
+    while not bus.complete:
+        await asyncio.wait_for(bus.wait_for_complete(), timeout=2)
 
 
-async def settle_until(predicate: object) -> None:
-    for _ in range(20):
-        if predicate():
-            return
-        await asyncio.sleep(0)
-    assert predicate()
-
-
-async def test_upload_success_preserves_caption_video_flag_and_result(
-    tmp_path: Path,
+async def test_an_expanded_playlist_posts_its_name_as_a_header(
+    uploader, bus, telegram, recorder
 ) -> None:
-    bus = AsyncIOEventEmitter()
-    storage = ArtifactStorage(tmp_path / "artifacts")
-    client = FakeClient()
-    facts = capture(bus)
-    uploader = TelegramArtifactUploader(
-        bus, storage, client, settings(), clock=lambda: NOW
+    targets = (DownloadTarget("a" * 11, "https://youtu.be/aaaaaaaaaaa"),)
+
+    bus.emit(
+        "youtube.playlist.expanded",
+        PlaylistExpanded(uuid4(), targets, 0, datetime.now(UTC), "Rust Fundamentals"),
     )
-    event = staged_event(storage)
+    bus.emit(
+        "youtube.playlist.expanded",
+        PlaylistExpanded(uuid4(), targets, 0, datetime.now(UTC), None),
+    )
+    await settle(bus)
 
-    await uploader.handle_artifact_ready(event)
-
-    assert len(client.uploads) == 1
-    assert client.uploads[0]["path"] == event.local_path
-    assert client.uploads[0]["caption"] == "hello"
-    assert client.uploads[0]["supports_streaming"] is True
-    assert len(facts) == 1
-    topic, uploaded = facts[0]
-    assert topic == ARTIFACT_UPLOADED
-    assert uploaded.job_id == JOB
-    assert uploaded.artifact_id == ARTIFACT
-    assert uploaded.telegram_chat_id == -100123
-    assert uploaded.telegram_message_id == 91
+    assert telegram.messages == ["Rust Fundamentals - 1 video(s)"]
+    assert recorder.errors == []
 
 
-@pytest.mark.parametrize(
-    ("case", "expected_code"),
-    [
-        ("missing", "artifact_missing"),
-        ("outside", "artifact_outside"),
-        ("oversize", "artifact_oversize"),
-    ],
-)
-async def test_invalid_artifacts_fail_before_client_call(
-    tmp_path: Path, case: str, expected_code: str
+async def test_a_failed_header_does_not_fail_the_batch(
+    uploader, bus, telegram, storage, recorder, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    bus = AsyncIOEventEmitter()
-    storage = ArtifactStorage(tmp_path / "artifacts")
-    client = FakeClient()
-    facts = capture(bus)
-    uploader = TelegramArtifactUploader(
-        bus, storage, client, settings(max_bytes=4), clock=lambda: NOW
+    async def boom(_text: str) -> None:
+        raise TelegramUploadError()
+
+    monkeypatch.setattr(telegram, "send_message", boom)
+
+    bus.emit(
+        "youtube.playlist.expanded",
+        PlaylistExpanded(uuid4(), (), 0, datetime.now(UTC), "Rust Fundamentals"),
     )
-    if case == "missing":
-        event = ArtifactReady(
-            JOB,
-            ARTIFACT,
-            storage.root / str(JOB) / str(ARTIFACT) / "clip.mp4",
-            "clip.mp4",
-            "video/mp4",
-            5,
-            None,
-            NOW,
-        )
-    elif case == "outside":
-        path = tmp_path / "outside.mp4"
-        path.write_bytes(b"data")
-        event = ArtifactReady(
-            JOB, ARTIFACT, path, path.name, "video/mp4", 4, None, NOW
-        )
-    else:
-        event = staged_event(storage, content=b"large")
+    bus.emit("artifact.ready", ready_artifact(storage))
+    await settle(bus)
 
-    await uploader.handle_artifact_ready(event)
-
-    assert client.uploads == []
-    assert [topic for topic, _ in facts] == [ARTIFACT_UPLOAD_FAILED]
-    assert facts[0][1].error.code == expected_code
+    assert recorder.errors == []
+    assert recorder.failure_codes() == []
+    assert len(recorder.uploaded) == 1
 
 
-@pytest.mark.parametrize(
-    ("error", "block_upload", "expected_code"),
-    [
-        (None, True, "telegram_timeout"),
-        (RuntimeError("private data"), False, "internal_error"),
-    ],
-)
-async def test_upload_errors_map_to_one_safe_failure(
-    tmp_path: Path,
-    error: BaseException | None,
-    block_upload: bool,
-    expected_code: str,
+async def test_a_ready_artifact_is_uploaded_and_reported(
+    uploader, bus, storage, telegram, recorder
 ) -> None:
-    bus = AsyncIOEventEmitter()
-    storage = ArtifactStorage(tmp_path / "artifacts")
-    client = FakeClient()
-    client.upload_error = error
-    client.block_upload = block_upload
-    facts = capture(bus)
-    uploader = TelegramArtifactUploader(
-        bus,
-        storage,
-        client,
-        settings(timeout=0.01),
-        clock=lambda: NOW,
-    )
+    event = ready_artifact(storage)
 
-    await uploader.handle_artifact_ready(staged_event(storage))
+    bus.emit("artifact.ready", event)
+    await settle(bus)
 
-    assert [topic for topic, _ in facts] == [ARTIFACT_UPLOAD_FAILED]
-    assert facts[0][1].error.code == expected_code
-    assert "private" not in facts[0][1].error.message
+    assert telegram.uploaded_filenames == ["clip.mp4"]
+    assert telegram.captions == ["hi"]
+    assert recorder.failure_codes() == []
+    assert len(recorder.uploaded) == 1
+    uploaded = recorder.uploaded[0]
+    assert (uploaded.job_id, uploaded.artifact_id) == (event.job_id, event.artifact_id)
+    assert (uploaded.telegram_chat_id, uploaded.telegram_message_id) == (-1001, 1)
 
 
-async def test_connection_failure_orders_failure_then_one_unavailable(
-    tmp_path: Path,
+async def test_the_same_artifact_is_never_uploaded_twice(
+    uploader, bus, storage, telegram, recorder
 ) -> None:
-    bus = AsyncIOEventEmitter()
-    storage = ArtifactStorage(tmp_path / "artifacts")
-    client = FakeClient()
-    client.upload_error = TelegramUnavailableError()
-    facts = capture(bus)
-    uploader = TelegramArtifactUploader(
-        bus, storage, client, settings(), clock=lambda: NOW
-    )
-    first = staged_event(storage)
-    second = staged_event(
-        storage,
-        artifact_id=UUID("30000000-0000-0000-0000-000000000002"),
-    )
+    event = ready_artifact(storage)
 
-    await uploader.handle_artifact_ready(first)
-    await uploader.handle_artifact_ready(second)
+    bus.emit("artifact.ready", event)
+    await settle(bus)
+    bus.emit("artifact.ready", event)
+    await settle(bus)
 
-    assert [topic for topic, _ in facts] == [
-        ARTIFACT_UPLOAD_FAILED,
-        TELEGRAM_UNAVAILABLE,
-        ARTIFACT_UPLOAD_FAILED,
-    ]
-    assert facts[0][1].error.code == "telegram_unavailable"
+    assert telegram.uploaded_filenames == ["clip.mp4"]
+    assert len(recorder.uploaded) == 1
 
 
-async def test_idle_disconnect_emits_once_but_shutdown_disconnect_is_suppressed(
-    tmp_path: Path,
+async def test_distinct_artifacts_each_get_their_own_outcome(
+    uploader, bus, storage, telegram, recorder
 ) -> None:
-    bus = AsyncIOEventEmitter()
-    storage = ArtifactStorage(tmp_path / "artifacts")
-    client = FakeClient()
-    facts = capture(bus)
-    uploader = TelegramArtifactUploader(bus, storage, client, settings())
+    first = ready_artifact(storage)
+    second = ready_artifact(storage)
 
+    bus.emit("artifact.ready", first)
+    bus.emit("artifact.ready", second)
+    await settle(bus)
+
+    assert len(telegram.uploaded_filenames) == 2
+    assert {event.job_id for event in recorder.uploaded} == {
+        first.job_id,
+        second.job_id,
+    }
+
+
+async def test_a_missing_artifact_fails_before_contacting_telegram(
+    uploader, bus, storage, telegram, recorder
+) -> None:
+    event = ready_artifact(storage)
+    event.local_path.unlink()
+
+    bus.emit("artifact.ready", event)
+    await settle(bus)
+
+    assert recorder.failure_codes() == ["artifact_missing"]
+    assert telegram.uploaded_filenames == []
+
+
+async def test_an_artifact_that_changed_size_is_rejected_as_drift(
+    uploader, bus, storage, telegram, recorder
+) -> None:
+    event = ready_artifact(storage)
+    event.local_path.write_bytes(b"a different payload entirely")
+
+    bus.emit("artifact.ready", event)
+    await settle(bus)
+
+    assert recorder.failure_codes() == ["artifact_drift"]
+    assert telegram.uploaded_filenames == []
+
+
+async def test_an_artifact_outside_managed_storage_is_rejected(
+    uploader, bus, storage, telegram, recorder, tmp_path
+) -> None:
+    outside = tmp_path / "elsewhere.mp4"
+    outside.write_bytes(b"payload")
+    event = ArtifactReady(
+        uuid4(),
+        uuid4(),
+        outside,
+        "elsewhere.mp4",
+        "video/mp4",
+        7,
+        None,
+        datetime.now(UTC),
+    )
+
+    bus.emit("artifact.ready", event)
+    await settle(bus)
+
+    assert recorder.failure_codes() == ["artifact_outside"]
+    assert telegram.uploaded_filenames == []
+
+
+async def test_an_artifact_over_the_configured_limit_is_rejected(
+    bus, storage, telegram, recorder, tmp_path
+) -> None:
+    small = settings_for(tmp_path, max_artifact_bytes=4)
+    uploader = TelegramArtifactUploader(bus, storage, telegram, small)
     await uploader.start()
-    client.disconnected.set()
+    try:
+        bus.emit("artifact.ready", ready_artifact(storage, payload=b"much too long"))
+        await settle(bus)
+    finally:
+        await uploader.stop()
+
+    assert recorder.failure_codes() == ["artifact_oversize"]
+    assert telegram.uploaded_filenames == []
+
+
+@pytest.mark.parametrize(
+    "error,code",
+    [
+        (TelegramUploadError(), "telegram_upload_failed"),
+        (RuntimeError("boom"), "internal_error"),
+    ],
+)
+async def test_upload_failures_map_to_stable_codes(
+    uploader, bus, storage, telegram, recorder, error: BaseException, code: str
+) -> None:
+    telegram.upload_errors = [error]
+
+    bus.emit("artifact.ready", ready_artifact(storage))
+    await settle(bus)
+
+    assert recorder.failure_codes() == [code]
+    assert recorder.uploaded == []
+
+
+async def test_a_timeout_fails_the_job_without_stopping_the_uploader(
+    bus, storage, recorder, tmp_path
+) -> None:
+    telegram = FakeTelegram(manual_release=True)
+    impatient = settings_for(tmp_path, tg_upload_timeout_seconds=0.01)
+    uploader = TelegramArtifactUploader(bus, storage, telegram, impatient)
+    await uploader.start()
+    try:
+        bus.emit("artifact.ready", ready_artifact(storage))
+        await settle(bus)
+    finally:
+        telegram.releases[0].set()
+        await uploader.stop()
+
+    assert recorder.failure_codes() == ["telegram_timeout"]
+
+
+async def test_losing_telegram_fails_the_job_and_announces_unavailability(
+    uploader, bus, storage, telegram, recorder
+) -> None:
+    telegram.upload_errors = [TelegramUnavailableError()]
+
+    bus.emit("artifact.ready", ready_artifact(storage))
+    await settle(bus)
+
+    assert recorder.failure_codes() == ["telegram_unavailable"]
+    assert len(recorder.unavailable) == 1
+
+
+async def test_unavailability_is_announced_only_once(
+    uploader, bus, storage, telegram, recorder
+) -> None:
+    telegram.upload_errors = [TelegramUnavailableError(), TelegramUnavailableError()]
+
+    bus.emit("artifact.ready", ready_artifact(storage))
+    await settle(bus)
+    bus.emit("artifact.ready", ready_artifact(storage))
+    await settle(bus)
+
+    assert len(recorder.unavailable) == 1
+
+
+async def test_the_pause_signal_waits_for_the_in_flight_upload_to_settle(
+    bus, storage, settings, recorder
+) -> None:
+    telegram = FakeTelegram(manual_release=True)
+    uploader = TelegramArtifactUploader(bus, storage, telegram, settings)
+    await uploader.start()
+    try:
+        bus.emit("artifact.ready", ready_artifact(storage))
+        await asyncio.wait_for(telegram.started[0].wait(), timeout=1)
+
+        # The connection drops while the upload is still running.
+        telegram.drop()
+        await asyncio.sleep(0)
+        assert recorder.unavailable == []
+
+        telegram.releases[0].set()
+        await settle(bus)
+    finally:
+        await uploader.stop()
+
+    assert len(recorder.uploaded) == 1
+    assert len(recorder.unavailable) == 1
+
+
+async def test_a_disconnect_while_idle_announces_unavailability(
+    uploader, bus, telegram, recorder
+) -> None:
+    telegram.drop()
     await asyncio.sleep(0)
     await asyncio.sleep(0)
-    assert [topic for topic, _ in facts] == [TELEGRAM_UNAVAILABLE]
+
+    assert len(recorder.unavailable) == 1
+
+
+async def test_a_monitor_crash_is_published_on_the_error_topic(
+    bus, storage, settings, recorder
+) -> None:
+    class BrokenMonitor(FakeTelegram):
+        async def wait_until_disconnected(self) -> None:
+            raise RuntimeError("monitor exploded")
+
+    uploader = TelegramArtifactUploader(bus, storage, BrokenMonitor(), settings)
+    await uploader.start()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
     await uploader.stop()
 
-    shutdown_bus = AsyncIOEventEmitter()
-    shutdown_client = FakeClient()
-    shutdown_facts = capture(shutdown_bus)
-    shutdown = TelegramArtifactUploader(
-        shutdown_bus, storage, shutdown_client, settings()
-    )
-    await shutdown.start()
-    await shutdown.stop()
-    await asyncio.sleep(0)
-    assert shutdown_facts == []
+    assert [type(error) for error in recorder.errors] == [RuntimeError]
 
 
-async def test_duplicate_artifact_event_uploads_once(tmp_path: Path) -> None:
-    bus = AsyncIOEventEmitter()
-    storage = ArtifactStorage(tmp_path / "artifacts")
-    client = FakeClient()
-    uploader = TelegramArtifactUploader(bus, storage, client, settings())
-    event = staged_event(storage)
-
-    await asyncio.gather(
-        uploader.handle_artifact_ready(event),
-        uploader.handle_artifact_ready(event),
-    )
-
-    for value in range(1, 1025):
-        await uploader.handle_artifact_ready(
-            staged_event(storage, artifact_id=UUID(int=value))
-        )
-    await uploader.handle_artifact_ready(event)
-
-    assert len(client.uploads) == 1025
-
-
-async def test_started_monitor_defers_unavailable_until_active_failure(
-    tmp_path: Path,
+async def test_a_client_monitor_failure_is_not_an_application_error(
+    bus, storage, settings, recorder
 ) -> None:
-    bus = AsyncIOEventEmitter()
-    storage = ArtifactStorage(tmp_path / "artifacts")
-    client = FakeClient()
-    client.block_upload = True
-    client.upload_error = TelegramUnavailableError()
-    facts = capture(bus)
-    uploader = TelegramArtifactUploader(bus, storage, client, settings())
+    class DroppingMonitor(FakeTelegram):
+        async def wait_until_disconnected(self) -> None:
+            raise TelegramClientError("monitor lost")
 
+    uploader = TelegramArtifactUploader(bus, storage, DroppingMonitor(), settings)
     await uploader.start()
-    bus.emit(ARTIFACT_READY, staged_event(storage))
-    await client.upload_started.wait()
-    client.disconnected.set()
     await asyncio.sleep(0)
     await asyncio.sleep(0)
-    try:
-        assert facts == []
-        client.release_upload.set()
-        await settle_until(lambda: len(facts) == 2)
-        assert [topic for topic, _ in facts] == [
-            ARTIFACT_UPLOAD_FAILED,
-            TELEGRAM_UNAVAILABLE,
-        ]
-    finally:
-        client.release_upload.set()
-        await uploader.stop()
+    await uploader.stop()
+
+    assert recorder.errors == []
+    assert len(recorder.unavailable) == 1
 
 
-async def test_stop_cancels_inflight_then_disconnects_and_ignores_late_events(
-    tmp_path: Path,
+async def test_a_failed_connect_rolls_back_and_propagates(
+    bus, storage, settings
 ) -> None:
-    bus = AsyncIOEventEmitter()
-    storage = ArtifactStorage(tmp_path / "artifacts")
-    client = FakeClient()
-    client.block_upload = True
-    facts = capture(bus)
-    uploader = TelegramArtifactUploader(bus, storage, client, settings())
-    first = staged_event(storage)
-    late = staged_event(
-        storage,
-        artifact_id=UUID("30000000-0000-0000-0000-000000000002"),
-    )
+    telegram = FakeTelegram()
+    telegram.connect_error = TelegramUnavailableError()
+    uploader = TelegramArtifactUploader(bus, storage, telegram, settings)
 
-    await uploader.start()
-    await uploader.start()
-    bus.emit(ARTIFACT_READY, first)
-    await client.upload_started.wait()
-    try:
-        await uploader.stop()
-        bus.emit(ARTIFACT_READY, late)
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-
-        assert client.connect_calls == 1
-        assert client.actions == ["upload_cancelled", "disconnect"]
-        assert len(client.uploads) == 1
-        assert facts == []
-    finally:
-        client.release_upload.set()
-
-
-async def test_partial_start_failure_rolls_back_and_remains_restartable(
-    tmp_path: Path,
-) -> None:
-    bus = AsyncIOEventEmitter()
-    storage = ArtifactStorage(tmp_path / "artifacts")
-    client = FakeClient()
-    primary = TelegramUnavailableError()
-    client.connect_error = primary
-    client.disconnect_error = RuntimeError("cleanup failed")
-    facts = capture(bus)
-    uploader = TelegramArtifactUploader(bus, storage, client, settings())
-
-    with pytest.raises(TelegramUnavailableError) as raised:
+    with pytest.raises(TelegramUnavailableError):
         await uploader.start()
+    assert telegram.disconnected.is_set()
 
-    assert raised.value is primary
-    assert client.disconnect_calls == 1
-    assert not client.is_connected
-    assert facts == []
-    bus.emit(ARTIFACT_READY, staged_event(storage))
-    await asyncio.sleep(0)
-    assert client.uploads == []
-    await uploader.stop()
-    assert client.disconnect_calls == 1
 
-    client.connect_error = None
-    client.disconnect_error = None
+async def test_begin_shutdown_refuses_new_artifacts_but_keeps_the_connection(
+    uploader, bus, storage, telegram, recorder
+) -> None:
+    uploader.begin_shutdown()
+
+    bus.emit("artifact.ready", ready_artifact(storage))
+    await settle(bus)
+
+    assert telegram.uploaded_filenames == []
+    assert recorder.uploaded == []
+    assert recorder.failed == []
+    assert telegram.connected is True
+
+
+async def test_stop_can_leave_the_connection_open_for_a_later_disconnect(
+    bus, storage, telegram, settings
+) -> None:
+    uploader = TelegramArtifactUploader(bus, storage, telegram, settings)
     await uploader.start()
-    assert client.connect_calls == 2
+
+    await uploader.stop(disconnect=False)
+
+    assert telegram.connected is True
+
+
+async def test_stop_cancels_an_upload_that_is_still_running(
+    bus, storage, settings, recorder
+) -> None:
+    telegram = FakeTelegram(manual_release=True)
+    uploader = TelegramArtifactUploader(bus, storage, telegram, settings)
+    await uploader.start()
+    bus.emit("artifact.ready", ready_artifact(storage))
+    await asyncio.wait_for(telegram.started[0].wait(), timeout=1)
+
     await uploader.stop()
-    assert client.disconnect_calls == 2
+
+    assert recorder.uploaded == []
+    assert telegram.connected is False

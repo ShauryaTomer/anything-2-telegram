@@ -5,6 +5,7 @@ import signal
 import pytest
 
 from anything2telegram.domain import ProcessResult as DomainProcessResult
+from anything2telegram.downloaders import process as process_module
 from anything2telegram.downloaders.process import (
     ProcessResult,
     ProcessTimeoutError,
@@ -54,9 +55,8 @@ async def test_runner_uses_argument_vector_new_session_and_bounds_output(monkeyp
         return process
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
-    result = await YouTubeProcessRunner(max_output_bytes=4).run(
-        ["yt-dlp", "--version"], 1
-    )
+    monkeypatch.setattr(process_module, "_MAX_OUTPUT_BYTES", 4)
+    result = await YouTubeProcessRunner().run(["yt-dlp", "--version"], 1)
 
     assert spawned[0][0] == ("yt-dlp", "--version")
     assert spawned[0][1]["start_new_session"] is True
@@ -80,8 +80,10 @@ async def test_timeout_terminates_group_then_kills_and_reaps(monkeypatch) -> Non
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
     monkeypatch.setattr(os, "killpg", killpg)
 
+    monkeypatch.setattr(process_module, "_SHUTDOWN_GRACE_SECONDS", 0)
+
     with pytest.raises(ProcessTimeoutError):
-        await YouTubeProcessRunner(shutdown_grace_seconds=0).run(["yt-dlp"], 0.001)
+        await YouTubeProcessRunner().run(["yt-dlp"], 0.001)
 
     assert [call for call in calls if call[1] != 0] == [
         (4321, signal.SIGTERM),
@@ -165,14 +167,10 @@ async def test_timeout_kills_group_when_leader_exits_but_descendant_holds_pipes(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
     monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(process_module, "_SHUTDOWN_GRACE_SECONDS", 0.001)
 
     with pytest.raises(ProcessTimeoutError):
-        await asyncio.wait_for(
-            YouTubeProcessRunner(shutdown_grace_seconds=0.001).run(
-                ["yt-dlp"], 0.001
-            ),
-            0.1,
-        )
+        await asyncio.wait_for(YouTubeProcessRunner().run(["yt-dlp"], 0.001), 0.1)
     assert calls[0] == signal.SIGTERM
     assert 0 in calls
     assert calls[-1] == signal.SIGKILL

@@ -7,37 +7,20 @@ from collections.abc import Sequence
 from ..domain import ProcessResult
 
 
+_MAX_OUTPUT_BYTES = 1024 * 1024
+_SHUTDOWN_GRACE_SECONDS = 1.0
+
+
 class ProcessTimeoutError(TimeoutError):
     """The child exceeded its execution deadline."""
 
 
 class YouTubeProcessRunner:
-    def __init__(
-        self,
-        *,
-        max_output_bytes: int = 1024 * 1024,
-        shutdown_grace_seconds: float = 1,
-    ) -> None:
-        if type(max_output_bytes) is not int or max_output_bytes < 0:
-            raise ValueError("max_output_bytes must be a nonnegative int")
-        if (
-            type(shutdown_grace_seconds) not in (int, float)
-            or shutdown_grace_seconds < 0
-        ):
-            raise ValueError("shutdown_grace_seconds must be nonnegative")
-        self._max_output_bytes = max_output_bytes
-        self._shutdown_grace_seconds = shutdown_grace_seconds
+    """Runs yt-dlp in its own process group so a timeout can kill the tree."""
 
     async def run(
-        self, args: Sequence[str], timeout_seconds: float | int
+        self, args: Sequence[str], timeout_seconds: float
     ) -> ProcessResult:
-        if not isinstance(args, (list, tuple)) or not args:
-            raise ValueError("args must be a nonempty argument vector")
-        if not all(isinstance(arg, str) and arg for arg in args):
-            raise ValueError("args must contain nonempty strings")
-        if type(timeout_seconds) not in (int, float) or timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
-
         process = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
@@ -77,7 +60,7 @@ class YouTubeProcessRunner:
                     task.cancel()
             done, _ = await asyncio.wait(
                 (stdout_task, stderr_task),
-                timeout=max(self._shutdown_grace_seconds, 0.1),
+                timeout=max(_SHUTDOWN_GRACE_SECONDS, 0.1),
             )
             for task in done:
                 try:
@@ -85,8 +68,9 @@ class YouTubeProcessRunner:
                 except asyncio.CancelledError:
                     pass
 
+    @staticmethod
     async def _read_bounded(
-        self, stream: asyncio.StreamReader | None
+        stream: asyncio.StreamReader | None
     ) -> tuple[bytes, int]:
         if stream is None:
             return b"", 0
@@ -97,29 +81,31 @@ class YouTubeProcessRunner:
             if not chunk:
                 return bytes(stored), total
             total += len(chunk)
-            remaining = self._max_output_bytes - len(stored)
+            remaining = _MAX_OUTPUT_BYTES - len(stored)
             if remaining > 0:
                 stored.extend(chunk[:remaining])
 
+    @classmethod
     async def _cleanup_after_interrupt(
-        self, process_group_id: int, wait_task: asyncio.Task
+        cls, process_group_id: int, wait_task: asyncio.Task
     ) -> None:
         cleanup = asyncio.create_task(
-            self._terminate(process_group_id, wait_task)
+            cls._terminate(process_group_id, wait_task)
         )
         try:
             await asyncio.shield(cleanup)
         except asyncio.CancelledError:
             await cleanup
 
+    @classmethod
     async def _terminate(
-        self, process_group_id: int, wait_task: asyncio.Task
+        cls, process_group_id: int, wait_task: asyncio.Task
     ) -> None:
-        if not self._signal_group(process_group_id, signal.SIGTERM):
+        if not cls._signal_group(process_group_id, signal.SIGTERM):
             await asyncio.shield(wait_task)
             return
-        if await self._group_survives_grace(process_group_id):
-            self._signal_group(process_group_id, signal.SIGKILL)
+        if await cls._group_survives_grace(process_group_id):
+            cls._signal_group(process_group_id, signal.SIGKILL)
         await asyncio.shield(wait_task)
 
     @staticmethod
@@ -135,11 +121,12 @@ class YouTubeProcessRunner:
                 return False
             raise
 
-    async def _group_survives_grace(self, process_group_id: int) -> bool:
+    @classmethod
+    async def _group_survives_grace(cls, process_group_id: int) -> bool:
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._shutdown_grace_seconds
+        deadline = loop.time() + _SHUTDOWN_GRACE_SECONDS
         while True:
-            if not self._group_exists(process_group_id):
+            if not cls._group_exists(process_group_id):
                 return False
             remaining = deadline - loop.time()
             if remaining <= 0:

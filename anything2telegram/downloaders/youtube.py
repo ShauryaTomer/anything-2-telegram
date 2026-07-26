@@ -3,16 +3,15 @@ import json
 import mimetypes
 import re
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Protocol
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID, uuid4
 
 from ..artifacts.storage import ArtifactStorage
-from ..bus import EventBus
+from ..config import Settings
 from ..domain import ErrorInfo, StagedArtifact
 from ..events import (
     ARTIFACT_PRODUCTION_FAILED,
@@ -40,9 +39,7 @@ _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _PLAYLIST_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 _FINAL_MEDIA_SUFFIXES = frozenset({".mp4", ".mkv", ".webm"})
 _YTDLP_COMMAND = (sys.executable, "-m", "yt_dlp")
-_UNAVAILABLE = frozenset(
-    {"private", "premium_only", "subscriber_only", "needs_auth", "unavailable"}
-)
+_QUOTA_POLL_SECONDS = 1.0
 
 
 class YouTubeUrlKind(str, Enum):
@@ -55,12 +52,6 @@ class UnsupportedYouTubeUrl(ValueError):
 
     def __init__(self) -> None:
         super().__init__("YouTube URL is unsupported")
-
-
-class _ProcessRunner(Protocol):
-    async def run(
-        self, args: Sequence[str], timeout_seconds: float | int
-    ) -> ProcessResult: ...
 
 
 def classify_youtube_url(url: str) -> YouTubeUrlKind:
@@ -128,41 +119,17 @@ def _valid_video_id(value: str) -> bool:
 class YouTubeArtifactProducer:
     def __init__(
         self,
-        bus: EventBus,
+        bus,
         storage: ArtifactStorage,
-        process_runner: _ProcessRunner,
-        *,
-        timeout_seconds: float | int,
-        max_artifact_bytes: int = 2_000_000_000,
-        cookies_path: Path | None = None,
-        format_selector: str = YTDLP_FORMAT,
-        quota_poll_seconds: float | int = 0.05,
-        id_factory: Callable[[], UUID] = uuid4,
-        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        process_runner,
+        settings: Settings,
     ) -> None:
-        if type(timeout_seconds) not in (int, float) or timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
-        if type(max_artifact_bytes) is not int or max_artifact_bytes <= 0:
-            raise ValueError("max_artifact_bytes must be a positive int")
-        if (
-            type(quota_poll_seconds) not in (int, float)
-            or quota_poll_seconds <= 0
-        ):
-            raise ValueError("quota_poll_seconds must be positive")
-        if cookies_path is not None and not isinstance(cookies_path, Path):
-            raise TypeError("cookies_path must be Path or None")
-        if not isinstance(format_selector, str) or not format_selector:
-            raise ValueError("format_selector must be nonblank")
         self._bus = bus
         self._storage = storage
         self._runner = process_runner
-        self._timeout_seconds = timeout_seconds
-        self._max_artifact_bytes = max_artifact_bytes
-        self._cookies_path = cookies_path
-        self._format_selector = format_selector
-        self._quota_poll_seconds = quota_poll_seconds
-        self._id_factory = id_factory
-        self._clock = clock
+        self._timeout_seconds = settings.ytdlp_timeout_seconds
+        self._max_artifact_bytes = settings.max_artifact_bytes
+        self._cookies_path = settings.cookies_path
         bus.on(
             YOUTUBE_PLAYLIST_EXPANSION_REQUESTED,
             self.handle_playlist_expansion_requested,
@@ -174,14 +141,15 @@ class YouTubeArtifactProducer:
     ) -> None:
         try:
             result = await self._runner.run(
-                self._playlist_args(event.source_url), self._timeout_seconds
+                self._playlist_args(event.source_url, event.offset),
+                self._timeout_seconds,
             )
             if result.exit_code != 0:
                 self._emit_playlist_failure(
                     event, "youtube_process_failed", "YouTube process failed"
                 )
                 return
-            targets, skipped = self._parse_playlist(result.stdout)
+            targets, skipped, playlist_title = self._parse_playlist(result.stdout)
             if not targets:
                 self._emit_playlist_failure(
                     event,
@@ -195,7 +163,8 @@ class YouTubeArtifactProducer:
                     event.batch_id,
                     tuple(targets),
                     skipped,
-                    self._causal_time(event.occurred_at),
+                    _now(),
+                    playlist_title,
                 ),
             )
         except ProcessTimeoutError:
@@ -218,7 +187,7 @@ class YouTubeArtifactProducer:
     ) -> None:
         artifact_id: UUID | None = None
         try:
-            artifact_id = self._id_factory()
+            artifact_id = uuid4()
             directory = self._storage.allocate_download_directory(
                 event.job_id, artifact_id
             )
@@ -234,9 +203,11 @@ class YouTubeArtifactProducer:
                     "youtube_process_failed",
                     "YouTube process failed",
                 )
-                self._best_effort_cleanup(event.job_id)
+                self._storage.delete_job_directory(event.job_id)
                 return
-            artifact = self._discover_artifact(event.job_id, artifact_id, directory)
+            artifact = self._discover_artifact(
+                event.job_id, artifact_id, directory, event.caption_prefix
+            )
             self._bus.emit(
                 ARTIFACT_READY,
                 ArtifactReady(
@@ -247,19 +218,19 @@ class YouTubeArtifactProducer:
                     artifact.media_type,
                     artifact.size_bytes,
                     artifact.caption,
-                    self._causal_time(event.occurred_at),
+                    _now(),
                 ),
             )
         except asyncio.CancelledError:
-            self._best_effort_cleanup(event.job_id)
+            self._storage.delete_job_directory(event.job_id)
             raise
         except ProcessTimeoutError:
-            self._best_effort_cleanup(event.job_id)
+            self._storage.delete_job_directory(event.job_id)
             self._emit_artifact_failure(
                 event, artifact_id, "youtube_timeout", "YouTube operation timed out"
             )
         except _ArtifactOversize:
-            self._best_effort_cleanup(event.job_id)
+            self._storage.delete_job_directory(event.job_id)
             self._emit_artifact_failure(
                 event,
                 artifact_id,
@@ -267,21 +238,24 @@ class YouTubeArtifactProducer:
                 "Artifact exceeds maximum allowed size",
             )
         except Exception:
-            self._best_effort_cleanup(event.job_id)
+            self._storage.delete_job_directory(event.job_id)
             self._emit_artifact_failure(
                 event, artifact_id, "internal_error", "Artifact production failed"
             )
         except BaseException:
-            self._best_effort_cleanup(event.job_id)
+            self._storage.delete_job_directory(event.job_id)
             raise
 
-    def _playlist_args(self, source_url: str) -> list[str]:
+    def _playlist_args(self, source_url: str, offset: int = 0) -> list[str]:
+        # --playlist-start is 1-indexed; offset=N skips the first N videos.
+        offset_args = ["--playlist-start", str(offset + 1)] if offset > 0 else []
         return [
             *_YTDLP_COMMAND,
             "--flat-playlist",
             "--dump-json",
             "--no-warnings",
             "--ignore-errors",
+            *offset_args,
             *self._cookie_args(),
             source_url,
         ]
@@ -290,7 +264,7 @@ class YouTubeArtifactProducer:
         return [
             *_YTDLP_COMMAND,
             "-f",
-            self._format_selector,
+            YTDLP_FORMAT,
             "--merge-output-format",
             "mp4",
             "--max-filesize",
@@ -310,37 +284,24 @@ class YouTubeArtifactProducer:
     async def _run_download(
         self, args: Sequence[str], job_id: UUID, artifact_id: UUID
     ) -> ProcessResult:
+        """Waits for yt-dlp, stopping it if the partial download outgrows its quota."""
         runner_task = asyncio.create_task(
             self._runner.run(args, self._timeout_seconds)
         )
         try:
             while True:
                 done, _ = await asyncio.wait(
-                    (runner_task,), timeout=self._quota_poll_seconds
+                    (runner_task,), timeout=_QUOTA_POLL_SECONDS
                 )
-                if done:
-                    result = await runner_task
-                    if (
-                        self._download_size(job_id, artifact_id)
-                        > self._max_artifact_bytes
-                    ):
-                        raise _ArtifactOversize()
-                    return result
-                if (
-                    self._download_size(job_id, artifact_id)
-                    > self._max_artifact_bytes
-                ):
-                    runner_task.cancel()
-                    await asyncio.gather(runner_task, return_exceptions=True)
+                size = self._storage.download_directory_size(job_id, artifact_id)
+                if size > self._max_artifact_bytes:
                     raise _ArtifactOversize()
-        except BaseException:
+                if done:
+                    return await runner_task
+        finally:
             if not runner_task.done():
                 runner_task.cancel()
                 await asyncio.gather(runner_task, return_exceptions=True)
-            raise
-
-    def _download_size(self, job_id: UUID, artifact_id: UUID) -> int:
-        return self._storage.download_directory_size(job_id, artifact_id)
 
     def _cookie_args(self) -> list[str]:
         if self._cookies_path is None:
@@ -348,14 +309,12 @@ class YouTubeArtifactProducer:
         return ["--cookies", str(self._cookies_path)]
 
     @staticmethod
-    def _parse_playlist(stdout: str) -> tuple[list[DownloadTarget], int]:
+    def _parse_playlist(stdout: str) -> tuple[list[DownloadTarget], int, str | None]:
         targets: list[DownloadTarget] = []
         seen: set[str] = set()
         skipped = 0
-        nonblank_lines = [line for line in stdout.splitlines() if line.strip()]
-        if not nonblank_lines:
-            return targets, 0
-        for line in nonblank_lines:
+        playlist_title: str | None = None
+        for line in (line for line in stdout.splitlines() if line.strip()):
             try:
                 entry = json.loads(line)
             except (json.JSONDecodeError, TypeError):
@@ -364,58 +323,55 @@ class YouTubeArtifactProducer:
                 skipped += 1
                 continue
             source_id = entry.get("id")
-            availability = entry.get("availability")
+            # Availability is not filtered here: cookies auth downloads member-only
+            # videos, and unavailable entries fail per-job downstream (visible, not
+            # silently dropped). ponytail: re-add a {"private","unavailable"} skip
+            # if dead-video failure spam becomes a problem.
             if (
                 not isinstance(source_id, str)
                 or not _valid_video_id(source_id)
-                or availability in _UNAVAILABLE
                 or source_id in seen
             ):
                 skipped += 1
                 continue
             seen.add(source_id)
+            if playlist_title is None:
+                playlist_title = _playlist_title(entry)
             targets.append(
                 DownloadTarget(
                     source_id,
                     f"https://www.youtube.com/watch?v={source_id}",
+                    _caption_prefix(entry),
                 )
             )
-        return targets, skipped
+        return targets, skipped, playlist_title
 
     def _discover_artifact(
-        self, job_id: UUID, artifact_id: UUID, directory: Path
+        self,
+        job_id: UUID,
+        artifact_id: UUID,
+        directory: Path,
+        caption_prefix: str = "",
     ) -> StagedArtifact:
-        resolved_directory = directory.resolve(strict=True)
-        candidates: list[Path] = []
-        for entry in directory.iterdir():
-            if (
-                entry.suffix.lower() not in _FINAL_MEDIA_SUFFIXES
-                or entry.is_symlink()
-                or not entry.is_file()
-            ):
-                continue
-            resolved = entry.resolve(strict=True)
-            try:
-                resolved.relative_to(resolved_directory)
-            except ValueError:
-                continue
-            candidates.append(entry)
+        candidates = [
+            entry
+            for entry in directory.iterdir()
+            if entry.suffix.lower() in _FINAL_MEDIA_SUFFIXES
+            and not entry.is_symlink()
+            and entry.is_file()
+        ]
         if len(candidates) != 1:
             raise RuntimeError("download output is missing or ambiguous")
         path = candidates[0]
-        size = path.stat().st_size
-        media_type = mimetypes.guess_type(path.name)[0]
-        staged = StagedArtifact(
+        return StagedArtifact(
             job_id,
             artifact_id,
             path,
             path.name,
-            media_type,
-            size,
-            path.stem.replace("_", " "),
+            mimetypes.guess_type(path.name)[0],
+            path.stat().st_size,
+            caption_prefix + path.stem.replace("_", " "),
         )
-        self._storage.validate_staged_artifact(staged)
-        return staged
 
     def _emit_playlist_failure(
         self, event: PlaylistExpansionRequested, code: str, message: str
@@ -425,7 +381,7 @@ class YouTubeArtifactProducer:
             PlaylistExpansionFailed(
                 event.batch_id,
                 ErrorInfo(code, message),
-                self._causal_time(event.occurred_at),
+                _now(),
             ),
         )
 
@@ -442,18 +398,29 @@ class YouTubeArtifactProducer:
                 event.job_id,
                 artifact_id,
                 ErrorInfo(code, message),
-                self._causal_time(event.occurred_at),
+                _now(),
             ),
         )
 
-    def _causal_time(self, occurred_at: datetime) -> datetime:
-        return max(self._clock(), occurred_at)
+def _playlist_title(entry: dict) -> str | None:
+    title = entry.get("playlist_title") or entry.get("playlist")
+    return title.strip() if isinstance(title, str) and title.strip() else None
 
-    def _best_effort_cleanup(self, job_id: UUID) -> None:
-        try:
-            self._storage.delete_job_directory(job_id)
-        except Exception:
-            pass
+
+def _caption_prefix(entry: dict) -> str:
+    """'Playlist name - 03/42 - ' from flat-playlist metadata, '' when absent."""
+    parts = []
+    title = _playlist_title(entry)
+    if title is not None:
+        parts.append(title)
+    index = entry.get("playlist_index")
+    total = entry.get("playlist_count")
+    if isinstance(index, int) and not isinstance(index, bool) and index > 0:
+        if isinstance(total, int) and not isinstance(total, bool) and total >= index:
+            parts.append(f"{index:0{len(str(total))}d}/{total}")
+        else:
+            parts.append(str(index))
+    return " - ".join(parts) + " - " if parts else ""
 
 
 class _PlaylistParseError(ValueError):
@@ -462,3 +429,7 @@ class _PlaylistParseError(ValueError):
 
 class _ArtifactOversize(Exception):
     pass
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)

@@ -1,7 +1,6 @@
 import asyncio
 from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol
 
 from telethon import TelegramClient
 from telethon.errors import RpcCallFailError, ServerError, TimedOutError
@@ -24,25 +23,10 @@ class TelegramUploadError(TelegramClientError):
         super().__init__("Telegram upload failed")
 
 
-class _TelethonClient(Protocol):
-    async def start(self, *, bot_token: str) -> object: ...
 
-    async def disconnect(self) -> object: ...
-
-    async def run_until_disconnected(self) -> object: ...
-
-    async def send_file(
-        self,
-        entity: int,
-        file: str,
-        *,
-        caption: str | None,
-        supports_streaming: bool,
-        progress_callback: Callable[[int, int], object],
-    ) -> object: ...
-
-
-_ClientFactory = Callable[[str, int, str], _TelethonClient]
+# ponytail: 512KB = Telegram's max part size; fewer SaveFilePart RPCs.
+# Telethon's send_file can't forward part_size_kb, so pre-upload the handle.
+_PART_SIZE_KB = 512
 _CONNECTION_ERRORS = (
     ConnectionError,
     OSError,
@@ -54,13 +38,8 @@ _CONNECTION_ERRORS = (
 
 
 class TelegramClientAdapter:
-    def __init__(
-        self,
-        settings: Settings,
-        *,
-        client_factory: _ClientFactory = TelegramClient,
-    ) -> None:
-        self._client = client_factory(
+    def __init__(self, settings: Settings) -> None:
+        self._client = TelegramClient(
             str(settings.session_path), settings.api_id, settings.api_hash
         )
         self._bot_token = settings.bot_token
@@ -95,6 +74,14 @@ class TelegramClientAdapter:
         except Exception:
             raise TelegramClientError("Telegram connection monitor failed") from None
 
+    async def send_message(self, text: str) -> None:
+        try:
+            await self._client.send_message(self._entity, text)
+        except _CONNECTION_ERRORS:
+            raise TelegramUnavailableError() from None
+        except Exception:
+            raise TelegramUploadError() from None
+
     async def upload(
         self,
         path: Path,
@@ -102,14 +89,20 @@ class TelegramClientAdapter:
         caption: str | None,
         supports_streaming: bool,
         progress_callback: Callable[[int, int], object],
+        file_size: int | None = None,
     ) -> TelegramUploadResult:
         try:
+            handle = await self._client.upload_file(
+                str(path),
+                part_size_kb=_PART_SIZE_KB,
+                file_size=file_size,
+                progress_callback=progress_callback,
+            )
             message = await self._client.send_file(
                 self._entity,
-                str(path),
+                handle,
                 caption=caption,
                 supports_streaming=supports_streaming,
-                progress_callback=progress_callback,
             )
             chat_id = message.chat_id
             message_id = message.id

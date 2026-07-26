@@ -284,17 +284,6 @@ def test_unknown_reads_return_none() -> None:
     assert tracker.get_batch(BATCH) is None
 
 
-def test_mixed_aware_and_naive_job_times_fail_at_event_boundary(tracked_bus) -> None:
-    tracker, bus, errors = tracked_bus
-    emit_valid(bus, errors, JOB_QUEUED, youtube_queued())
-
-    with pytest.raises(ValueError, match="occurred_at must be timezone-aware"):
-        JobStarted(JOB_1, JobPhase.PRODUCING, NOW.replace(tzinfo=None))
-
-    assert tracker.get_job(JOB_1).status is JobStatus.WAITING  # type: ignore[union-attr]
-    assert errors == []
-
-
 def test_job_queued_creates_exact_waiting_snapshot(tracked_bus) -> None:
     tracker, bus, errors = tracked_bus
     emit_valid(bus, errors, JOB_QUEUED, youtube_queued())
@@ -967,25 +956,6 @@ def test_expansion_failure_rejects_already_queued_pending_child(tracked_bus) -> 
     assert tracker.get_batch(BATCH).status is BatchStatus.EXPANDING  # type: ignore[union-attr]
 
 
-def test_batched_job_timestamp_cannot_predate_batch(tracked_bus) -> None:
-    tracker, bus, errors = tracked_bus
-    emit_valid(
-        bus,
-        errors,
-        BATCH_CREATED,
-        BatchCreated(BATCH, "https://example.test/playlist", time(2)),
-    )
-
-    emit_invalid(
-        bus,
-        errors,
-        JOB_QUEUED,
-        youtube_queued(JOB_1, batch_id=BATCH, occurred_at=time(1)),
-    )
-    assert tracker.get_job(JOB_1) is None
-    assert tracker.get_batch(BATCH).updated_at == time(2)  # type: ignore[union-attr]
-
-
 def test_batch_attachment_is_only_allowed_while_expanding(tracked_bus) -> None:
     tracker, bus, errors = tracked_bus
     create_batch_and_jobs(bus, errors)
@@ -1138,85 +1108,6 @@ def test_batch_updated_at_advances_for_each_attached_child_event(tracked_bus) ->
     assert tracker.get_batch(BATCH).updated_at == time(5)  # type: ignore[union-attr]
     emit_valid(bus, errors, ARTIFACT_UPLOADED, uploaded(occurred_at=time(6)))
     assert tracker.get_batch(BATCH).updated_at == time(6)  # type: ignore[union-attr]
-
-
-@pytest.mark.parametrize(
-    ("status", "topic", "event"),
-    [
-        (
-            JobStatus.WAITING,
-            JOB_STARTED,
-            JobStarted(JOB_1, JobPhase.PRODUCING, time(-1)),
-        ),
-        (JobStatus.PRODUCING, ARTIFACT_READY, ready(occurred_at=time(0))),
-        (
-            JobStatus.PRODUCING,
-            ARTIFACT_PRODUCTION_FAILED,
-            ArtifactProductionFailed(JOB_1, None, DOWNLOAD_ERROR, time(0)),
-        ),
-        (JobStatus.UPLOADING, ARTIFACT_UPLOADED, uploaded(occurred_at=time(1))),
-        (
-            JobStatus.UPLOADING,
-            ARTIFACT_UPLOAD_FAILED,
-            ArtifactUploadFailed(JOB_1, ARTIFACT_1, UPLOAD_ERROR, time(1)),
-        ),
-    ],
-)
-def test_job_lifecycle_rejects_stale_nonduplicate_events(
-    tracked_bus, status, topic, event
-) -> None:
-    tracker, bus, errors = tracked_bus
-    create_job_at_status(bus, errors, status)
-    before = tracker.get_job(JOB_1)
-
-    emit_invalid(bus, errors, topic, event, InvalidJobTransition)
-    assert tracker.get_job(JOB_1) == before
-
-
-def test_batch_attachment_rejects_timestamp_older_than_pending_child(
-    tracked_bus,
-) -> None:
-    tracker, bus, errors = tracked_bus
-    emit_valid(
-        bus,
-        errors,
-        BATCH_CREATED,
-        BatchCreated(BATCH, "https://example.test/playlist", time(0)),
-    )
-    emit_valid(
-        bus,
-        errors,
-        JOB_QUEUED,
-        youtube_queued(JOB_1, batch_id=BATCH, occurred_at=time(2)),
-    )
-
-    emit_invalid(
-        bus,
-        errors,
-        BATCH_JOBS_CREATED,
-        BatchJobsCreated(BATCH, (JOB_1,), 0, time(1)),
-    )
-    assert tracker.get_batch(BATCH).updated_at == time(2)  # type: ignore[union-attr]
-    assert tracker.get_batch(BATCH).job_ids == ()  # type: ignore[union-attr]
-
-
-def test_expansion_failure_rejects_timestamp_older_than_batch(tracked_bus) -> None:
-    tracker, bus, errors = tracked_bus
-    emit_valid(
-        bus,
-        errors,
-        BATCH_CREATED,
-        BatchCreated(BATCH, "https://example.test/playlist", time(2)),
-    )
-
-    emit_invalid(
-        bus,
-        errors,
-        YOUTUBE_PLAYLIST_EXPANSION_FAILED,
-        PlaylistExpansionFailed(BATCH, DOWNLOAD_ERROR, time(1)),
-    )
-    assert tracker.get_batch(BATCH).updated_at == time(2)  # type: ignore[union-attr]
-    assert tracker.get_batch(BATCH).status is BatchStatus.EXPANDING  # type: ignore[union-attr]
 
 
 def test_batch_freshness_never_regresses_across_children(tracked_bus) -> None:

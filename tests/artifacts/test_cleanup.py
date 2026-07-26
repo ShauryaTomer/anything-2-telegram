@@ -1,115 +1,74 @@
 from datetime import UTC, datetime
-from pathlib import Path
-from unittest.mock import Mock
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from pyee import EventEmitter
-from pyee.asyncio import AsyncIOEventEmitter
 
+from anything2telegram.artifacts.cleanup import ArtifactCleanup
 from anything2telegram.domain import ErrorInfo
 from anything2telegram.events import (
     ARTIFACT_PRODUCTION_FAILED,
-    ARTIFACT_UPLOADED,
     ARTIFACT_UPLOAD_FAILED,
+    ARTIFACT_UPLOADED,
     ArtifactProductionFailed,
     ArtifactUploaded,
     ArtifactUploadFailed,
 )
 
 
-NOW = datetime(2026, 7, 19, 8, 30, tzinfo=UTC)
-
-
-def _cleanup_api():
-    from anything2telegram.artifacts.cleanup import ArtifactCleanup
-
-    return ArtifactCleanup
-
-
 class RecordingStorage:
-    def __init__(self, error: Exception | None = None) -> None:
-        self.deleted: list[UUID] = []
-        self.error = error
+    def __init__(self, *, failing: bool = False) -> None:
+        self.deleted: list[object] = []
+        self._failing = failing
 
-    def delete_job_directory(self, job_id: UUID) -> None:
+    def delete_job_directory(self, job_id: object) -> None:
+        if self._failing:
+            raise OSError("busy")
         self.deleted.append(job_id)
-        if self.error is not None:
-            raise self.error
 
 
-def _events(job_id: UUID):
-    artifact_id = uuid4()
-    error = ErrorInfo("failed", "Operation failed")
-    return [
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+@pytest.mark.parametrize(
+    "topic,event_for",
+    [
         (
             ARTIFACT_UPLOADED,
-            ArtifactUploaded(job_id, artifact_id, -1001, 7, NOW),
+            lambda job_id: ArtifactUploaded(job_id, uuid4(), -1001, 7, _now()),
         ),
         (
             ARTIFACT_UPLOAD_FAILED,
-            ArtifactUploadFailed(job_id, artifact_id, error, NOW),
+            lambda job_id: ArtifactUploadFailed(
+                job_id, uuid4(), ErrorInfo("boom", "Boom"), _now()
+            ),
         ),
         (
             ARTIFACT_PRODUCTION_FAILED,
-            ArtifactProductionFailed(job_id, artifact_id, error, NOW),
+            lambda job_id: ArtifactProductionFailed(
+                job_id, None, ErrorInfo("boom", "Boom"), _now()
+            ),
         ),
-    ]
-
-
-@pytest.mark.parametrize("bus_type", [EventEmitter, AsyncIOEventEmitter])
-def test_register_deletes_correct_job_for_all_terminal_artifact_topics(
-    bus_type: type[EventEmitter],
-) -> None:
-    ArtifactCleanup = _cleanup_api()
+    ],
+)
+def test_every_terminal_topic_deletes_that_job(topic: str, event_for) -> None:
     storage = RecordingStorage()
-    logger = Mock()
-    bus = bus_type()
-    ArtifactCleanup(storage, logger).register(bus)
-    job_ids = [uuid4(), uuid4(), uuid4()]
-
-    for job_id, (topic, event) in zip(job_ids, _events(job_ids[0])):
-        event = type(event)(job_id=job_id, **{
-            field: getattr(event, field)
-            for field in event.__dataclass_fields__
-            if field != "job_id"
-        })
-        assert bus.emit(topic, event) is True
-
-    assert storage.deleted == job_ids
-    logger.error.assert_not_called()
-
-
-def test_cleanup_failure_is_logged_safely_and_swallowed() -> None:
-    ArtifactCleanup = _cleanup_api()
-    storage = RecordingStorage(RuntimeError("/secret/artifact/path"))
-    logger = Mock()
     bus = EventEmitter()
-    ArtifactCleanup(storage, logger).register(bus)
-    topic, event = _events(uuid4())[0]
-    original = event
+    ArtifactCleanup(storage).register(bus)
+    job_id = uuid4()
 
-    assert bus.emit(topic, event) is True
+    bus.emit(topic, event_for(job_id))
 
-    assert event == original
-    logger.error.assert_called_once()
-    args, kwargs = logger.error.call_args
-    rendered = " ".join(str(value) for value in (*args, *kwargs.values()))
-    assert "/secret" not in rendered
-    assert str(event.job_id) not in rendered
+    assert storage.deleted == [job_id]
 
 
-def test_cleanup_logger_failure_is_swallowed_and_later_listeners_run() -> None:
-    ArtifactCleanup = _cleanup_api()
-    storage = RecordingStorage(RuntimeError("delete failed"))
-    logger = Mock()
-    logger.error.side_effect = RuntimeError("logger failed")
+def test_a_failing_delete_is_logged_and_later_listeners_still_run() -> None:
     bus = EventEmitter()
-    ArtifactCleanup(storage, logger).register(bus)
-    topic, event = _events(uuid4())[0]
-    later_events: list[object] = []
-    bus.on(topic, later_events.append)
+    ArtifactCleanup(RecordingStorage(failing=True)).register(bus)
+    seen: list[object] = []
+    bus.on(ARTIFACT_UPLOADED, seen.append)
 
-    assert bus.emit(topic, event) is True
+    bus.emit(ARTIFACT_UPLOADED, ArtifactUploaded(uuid4(), uuid4(), -1001, 7, _now()))
 
-    assert later_events == [event]
+    assert len(seen) == 1

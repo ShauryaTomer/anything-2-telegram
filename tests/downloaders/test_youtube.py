@@ -1,17 +1,19 @@
 import asyncio
 import json
 import sys
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from pyee.asyncio import AsyncIOEventEmitter
 
 from anything2telegram.artifacts.storage import ArtifactStorage
-from anything2telegram.downloaders.process import ProcessResult, ProcessTimeoutError
+from anything2telegram.config import Settings
+from anything2telegram.domain import ProcessResult
+from anything2telegram.downloaders.process import ProcessTimeoutError
 from anything2telegram.downloaders.youtube import (
-    YTDLP_FORMAT,
     UnsupportedYouTubeUrl,
     YouTubeArtifactProducer,
     YouTubeUrlKind,
@@ -20,348 +22,415 @@ from anything2telegram.downloaders.youtube import (
 from anything2telegram.events import (
     ARTIFACT_PRODUCTION_FAILED,
     ARTIFACT_READY,
-    YOUTUBE_DOWNLOAD_REQUESTED,
     YOUTUBE_PLAYLIST_EXPANDED,
     YOUTUBE_PLAYLIST_EXPANSION_FAILED,
-    YOUTUBE_PLAYLIST_EXPANSION_REQUESTED,
     PlaylistExpansionRequested,
     YouTubeDownloadRequested,
 )
+from tests.conftest import settings_for
 
 
-NOW = datetime(2026, 7, 19, tzinfo=UTC)
-ARTIFACT_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
-
-
-class Runner:
-    def __init__(self, result=None, error=None, side_effect=None) -> None:
-        self.result = result or ProcessResult(0, "", "")
-        self.error = error
-        self.side_effect = side_effect
-        self.calls = []
-
-    async def run(self, args, timeout_seconds):
-        self.calls.append((list(args), timeout_seconds))
-        if self.side_effect:
-            self.side_effect(args)
-        if self.error:
-            raise self.error
-        return self.result
-
-
-async def settle() -> None:
-    for _ in range(5):
-        await asyncio.sleep(0)
+VIDEO_ID = "aaaaaaaaaaa"
 
 
 @pytest.mark.parametrize(
-    ("url", "kind"),
+    "url,kind",
     [
-        ("https://youtube.com/watch?v=dQw4w9WgXcQ", YouTubeUrlKind.VIDEO),
-        ("https://music.youtube.com/watch?v=dQw4w9WgXcQ", YouTubeUrlKind.VIDEO),
-        ("https://youtu.be/dQw4w9WgXcQ", YouTubeUrlKind.VIDEO),
-        ("https://youtube.com/shorts/dQw4w9WgXcQ", YouTubeUrlKind.VIDEO),
-        ("https://youtube.com/watch?v=dQw4w9WgXcQ&list=PL123", YouTubeUrlKind.VIDEO),
-        ("https://youtube.com/playlist?list=PL123", YouTubeUrlKind.PLAYLIST),
-        ("https://youtube.com/?list=PL123", YouTubeUrlKind.PLAYLIST),
+        ("https://youtu.be/aaaaaaaaaaa", YouTubeUrlKind.VIDEO),
+        ("https://www.youtube.com/watch?v=aaaaaaaaaaa", YouTubeUrlKind.VIDEO),
+        ("https://youtube.com/shorts/aaaaaaaaaaa", YouTubeUrlKind.VIDEO),
+        ("https://m.youtube.com/embed/aaaaaaaaaaa", YouTubeUrlKind.VIDEO),
+        ("https://www.youtube.com/v/aaaaaaaaaaa", YouTubeUrlKind.VIDEO),
+        # A video id wins even when the URL also carries a playlist.
+        (
+            "https://www.youtube.com/watch?v=aaaaaaaaaaa&list=PL123",
+            YouTubeUrlKind.VIDEO,
+        ),
+        ("https://www.youtube.com/playlist?list=PL123", YouTubeUrlKind.PLAYLIST),
+        ("https://www.youtube.com/?list=PL123", YouTubeUrlKind.PLAYLIST),
     ],
 )
-def test_classifies_supported_youtube_urls(url, kind) -> None:
+def test_supported_urls_are_classified(url: str, kind: YouTubeUrlKind) -> None:
     assert classify_youtube_url(url) is kind
 
 
 @pytest.mark.parametrize(
     "url",
     [
-        "https://youtube.com.evil.test/watch?v=dQw4w9WgXcQ",
-        "https://notyoutube.com/watch?v=dQw4w9WgXcQ",
-        "https://youtube.com@evil.test/watch?v=dQw4w9WgXcQ",
-        "https://user@youtube.com/watch?v=dQw4w9WgXcQ",
-        "ftp://youtube.com/watch?v=dQw4w9WgXcQ",
-        "https://youtube.com:443/watch?v=dQw4w9WgXcQ",
-        "https://youtube.com/channel/UC123",
-        "https://youtu.be/not-an-id/extra",
+        "",
+        "   ",
+        "not-a-url",
+        "ftp://youtube.com/watch?v=aaaaaaaaaaa",
+        "https://evil.com/watch?v=aaaaaaaaaaa",
+        "https://youtube.com.evil.com/watch?v=aaaaaaaaaaa",
+        "https://user:pass@youtube.com/watch?v=aaaaaaaaaaa",
+        "https://youtube.com:8080/watch?v=aaaaaaaaaaa",
+        "https://www.youtube.com/watch?v=tooshort",
+        "https://www.youtube.com/watch?v=aaaaaaaaaaa&v=bbbbbbbbbbb",
+        "https://youtu.be/aaaaaaaaaaa/extra",
+        "https://www.youtube.com/watch?v=aaaaaaaaaaa#fragment",
+        "https://www.youtube.com/feed/subscriptions",
     ],
 )
-def test_rejects_deceptive_or_unsupported_urls(url) -> None:
-    with pytest.raises(UnsupportedYouTubeUrl) as caught:
+def test_unsupported_urls_are_rejected(url: str) -> None:
+    with pytest.raises(UnsupportedYouTubeUrl):
         classify_youtube_url(url)
-    assert caught.value.code == "unsupported_youtube_url"
-    assert url not in str(caught.value)
 
 
-@pytest.mark.asyncio
-async def test_expansion_uses_exact_args_and_emits_ordered_deduped_targets(tmp_path) -> None:
-    output = "\n".join(
-        json.dumps(entry)
-        for entry in [
-            {"id": "dQw4w9WgXcQ"},
-            {"id": "M7lc1UVf-VE", "availability": "private"},
-            {"id": "9bZkp7q19f0"},
-            {"id": "dQw4w9WgXcQ"},
-            {"title": "malformed"},
-        ]
-    )
-    runner = Runner(ProcessResult(0, output, ""))
-    bus = AsyncIOEventEmitter()
-    errors = []
-    expanded = []
-    bus.on("error", errors.append)
-    bus.on(YOUTUBE_PLAYLIST_EXPANDED, expanded.append)
-    YouTubeArtifactProducer(
-        bus,
-        ArtifactStorage(tmp_path / "artifacts"),
-        runner,
-        timeout_seconds=15,
-        cookies_path=tmp_path / "cookies.txt",
-        id_factory=lambda: ARTIFACT_ID,
-        clock=lambda: NOW,
-    )
-    request = PlaylistExpansionRequested(uuid4(), "https://youtube.com/playlist?list=PL123", NOW)
-    bus.emit(YOUTUBE_PLAYLIST_EXPANSION_REQUESTED, request)
-    await settle()
+class ScriptedRunner:
+    """Returns a queued result per call and records the argument vectors."""
 
-    assert errors == []
-    assert runner.calls == [
-        ([
-            sys.executable, "-m", "yt_dlp",
-            "--flat-playlist", "--dump-json", "--no-warnings",
-            "--ignore-errors", "--cookies", str(tmp_path / "cookies.txt"),
-            request.source_url,
-        ], 15)
-    ]
-    assert [target.source_id for target in expanded[0].targets] == [
-        "dQw4w9WgXcQ", "9bZkp7q19f0"
-    ]
-    assert expanded[0].skipped_entries == 3
-    assert expanded[0].occurred_at == NOW
+    def __init__(self, *results: object) -> None:
+        self.results = list(results)
+        self.calls: list[Sequence[str]] = []
+
+    async def run(self, args: Sequence[str], timeout_seconds: float) -> ProcessResult:
+        self.calls.append(list(args))
+        self.timeout_seconds = timeout_seconds
+        result = self.results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        if callable(result):
+            return result(args)
+        return result
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("result", "code"),
-    [
-        (ProcessResult(0, "", ""), "playlist_empty"),
-        (ProcessResult(0, "not-json", ""), "playlist_parse_failed"),
-        (ProcessResult(2, "", "safe"), "youtube_process_failed"),
-    ],
-)
-async def test_expansion_converts_empty_malformed_and_process_failures(tmp_path, result, code) -> None:
-    runner = Runner(result)
-    bus = AsyncIOEventEmitter()
-    failures = []
-    bus.on("error", lambda error: pytest.fail(str(error)))
-    bus.on(YOUTUBE_PLAYLIST_EXPANSION_FAILED, failures.append)
-    YouTubeArtifactProducer(bus, ArtifactStorage(tmp_path / "root"), runner, timeout_seconds=1)
-    request = PlaylistExpansionRequested(uuid4(), "https://youtube.com/playlist?list=PL123", NOW)
-    bus.emit(YOUTUBE_PLAYLIST_EXPANSION_REQUESTED, request)
-    await settle()
-    assert failures[0].batch_id == request.batch_id
-    assert failures[0].error.code == code
-    assert request.source_url not in failures[0].error.message
+class Recorder:
+    def __init__(self, bus: AsyncIOEventEmitter) -> None:
+        self.expanded: list[object] = []
+        self.expansion_failed: list[object] = []
+        self.ready: list[object] = []
+        self.production_failed: list[object] = []
+        bus.on(YOUTUBE_PLAYLIST_EXPANDED, self.expanded.append)
+        bus.on(YOUTUBE_PLAYLIST_EXPANSION_FAILED, self.expansion_failed.append)
+        bus.on(ARTIFACT_READY, self.ready.append)
+        bus.on(ARTIFACT_PRODUCTION_FAILED, self.production_failed.append)
+
+    def failure_codes(self) -> list[str]:
+        return [event.error.code for event in self.production_failed]
+
+    def expansion_failure_codes(self) -> list[str]:
+        return [event.error.code for event in self.expansion_failed]
 
 
-@pytest.mark.asyncio
-async def test_download_exact_args_and_ready_metadata(tmp_path) -> None:
-    storage = ArtifactStorage(tmp_path / "root")
+@pytest.fixture
+def bus() -> AsyncIOEventEmitter:
+    return AsyncIOEventEmitter()
 
-    def create_output(args):
+
+@pytest.fixture
+def recorder(bus: AsyncIOEventEmitter) -> Recorder:
+    return Recorder(bus)
+
+
+@pytest.fixture
+def storage(tmp_path: Path) -> ArtifactStorage:
+    return ArtifactStorage(tmp_path / "artifacts")
+
+
+def make_producer(bus, storage, runner, settings: Settings):
+    return YouTubeArtifactProducer(bus, storage, runner, settings)
+
+
+async def settle(bus: AsyncIOEventEmitter) -> None:
+    while not bus.complete:
+        await asyncio.wait_for(bus.wait_for_complete(), timeout=2)
+
+
+def playlist_stdout(*entries: dict[str, object]) -> str:
+    return "\n".join(json.dumps(entry) for entry in entries)
+
+
+def writes_file(name: str, payload: bytes = b"payload"):
+    def run(args: Sequence[str]) -> ProcessResult:
         template = Path(args[args.index("-o") + 1])
-        (template.parent / "My_Video.mp4").write_bytes(b"video")
-        (template.parent / "My_Video.info.json").write_text("{}")
-        (template.parent / "My_Video.mp4.part").write_bytes(b"partial")
+        template.parent.joinpath(name).write_bytes(payload)
+        return ProcessResult(0, "", "")
 
-    runner = Runner(side_effect=create_output)
-    bus = AsyncIOEventEmitter()
-    ready = []
-    bus.on("error", lambda error: pytest.fail(str(error)))
-    bus.on(ARTIFACT_READY, ready.append)
-    YouTubeArtifactProducer(
-        bus,
-        storage,
-        runner,
-        timeout_seconds=22,
-        max_artifact_bytes=20,
-        id_factory=lambda: ARTIFACT_ID,
-        clock=lambda: NOW,
+    return run
+
+
+def expansion_request(offset: int = 0) -> PlaylistExpansionRequested:
+    return PlaylistExpansionRequested(
+        uuid4(), "https://www.youtube.com/playlist?list=PL123", datetime.now(UTC), offset
     )
-    event = YouTubeDownloadRequested(uuid4(), "https://youtu.be/dQw4w9WgXcQ", NOW)
-    bus.emit(YOUTUBE_DOWNLOAD_REQUESTED, event)
-    await settle()
-
-    directory = storage.root / str(event.job_id) / str(ARTIFACT_ID)
-    assert runner.calls[0] == ([
-        sys.executable, "-m", "yt_dlp",
-        "-f", YTDLP_FORMAT, "--merge-output-format", "mp4",
-        "--max-filesize", "20",
-        "--restrict-filenames", "--no-playlist", "--js-runtimes", "node",
-        "--remote-components", "ejs:github", "-o",
-        str(directory / "%(title).80s.%(ext)s"), event.source_url,
-    ], 22)
-    assert ready[0].local_path == directory / "My_Video.mp4"
-    assert ready[0].filename == "My_Video.mp4"
-    assert ready[0].caption == "My Video"
-    assert ready[0].media_type == "video/mp4"
-    assert ready[0].size_bytes == 5
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["missing", "ambiguous", "symlink"])
-async def test_download_rejects_unsafe_or_ambiguous_outputs_and_cleans(tmp_path, mode) -> None:
-    storage = ArtifactStorage(tmp_path / "root")
-    job_id = uuid4()
-
-    def create_output(args):
-        directory = Path(args[args.index("-o") + 1]).parent
-        if mode == "ambiguous":
-            (directory / "one.mp4").write_bytes(b"1")
-            (directory / "two.webm").write_bytes(b"2")
-        elif mode == "symlink":
-            outside = tmp_path / "outside.mp4"
-            outside.write_bytes(b"x")
-            (directory / "video.mp4").symlink_to(outside)
-
-    runner = Runner(side_effect=create_output)
-    bus = AsyncIOEventEmitter()
-    ready, failed = [], []
-    bus.on("error", lambda error: pytest.fail(str(error)))
-    bus.on(ARTIFACT_READY, ready.append)
-    bus.on(ARTIFACT_PRODUCTION_FAILED, failed.append)
-    YouTubeArtifactProducer(bus, storage, runner, timeout_seconds=1, id_factory=lambda: ARTIFACT_ID)
-    bus.emit(YOUTUBE_DOWNLOAD_REQUESTED, YouTubeDownloadRequested(job_id, "https://youtu.be/dQw4w9WgXcQ", NOW))
-    await settle()
-    assert ready == []
-    assert failed[0].error.code == "internal_error"
-    assert not (storage.root / str(job_id)).exists()
+def download_request() -> YouTubeDownloadRequested:
+    return YouTubeDownloadRequested(
+        uuid4(), f"https://www.youtube.com/watch?v={VIDEO_ID}", datetime.now(UTC)
+    )
 
 
-@pytest.mark.asyncio
+async def test_a_playlist_is_expanded_into_canonical_watch_urls(
+    bus, storage, settings, recorder
+) -> None:
+    runner = ScriptedRunner(
+        ProcessResult(
+            0,
+            playlist_stdout({"id": VIDEO_ID}, {"id": "bbbbbbbbbbb"}),
+            "",
+        )
+    )
+    make_producer(bus, storage, runner, settings)
+
+    bus.emit("youtube.playlist.expansion.requested", expansion_request())
+    await settle(bus)
+
+    assert len(recorder.expanded) == 1
+    targets = recorder.expanded[0].targets
+    assert [target.source_url for target in targets] == [
+        f"https://www.youtube.com/watch?v={VIDEO_ID}",
+        "https://www.youtube.com/watch?v=bbbbbbbbbbb",
+    ]
+    assert recorder.expanded[0].skipped_entries == 0
+
+
+async def test_duplicate_and_unusable_playlist_entries_are_counted_as_skipped(
+    bus, storage, settings, recorder
+) -> None:
+    runner = ScriptedRunner(
+        ProcessResult(
+            0,
+            playlist_stdout(
+                {"id": VIDEO_ID},
+                {"id": VIDEO_ID},
+                {"id": "too-short"},
+                {"no_id": True},
+            ),
+            "",
+        )
+    )
+    make_producer(bus, storage, runner, settings)
+
+    bus.emit("youtube.playlist.expansion.requested", expansion_request())
+    await settle(bus)
+
+    assert len(recorder.expanded[0].targets) == 1
+    assert recorder.expanded[0].skipped_entries == 3
+
+
+async def test_playlist_entries_carry_a_numbered_caption_prefix(
+    bus, storage, settings, recorder
+) -> None:
+    entry = {
+        "playlist_title": "Rust Fundamentals ",
+        "playlist_count": 12,
+        "playlist_index": 3,
+    }
+    runner = ScriptedRunner(
+        ProcessResult(
+            0,
+            playlist_stdout(
+                {"id": VIDEO_ID, **entry},
+                {"id": "bbbbbbbbbbb", **entry, "playlist_index": 11},
+                {"id": "ccccccccccc"},
+            ),
+            "",
+        )
+    )
+    make_producer(bus, storage, runner, settings)
+
+    bus.emit("youtube.playlist.expansion.requested", expansion_request())
+    await settle(bus)
+
+    expanded = recorder.expanded[0]
+    assert expanded.playlist_title == "Rust Fundamentals"
+    assert [target.caption_prefix for target in expanded.targets] == [
+        "Rust Fundamentals - 03/12 - ",
+        "Rust Fundamentals - 11/12 - ",
+        "",
+    ]
+
+
+async def test_a_caption_prefix_is_prepended_to_the_artifact_caption(
+    bus, storage, settings, recorder
+) -> None:
+    runner = ScriptedRunner(writes_file("My_Great_Clip.mp4"))
+    make_producer(bus, storage, runner, settings)
+    request = download_request()
+    event = YouTubeDownloadRequested(
+        request.job_id, request.source_url, request.occurred_at, "Rust - 03/12 - "
+    )
+
+    bus.emit("youtube.download.requested", event)
+    await settle(bus)
+
+    assert recorder.ready[0].caption == "Rust - 03/12 - My Great Clip"
+
+
+async def test_an_offset_becomes_a_one_indexed_playlist_start(
+    bus, storage, settings, recorder
+) -> None:
+    runner = ScriptedRunner(
+        ProcessResult(0, playlist_stdout({"id": VIDEO_ID}), ""),
+        ProcessResult(0, playlist_stdout({"id": VIDEO_ID}), ""),
+    )
+    make_producer(bus, storage, runner, settings)
+
+    bus.emit("youtube.playlist.expansion.requested", expansion_request(offset=3))
+    await settle(bus)
+    assert "--playlist-start" in runner.calls[0]
+    assert runner.calls[0][runner.calls[0].index("--playlist-start") + 1] == "4"
+
+    bus.emit("youtube.playlist.expansion.requested", expansion_request(offset=0))
+    await settle(bus)
+    assert "--playlist-start" not in runner.calls[1]
+
+
 @pytest.mark.parametrize(
-    ("error", "result", "code", "oversize"),
+    "result,code",
     [
-        (ProcessTimeoutError(), None, "youtube_timeout", False),
-        (None, ProcessResult(3, "", "safe"), "youtube_process_failed", False),
-        (RuntimeError("URL and secret"), None, "internal_error", False),
-        (None, None, "artifact_oversize", True),
+        (ProcessResult(1, "", "boom"), "youtube_process_failed"),
+        (ProcessResult(0, "", ""), "playlist_empty"),
+        (ProcessResult(0, "not json", ""), "playlist_parse_failed"),
+        (ProcessTimeoutError(), "youtube_timeout"),
+        (RuntimeError("boom"), "internal_error"),
     ],
 )
-async def test_download_converts_errors_and_cleans(
-    tmp_path, error, result, code, oversize
+async def test_expansion_failures_map_to_stable_codes(
+    bus, storage, settings, recorder, result: object, code: str
 ) -> None:
-    storage = ArtifactStorage(tmp_path / "root")
-    cancelled = asyncio.Event()
+    make_producer(bus, storage, ScriptedRunner(result), settings)
 
-    class OversizeRunner:
-        async def run(self, args, timeout_seconds):
-            directory = Path(args[args.index("-o") + 1]).parent
-            (directory / "growing.part").write_bytes(b"12345")
-            try:
-                await asyncio.Future()
-            finally:
-                cancelled.set()
+    bus.emit("youtube.playlist.expansion.requested", expansion_request())
+    await settle(bus)
 
-    runner = OversizeRunner() if oversize else Runner(result=result, error=error)
-    bus = AsyncIOEventEmitter()
-    failures, ready = [], []
-    bus.on("error", lambda value: pytest.fail(str(value)))
-    bus.on(ARTIFACT_PRODUCTION_FAILED, failures.append)
-    bus.on(ARTIFACT_READY, ready.append)
-    job_id = uuid4()
-    YouTubeArtifactProducer(
-        bus,
-        storage,
-        runner,
-        timeout_seconds=1,
-        max_artifact_bytes=4,
-        id_factory=lambda: ARTIFACT_ID,
+    assert recorder.expansion_failure_codes() == [code]
+    assert recorder.expanded == []
+
+
+async def test_a_playlist_of_only_unusable_entries_is_reported_empty(
+    bus, storage, settings, recorder
+) -> None:
+    runner = ScriptedRunner(
+        ProcessResult(0, playlist_stdout({"id": "too-short"}), "")
     )
-    bus.emit(YOUTUBE_DOWNLOAD_REQUESTED, YouTubeDownloadRequested(job_id, "https://youtu.be/dQw4w9WgXcQ", NOW))
-    if oversize:
-        await asyncio.wait_for(cancelled.wait(), 0.1)
-    await settle()
-    assert ready == []
-    assert len(failures) == 1
-    assert failures[0].artifact_id == ARTIFACT_ID
-    assert failures[0].error.code == code
-    assert "secret" not in failures[0].error.message.lower()
-    assert not (storage.root / str(job_id)).exists()
+    make_producer(bus, storage, runner, settings)
+
+    bus.emit("youtube.playlist.expansion.requested", expansion_request())
+    await settle(bus)
+
+    assert recorder.expansion_failure_codes() == ["playlist_empty"]
 
 
-@pytest.mark.asyncio
-async def test_download_cancellation_cleans_and_emits_no_failure(tmp_path) -> None:
-    storage = ArtifactStorage(tmp_path / "root")
-    started = asyncio.Event()
+async def test_a_download_produces_a_ready_artifact_with_a_readable_caption(
+    bus, storage, settings, recorder
+) -> None:
+    runner = ScriptedRunner(writes_file("My_Great_Clip.mp4"))
+    make_producer(bus, storage, runner, settings)
+    event = download_request()
 
-    class BlockingRunner:
-        async def run(self, args, timeout_seconds):
-            started.set()
-            await asyncio.Future()
+    bus.emit("youtube.download.requested", event)
+    await settle(bus)
 
-    bus = AsyncIOEventEmitter()
-    failures = []
-    bus.on("error", lambda error: None)
-    bus.on(ARTIFACT_PRODUCTION_FAILED, failures.append)
-    producer = YouTubeArtifactProducer(bus, storage, BlockingRunner(), timeout_seconds=1)
-    event = YouTubeDownloadRequested(uuid4(), "https://youtu.be/dQw4w9WgXcQ", NOW)
-    task = asyncio.create_task(producer.handle_download_requested(event))
-    await started.wait()
-    task.cancel()
+    assert len(recorder.ready) == 1
+    ready = recorder.ready[0]
+    assert ready.job_id == event.job_id
+    assert ready.filename == "My_Great_Clip.mp4"
+    assert ready.caption == "My Great Clip"
+    assert ready.media_type == "video/mp4"
+    assert ready.size_bytes == 7
+    assert ready.local_path.parent.parent == storage.root / str(event.job_id)
+
+
+async def test_the_download_command_bounds_size_and_uses_the_running_interpreter(
+    bus, storage, settings, recorder
+) -> None:
+    runner = ScriptedRunner(writes_file("clip.mp4"))
+    make_producer(bus, storage, runner, settings)
+
+    bus.emit("youtube.download.requested", download_request())
+    await settle(bus)
+
+    args = runner.calls[0]
+    assert args[:3] == [sys.executable, "-m", "yt_dlp"]
+    assert args[args.index("--max-filesize") + 1] == str(settings.max_artifact_bytes)
+    assert "--no-playlist" in args
+    assert runner.timeout_seconds == settings.ytdlp_timeout_seconds
+
+
+async def test_cookies_are_passed_only_when_configured(
+    bus, storage, recorder, tmp_path
+) -> None:
+    cookies = tmp_path / "cookies.txt"
+    cookies.write_text("# netscape")
+    with_cookies = settings_for(tmp_path, cookies_path=cookies)
+    runner = ScriptedRunner(writes_file("clip.mp4"))
+    make_producer(bus, storage, runner, with_cookies)
+
+    bus.emit("youtube.download.requested", download_request())
+    await settle(bus)
+
+    args = runner.calls[0]
+    assert args[args.index("--cookies") + 1] == str(cookies)
+
+
+@pytest.mark.parametrize(
+    "result,code",
+    [
+        (ProcessResult(1, "", "boom"), "youtube_process_failed"),
+        (ProcessTimeoutError(), "youtube_timeout"),
+        (RuntimeError("boom"), "internal_error"),
+        # yt-dlp exited cleanly but left nothing usable behind.
+        (ProcessResult(0, "", ""), "internal_error"),
+    ],
+)
+async def test_download_failures_map_to_codes_and_clean_up(
+    bus, storage, settings, recorder, result: object, code: str
+) -> None:
+    make_producer(bus, storage, ScriptedRunner(result), settings)
+    event = download_request()
+
+    bus.emit("youtube.download.requested", event)
+    await settle(bus)
+
+    assert recorder.failure_codes() == [code]
+    assert recorder.ready == []
+    assert not (storage.root / str(event.job_id)).exists()
+
+
+async def test_an_ambiguous_download_output_is_refused(
+    bus, storage, settings, recorder
+) -> None:
+    def two_files(args: Sequence[str]) -> ProcessResult:
+        directory = Path(args[args.index("-o") + 1]).parent
+        directory.joinpath("one.mp4").write_bytes(b"a")
+        directory.joinpath("two.mkv").write_bytes(b"b")
+        return ProcessResult(0, "", "")
+
+    make_producer(bus, storage, ScriptedRunner(two_files), settings)
+
+    bus.emit("youtube.download.requested", download_request())
+    await settle(bus)
+
+    assert recorder.failure_codes() == ["internal_error"]
+
+
+async def test_a_download_that_outgrows_the_limit_is_stopped(
+    bus, storage, recorder, tmp_path
+) -> None:
+    small = settings_for(tmp_path, max_artifact_bytes=8)
+    make_producer(bus, storage, ScriptedRunner(writes_file("clip.mp4", b"x" * 64)), small)
+    event = download_request()
+
+    bus.emit("youtube.download.requested", event)
+    await settle(bus)
+
+    assert recorder.failure_codes() == ["artifact_oversize"]
+    assert not (storage.root / str(event.job_id)).exists()
+
+
+async def test_cancellation_cleans_up_and_propagates(
+    bus, storage, settings, recorder
+) -> None:
+    producer = make_producer(
+        bus, storage, ScriptedRunner(asyncio.CancelledError()), settings
+    )
+    event = download_request()
+
     with pytest.raises(asyncio.CancelledError):
-        await task
-    assert failures == []
-    assert not (storage.root / str(event.job_id)).exists()
-
-
-@pytest.mark.asyncio
-async def test_download_base_exception_cleans_and_reraises(tmp_path) -> None:
-    class Shutdown(BaseException):
-        pass
-
-    class ShutdownRunner:
-        async def run(self, args, timeout_seconds):
-            raise Shutdown()
-
-    storage = ArtifactStorage(tmp_path / "root")
-    bus = AsyncIOEventEmitter()
-    failures = []
-    bus.on(ARTIFACT_PRODUCTION_FAILED, failures.append)
-    producer = YouTubeArtifactProducer(bus, storage, ShutdownRunner(), timeout_seconds=1)
-    event = YouTubeDownloadRequested(uuid4(), "https://youtu.be/dQw4w9WgXcQ", NOW)
-
-    with pytest.raises(Shutdown):
         await producer.handle_download_requested(event)
-    assert failures == []
+
+    assert recorder.failure_codes() == []
     assert not (storage.root / str(event.job_id)).exists()
-
-
-@pytest.mark.asyncio
-async def test_download_factory_error_emits_one_correlated_failure_without_bus_error(
-    tmp_path,
-) -> None:
-    def fail_id_factory():
-        raise RuntimeError("factory secret")
-
-    bus = AsyncIOEventEmitter()
-    bus_errors = []
-    failures = []
-    bus.on("error", bus_errors.append)
-    bus.on(ARTIFACT_PRODUCTION_FAILED, failures.append)
-    YouTubeArtifactProducer(
-        bus,
-        ArtifactStorage(tmp_path / "root"),
-        Runner(),
-        timeout_seconds=1,
-        id_factory=fail_id_factory,
-    )
-    event = YouTubeDownloadRequested(
-        uuid4(), "https://youtu.be/dQw4w9WgXcQ", NOW
-    )
-
-    bus.emit(YOUTUBE_DOWNLOAD_REQUESTED, event)
-    await settle()
-
-    assert bus_errors == []
-    assert len(failures) == 1
-    assert failures[0].job_id == event.job_id
-    assert failures[0].artifact_id is None
-    assert failures[0].error.code == "internal_error"

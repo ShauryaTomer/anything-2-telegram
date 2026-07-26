@@ -1,135 +1,69 @@
+"""Losing Telegram must stop the service admitting work instead of losing it."""
+
 import asyncio
-from pathlib import Path
 
 from httpx import ASGITransport, AsyncClient
 
 from anything2telegram.config import Settings
-from anything2telegram.domain import JobStatus
-from anything2telegram.events import (
-    ARTIFACT_UPLOAD_FAILED,
-    TELEGRAM_UNAVAILABLE,
-)
-from anything2telegram.main import AdapterFactories, create_app
-from anything2telegram.telegram.client import TelegramUnavailableError
+from tests.conftest import FakeTelegram, FakeYouTubeRunner
 
 
-class UnavailableTelegram:
-    def __init__(self) -> None:
-        self.connected = False
-        self.upload_started = asyncio.Event()
-        self.release_upload = asyncio.Event()
-        self.disconnected = asyncio.Event()
-        self.upload_calls = 0
-
-    def is_connected(self) -> bool:
-        return self.connected
-
-    async def connect(self) -> None:
-        self.connected = True
-
-    async def disconnect(self) -> None:
-        self.connected = False
-        self.disconnected.set()
-
-    async def wait_until_disconnected(self) -> None:
-        await self.disconnected.wait()
-
-    async def upload(self, _path: Path, **_kwargs: object):
-        self.upload_calls += 1
-        self.upload_started.set()
-        await self.release_upload.wait()
-        self.connected = False
-        raise TelegramUnavailableError()
+VIDEO = "https://www.youtube.com/watch?v=AAAAAAAAAAA"
 
 
-async def test_runtime_telegram_unavailable_pauses_choreography(
-    tmp_path: Path,
+async def test_a_runtime_disconnect_makes_the_service_refuse_new_work(
+    build_app,
 ) -> None:
-    settings = Settings(
-        api_id=1,
-        api_hash="redacted",
-        bot_token="redacted",
-        channel_id=-1001,
-        session_path=tmp_path / "service.session",
-        cookies_path=None,
-        artifact_root=tmp_path / "artifacts",
-        max_artifact_bytes=1024,
-        ytdlp_timeout_seconds=1,
-        tg_upload_timeout_seconds=1,
-        shutdown_grace_seconds=0.01,
-    )
-    telegram = UnavailableTelegram()
-    service = create_app(
-        settings,
-        AdapterFactories(telegram_factory=lambda _settings: telegram),
-    )
-    transport = ASGITransport(app=service)
-    async with AsyncClient(transport=transport, base_url="http://service") as client:
-        outside = await client.get("/health")
-        assert outside.status_code == 503
-        assert outside.json() == {
-            "ready": False,
-            "telegram_connected": False,
-        }
+    telegram = FakeTelegram()
+    service = build_app(telegram=telegram)
 
-        async with service.router.lifespan_context(service):
-            facts: list[str] = []
-            unavailable = asyncio.Event()
-            service.state.bus.on(
-                ARTIFACT_UPLOAD_FAILED,
-                lambda _event: facts.append(ARTIFACT_UPLOAD_FAILED),
-            )
+    async with service.router.lifespan_context(service):
+        transport = ASGITransport(app=service)
+        async with AsyncClient(transport=transport, base_url="http://s") as client:
+            assert (await client.get("/health")).status_code == 200
 
-            def record_unavailable(_event: object) -> None:
-                facts.append(TELEGRAM_UNAVAILABLE)
-                unavailable.set()
+            telegram.drop()
+            for _ in range(4):
+                await asyncio.sleep(0)
 
-            service.state.bus.on(TELEGRAM_UNAVAILABLE, record_unavailable)
-            first = await client.post(
-                "/jobs/upload",
-                files={"file": ("first.mp4", b"first", "video/mp4")},
-            )
-            assert first.status_code == 202
-            await asyncio.wait_for(telegram.upload_started.wait(), timeout=1)
-
-            second = await client.post(
-                "/jobs/upload",
-                files={"file": ("second.mp4", b"second", "video/mp4")},
-            )
-            assert second.status_code == 202
-            first_id = first.json()["id"]
-            second_id = second.json()["id"]
-            first_job_dir = settings.artifact_root / first_id
-            second_job_dir = settings.artifact_root / second_id
-            assert first_job_dir.is_dir()
-            assert second_job_dir.is_dir()
-
-            telegram.release_upload.set()
-            await asyncio.wait_for(unavailable.wait(), timeout=1)
-            await service.state.bus.wait_for_complete()
-            await asyncio.sleep(0)
-
-            current = await client.get(f"/jobs/{first_id}")
-            queued = await client.get(f"/jobs/{second_id}")
-            assert current.status_code == 200
-            assert current.json()["status"] == JobStatus.FAILED.value
-            assert queued.status_code == 200
-            assert queued.json()["status"] == JobStatus.WAITING.value
-            assert facts == [ARTIFACT_UPLOAD_FAILED, TELEGRAM_UNAVAILABLE]
-            assert service.state.scheduler.paused is True
-            assert service.state.scheduler.pending_count == 1
-            assert telegram.upload_calls == 1
-            assert first_job_dir.exists() is False
-            assert second_job_dir.is_dir()
-
-            rejected = await client.post(
-                "/jobs/youtube",
-                json={"url": "https://youtu.be/abcdefghijk"},
-            )
             health = await client.get("/health")
-            assert rejected.status_code == 503
             assert health.status_code == 503
-            assert health.json() == {
-                "ready": False,
-                "telegram_connected": False,
-            }
+            assert health.json() == {"ready": False, "telegram_connected": False}
+
+            refused = await client.post("/jobs/youtube", json={"url": VIDEO})
+            assert refused.status_code == 503
+            assert refused.json()["detail"]["code"] == "service_unavailable"
+
+            upload = await client.post(
+                "/jobs/upload", files={"file": ("clip.mp4", b"x", "video/mp4")}
+            )
+            assert upload.status_code == 503
+
+
+async def test_an_upload_failure_pauses_the_queue_and_keeps_the_job_visible(
+    build_app, settings: Settings
+) -> None:
+    runner = FakeYouTubeRunner()
+    telegram = FakeTelegram()
+    telegram.upload_errors = [ConnectionResetError("telegram vanished")]
+    service = build_app(runner=runner, telegram=telegram)
+
+    async with service.router.lifespan_context(service):
+        transport = ASGITransport(app=service)
+        async with AsyncClient(transport=transport, base_url="http://s") as client:
+            job_id = (
+                await client.post("/jobs/youtube", json={"url": VIDEO})
+            ).json()["id"]
+
+            job = None
+            for _ in range(200):
+                job = (await client.get(f"/jobs/{job_id}")).json()
+                if job["status"] == "failed":
+                    break
+                await asyncio.sleep(0.01)
+
+            assert job is not None and job["status"] == "failed"
+            assert job["error"]["code"] == "internal_error"
+            assert (await client.get(f"/jobs/{job_id}")).status_code == 200
+
+    assert not (settings.artifact_root / job_id).exists()
