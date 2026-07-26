@@ -38,8 +38,10 @@ TG_BOT_TOKEN=123456:AA...         # @BotFather, bot must be channel admin
 TG_CHANNEL_ID=-1001234567890      # @getidsbot
 
 # optional (defaults shown)
+TG_TOPIC_ID=                          # forum topic to post into; unset = General
 TG_SESSION_PATH=./yt2tg.session
-YTDLP_COOKIES_PATH=./yt-cookies.txt   # see step 4; silently ignored if missing
+YTDLP_COOKIES_PROFILE=a2tg            # Chrome/Brave profile to read cookies from; see step 4
+YTDLP_COOKIES_PATH=./yt-cookies.txt   # fallback when that profile is not found
 ARTIFACT_ROOT=/tmp/anything2telegram  # scratch dir for staged/downloaded files
 MAX_ARTIFACT_BYTES=2000000000         # hard cap per artifact (~2 GB)
 YTDLP_TIMEOUT_SECONDS=3600
@@ -63,29 +65,64 @@ YouTube now blocks most server-side downloads as bot traffic. Without cookies yo
 
 Cookies are also what unlocks age-restricted, region-locked, private, and members-only videos — a playlist containing them expands normally and each video downloads with your account's access.
 
-### Export them
+Nothing is exported and nothing is stored here: the server hands yt-dlp a browser profile name, and yt-dlp reads that profile's cookie database on every run. Log in once and the browser keeps the session alive from then on.
 
-You need a **Netscape-format `cookies.txt`** for `youtube.com`. Two ways:
+**macOS only.** On other platforms this falls back to the cookie file in [step 4b](#4b-cookie-file-fallback).
 
-**Browser extension (easiest)**
+### Set it up once
 
-1. Install a cookies.txt exporter — [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) (Chrome) or *cookies.txt* (Firefox).
-2. Log in to YouTube, open a **new incognito/private window**, log in there, and go to <https://www.youtube.com>.
-3. Export cookies for `youtube.com` to a file.
-4. **Close the incognito window without logging out.** This is what stops YouTube from rotating and invalidating the cookies you just exported.
+1. Create a profile named **`a2tg`** in Chrome or Brave — *profile icon → Add profile* — and call it exactly that.
+2. Log in to YouTube in that profile with the account that holds your memberships.
+3. Start the server. It logs which profile it found:
 
-**yt-dlp directly**
+   ```
+   INFO  Found profile 'a2tg' in brave (directory 'Profile 4')
+   INFO  Profile 'a2tg' is signed in to YouTube: yt-dlp will read its cookies as brave:Profile 4
+   ```
+
+   Two lines, because finding the profile and finding a login in it are separate things — a profile you created but never logged in to gets a `WARNING` on the second line and still runs, minus members-only.
+
+4. On the first download macOS asks to release the *Brave Safe Storage* (or *Chrome Safe Storage*) key from your keychain. Choose **Always Allow** — yt-dlp needs it to decrypt the cookies, and it will not ask again.
+
+That is all. The browser may stay open while jobs run; yt-dlp copies the cookie database before reading it.
+
+Prefer a different name? `YTDLP_COOKIES_PROFILE=whatever`. Blank turns the lookup off entirely.
+
+### Things that will bite you
+
+- **Sign the membership account in as that profile's *default* account.** yt-dlp uses the profile's first account. If the membership sits on a secondary one, members-only videos fail with a sign-in error and nothing can warn you — this cannot be detected without decrypting the cookies.
+- **Don't browse YouTube in the `a2tg` profile while jobs run.** YouTube rotates session cookies on use; a download that reads them mid-rotation fails and needs a retry.
+- Don't reuse your everyday profile. Google occasionally invalidates a session it sees used from two different clients, which signs you out of your own browser.
+- The profile must exist for the user the server runs as, and it is read at **startup** — create it, then start the server.
+
+### Verify
 
 ```bash
-yt-dlp --cookies-from-browser firefox --cookies yt-cookies.txt --skip-download \
+yt-dlp --cookies-from-browser "brave:Profile 3" --simulate "https://www.youtube.com/watch?v=<members-only-id>"
+```
+
+Use the directory name the startup log printed. Then submit one video through `/jobs/youtube` and check the job reaches `completed`.
+
+Symptoms and what they mean:
+
+| Log line | Meaning |
+|---|---|
+| `No Chrome or Brave profile is named 'a2tg'` | Profile missing, misspelled, or another OS user owns it |
+| `Profile 'a2tg' holds no YouTube login cookie` | Profile found, never logged in — public videos only |
+| `cannot decrypt v10 cookies: no key found` (yt-dlp) | Keychain prompt was denied or never answered |
+
+### 4b. Cookie file fallback
+
+A browser profile always wins. If none is found, the server falls back to a **Netscape-format `cookies.txt`** — useful on Linux, in Docker, or when you would rather not have a browser involved.
+
+Export it with a browser extension, or from a browser profile:
+
+```bash
+yt-dlp --cookies-from-browser "brave:Profile 3" --cookies yt-cookies.txt --skip-download \
   "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 ```
 
-Chrome/Edge/Brave lock their cookie DB while running, so quit the browser first — or just use the extension.
-
-### Install them
-
-Drop the file in the repo root as `yt-cookies.txt` (the default path), or point at it:
+Drop it in the repo root as `yt-cookies.txt` (the default path), or point at it:
 
 ```dotenv
 YTDLP_COOKIES_PATH=/absolute/path/to/yt-cookies.txt
@@ -97,26 +134,11 @@ Then lock it down — this file is a live login to your Google account:
 chmod 600 yt-cookies.txt
 ```
 
-### Verify
+Caveats specific to the file:
 
-Cookies are picked up **only if the file exists at startup**. If the path is missing, the server silently runs without cookies — no error, no warning. So:
-
-1. Place the file **before** starting the server.
-2. Restart the server after replacing it.
-3. Confirm it works by submitting one video and checking the job reaches `completed`.
-
-Sanity-check the file itself first:
-
-```bash
-yt-dlp --cookies yt-cookies.txt --simulate "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
-```
-
-### Keeping them alive
-
-- Cookies expire. Expect to re-export every few weeks, sooner if you log out or change your password.
-- Symptom of expiry: every YouTube job starts failing at the `producing` stage while `/health` still reports `ready: true`. Re-export and restart.
-- Set `YTDLP_COOKIES_PATH=` (blank) or delete the file to run without cookies.
-- Never commit the file. Keep it out of git.
+- Picked up **only if the file exists at startup**. Missing path, no error, no warning — the server just runs without cookies. Restart after replacing it.
+- Cookies expire. Expect to re-export every few weeks, sooner if you log out or change your password. Symptom: every YouTube job fails at the `producing` stage while `/health` still reports `ready: true`.
+- Never commit it.
 
 ## 5. Start the server
 
@@ -254,8 +276,8 @@ On `completed`, `telegram_message_id` is the message in your channel. On `failed
 
 - **Everything returns 503** — `GET /health`. `telegram_connected: false` means the bot token, api id/hash, or network is the problem; check the server log.
 - **Server will not start** — config error text names the offending variable. Session-path errors usually mean the directory is group/world-writable.
-- **YouTube job fails immediately** — almost always cookies. Confirm the file exists at `YTDLP_COOKIES_PATH`, was present when the server started, and still works: `yt-dlp --cookies yt-cookies.txt --simulate <url>`. See [step 4](#4-youtube-cookies).
-- **YouTube jobs worked yesterday, all fail today** — cookies expired. Re-export and restart the server.
+- **YouTube job fails immediately** — almost always cookies. Check the startup log for which profile was found, then reproduce with `yt-dlp --cookies-from-browser "<what it printed>" --simulate <url>`. See [step 4](#4-youtube-cookies).
+- **YouTube jobs worked yesterday, all fail today** — the profile got signed out of YouTube, or the keychain prompt was denied. Log in again with that browser profile; restart only if you changed the profile name.
 - **Upload completes but nothing in the channel** — the bot must be an admin of `TG_CHANNEL_ID`, and the id must be the `-100…` form.
 
 ## Development

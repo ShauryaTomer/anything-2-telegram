@@ -66,7 +66,8 @@ each component knows only which facts it consumes and which it produces.
 | File | Lines* | Responsibility |
 |---|---:|---|
 | [main.py](../anything2telegram/main.py) | 138 | Wiring. Builds every component in the FastAPI lifespan, connects them to one bus, owns readiness and shutdown drain. |
-| [config.py](../anything2telegram/config.py) | 152 | `Settings` frozen dataclass, parsed from `.env` + environment. Fails loudly at startup on bad config. |
+| [config.py](../anything2telegram/config.py) | 161 | `Settings` frozen dataclass, parsed from `.env` + environment. Fails loudly at startup on bad config. |
+| [browsers.py](../anything2telegram/browsers.py) | 109 | Translates a Chrome/Brave profile's display name into the `browser:directory` pair yt-dlp wants. macOS only. |
 | [domain.py](../anything2telegram/domain.py) | 120 | Vocabulary: enums, refs, snapshots, `StagedArtifact`, `UploadReservation`. Pure data, zero behaviour. |
 | [events.py](../anything2telegram/events.py) | 136 | The 14 topic-name constants and one frozen dataclass per event. The contract between components. |
 | [api/jobs.py](../anything2telegram/api/jobs.py) | 324 | HTTP surface. Validates input, translates exceptions to status codes, renders snapshots to JSON. |
@@ -258,6 +259,13 @@ never enters an event payload or an HTTP response.
 Above that, `YouTubeArtifactProducer` polls the download directory once a second while yt-dlp runs
 and aborts if the partial download outgrows `max_artifact_bytes`. `--max-filesize` alone is not
 enough, because yt-dlp only knows a size it was told in advance.
+
+Cookies are yt-dlp's problem too. `browsers.py` resolves `YTDLP_COOKIES_PROFILE` to a
+`browser:directory` pair at startup by reading Chromium's `Local State`, and everything after that —
+copying the locked cookie database, reading the macOS keychain, decrypting values — happens inside
+yt-dlp behind `--cookies-from-browser`. A found profile wins over `YTDLP_COOKIES_PATH`, and the two
+flags are never passed together: with a cookie file set, yt-dlp writes the merged jar back to it on
+exit, which would spill every cookie in the browser onto disk.
 
 **Telegram** — `TelegramClientAdapter` collapses Telethon's error surface into
 `TelegramUnavailableError` / `TelegramUploadError` / `TelegramClientError`, so no `telethon` symbol

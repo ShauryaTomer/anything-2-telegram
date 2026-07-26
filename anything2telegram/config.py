@@ -6,6 +6,8 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
+from .browsers import find_cookie_profile
+
 
 _LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
@@ -22,12 +24,15 @@ class Settings:
     channel_id: int
     session_path: Path
     cookies_path: Path | None
+    cookies_browser: str | None
     artifact_root: Path
     max_artifact_bytes: int
     ytdlp_timeout_seconds: float
     tg_upload_timeout_seconds: float
     shutdown_grace_seconds: float
     log_level: str = "INFO"
+    # Forum supergroups route a threadless message to their General topic.
+    topic_id: int | None = None
 
     @classmethod
     def from_env(cls, base_dir: Path) -> "Settings":
@@ -51,6 +56,7 @@ class Settings:
             channel_id=_integer(values, "TG_CHANNEL_ID"),
             session_path=session_path,
             cookies_path=_cookies_path(resolved_base, values),
+            cookies_browser=_cookies_browser(values),
             artifact_root=_artifact_root(resolved_base, values),
             max_artifact_bytes=_integer(
                 values, "MAX_ARTIFACT_BYTES", default="2000000000", positive=True
@@ -61,6 +67,7 @@ class Settings:
             ),
             shutdown_grace_seconds=_seconds(values, "SHUTDOWN_GRACE_SECONDS", "30"),
             log_level=_log_level(values),
+            topic_id=_optional_integer(values, "TG_TOPIC_ID"),
         )
 
 
@@ -93,6 +100,10 @@ def _integer(
     if positive and parsed <= 0:
         raise ConfigError(f"{key} must be positive")
     return parsed
+
+
+def _optional_integer(values: Mapping[str, str], key: str) -> int | None:
+    return _integer(values, key) if values.get(key, "").strip() else None
 
 
 def _seconds(values: Mapping[str, str], key: str, default: str) -> float:
@@ -141,6 +152,11 @@ def _cookies_path(base_dir: Path, values: Mapping[str, str]) -> Path | None:
         return None
     candidate = _path(base_dir, value)
     return candidate if candidate.is_file() else None
+
+
+def _cookies_browser(values: Mapping[str, str]) -> str | None:
+    name = values.get("YTDLP_COOKIES_PROFILE", "a2tg").strip()
+    return find_cookie_profile(name) if name else None
 
 
 def _artifact_root(base_dir: Path, values: Mapping[str, str]) -> Path:

@@ -87,10 +87,14 @@ async def _shutdown(service: FastAPI) -> None:
 def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(service: FastAPI):
+        # Handlers first: parsing the config logs which browser profile the
+        # YouTube cookies came from, and those records are lost to logging's
+        # last-resort handler if no handler exists when they are emitted.
+        _configure_logging("INFO")
         resolved = settings if settings is not None else Settings.from_env(
             APPLICATION_BASE
         )
-        _configure_logging(resolved.log_level)
+        logging.getLogger("anything2telegram").setLevel(resolved.log_level)
         state = service.state
         state.settings = resolved
         state.readiness = Readiness()

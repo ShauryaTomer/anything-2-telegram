@@ -44,6 +44,7 @@ class TelegramClientAdapter:
         )
         self._bot_token = settings.bot_token
         self._entity = settings.channel_id
+        self._topic_id = settings.topic_id
 
     @property
     def is_connected(self) -> bool:
@@ -76,7 +77,9 @@ class TelegramClientAdapter:
 
     async def send_message(self, text: str) -> None:
         try:
-            await self._client.send_message(self._entity, text)
+            await self._client.send_message(
+                self._entity, text, reply_to=self._topic_id
+            )
         except _CONNECTION_ERRORS:
             raise TelegramUnavailableError() from None
         except Exception:
@@ -103,6 +106,7 @@ class TelegramClientAdapter:
                 handle,
                 caption=caption,
                 supports_streaming=supports_streaming,
+                reply_to=self._topic_id,
             )
             chat_id = message.chat_id
             message_id = message.id

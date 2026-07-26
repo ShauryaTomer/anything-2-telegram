@@ -134,6 +134,7 @@ class YouTubeArtifactProducer:
         self._timeout_seconds = settings.ytdlp_timeout_seconds
         self._max_artifact_bytes = settings.max_artifact_bytes
         self._cookies_path = settings.cookies_path
+        self._cookies_browser = settings.cookies_browser
         bus.on(
             YOUTUBE_PLAYLIST_EXPANSION_REQUESTED,
             self.handle_playlist_expansion_requested,
@@ -292,7 +293,7 @@ class YouTubeArtifactProducer:
             "--remote-components",
             "ejs:github",
             "-o",
-            str(directory / "%(title).80s.%(ext)s"),
+            str(directory / "%(title).100s.%(ext)s"),
             *self._cookie_args(),
             source_url,
         ]
@@ -325,6 +326,10 @@ class YouTubeArtifactProducer:
                 await asyncio.gather(runner_task, return_exceptions=True)
 
     def _cookie_args(self) -> list[str]:
+        # Never both: given a cookie file, yt-dlp writes the merged jar back to
+        # it on exit, which would spill every cookie in the browser onto disk.
+        if self._cookies_browser is not None:
+            return ["--cookies-from-browser", self._cookies_browser]
         if self._cookies_path is None:
             return []
         return ["--cookies", str(self._cookies_path)]

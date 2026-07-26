@@ -118,6 +118,7 @@ def settings_for(tmp_path: Path, **overrides: object) -> Settings:
         "channel_id": -1001,
         "session_path": tmp_path / "unused.session",
         "cookies_path": None,
+        "cookies_browser": None,
         "artifact_root": tmp_path / "artifacts",
         "max_artifact_bytes": 4096,
         "ytdlp_timeout_seconds": 2,

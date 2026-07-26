@@ -380,6 +380,26 @@ async def test_cookies_are_passed_only_when_configured(
     assert args[args.index("--cookies") + 1] == str(cookies)
 
 
+async def test_a_browser_profile_replaces_the_cookie_file(
+    bus, storage, recorder, tmp_path
+) -> None:
+    cookies = tmp_path / "cookies.txt"
+    cookies.write_text("# netscape")
+    from_browser = settings_for(
+        tmp_path, cookies_path=cookies, cookies_browser="brave:Profile 3"
+    )
+    runner = ScriptedRunner(writes_file("clip.mp4"))
+    make_producer(bus, storage, runner, from_browser)
+
+    bus.emit("youtube.download.requested", download_request())
+    await settle(bus)
+
+    args = runner.calls[0]
+    assert args[args.index("--cookies-from-browser") + 1] == "brave:Profile 3"
+    # Both flags together would make yt-dlp write the browser's cookies to disk.
+    assert "--cookies" not in args
+
+
 @pytest.mark.parametrize(
     "result,code",
     [

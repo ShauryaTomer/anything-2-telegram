@@ -10,6 +10,10 @@
   Primary source for `subscribe`, `unsubscribe`, publishers, listener validation, and topic APIs.
 - [Python `asyncio` coroutines and tasks](https://docs.python.org/3/library/asyncio-task.html)
   Primary source for coroutine creation, `await`, `create_task`, task ownership, and `asyncio.run` constraints.
+- [Python `asyncio` queues](https://docs.python.org/3/library/asyncio-queue.html)
+  Primary source for `maxsize` backpressure, `put`/`get` blocking semantics, and producer/consumer task pairs. Basis for bounded-prefetch designs.
+- [Python `asyncio` synchronization primitives](https://docs.python.org/3/library/asyncio-sync.html)
+  Primary source for `Lock` semantics and FIFO waiter ordering when serializing coroutines.
 - [pyee documentation](https://pyee.readthedocs.io/en/latest/)
   Primary source for pyee's EventEmitter model and supported async implementations.
 - [pyee API: `AsyncIOEventEmitter`](https://pyee.readthedocs.io/en/latest/api/#pyee.asyncio.AsyncIOEventEmitter)
@@ -18,6 +22,10 @@
   Primary source for current import paths and lifecycle API additions.
 - [Enterprise Integration Patterns: Asynchronous Request-Response](https://www.enterpriseintegrationpatterns.com/patterns/conversation/RequestResponse.html)
   Primary pattern reference for request/reply messaging and its correlation requirements.
+- [Enterprise Integration Patterns: Command Message](https://www.enterpriseintegrationpatterns.com/patterns/messaging/CommandMessage.html)
+  Primary reference for messages that instruct a named consumer to act. Use to classify `*_REQUESTED` events.
+- [Enterprise Integration Patterns: Event Message](https://www.enterpriseintegrationpatterns.com/patterns/messaging/EventMessage.html)
+  Primary reference for messages that report a fact to zero-to-many observers. Use to classify `*_READY` / `*_UPLOADED` events.
 - [Azure Architecture Center: Asynchronous Request-Reply](https://learn.microsoft.com/en-us/azure/architecture/patterns/asynchronous-request-reply)
   Trusted reference for when long-running work justifies splitting acceptance from completion, including HTTP 202 and job-status resources.
 - Gamma, Helm, Johnson, Vlissides, _Design Patterns: Elements of Reusable Object-Oriented Software_, Observer chapter.

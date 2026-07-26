@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from anything2telegram import config
 from anything2telegram.config import ConfigError, Settings
 
 
@@ -23,6 +24,8 @@ def base_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     for key, value in REQUIRED.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    # The real browser profiles of whoever runs the suite are not an input.
+    monkeypatch.setattr(config, "find_cookie_profile", lambda _name: None)
     return tmp_path
 
 
@@ -138,6 +141,28 @@ def test_cookies_are_used_only_when_the_file_exists(
 
     monkeypatch.setenv("YTDLP_COOKIES_PATH", "  ")
     assert Settings.from_env(base_dir).cookies_path is None
+
+
+def test_the_cookie_profile_is_looked_up_by_name(
+    base_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    looked_up: list[str] = []
+
+    def fake_find(name: str) -> str | None:
+        looked_up.append(name)
+        return "brave:Profile 3"
+
+    monkeypatch.setattr(config, "find_cookie_profile", fake_find)
+    assert Settings.from_env(base_dir).cookies_browser == "brave:Profile 3"
+    assert looked_up == ["a2tg"]
+
+    monkeypatch.setenv("YTDLP_COOKIES_PROFILE", "work")
+    Settings.from_env(base_dir)
+    assert looked_up[-1] == "work"
+
+    monkeypatch.setenv("YTDLP_COOKIES_PROFILE", "  ")
+    assert Settings.from_env(base_dir).cookies_browser is None
+    assert looked_up[-1] == "work"
 
 
 def test_secrets_are_kept_out_of_the_repr(base_dir: Path) -> None:

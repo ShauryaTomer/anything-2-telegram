@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -157,8 +158,26 @@ async def test_upload_pre_uploads_with_large_parts_then_sends_to_the_channel(
             "file": "handle",
             "caption": "hello",
             "supports_streaming": True,
+            "reply_to": None,
         }
     ]
+
+
+async def test_a_configured_topic_is_used_as_the_upload_thread(
+    telethon, settings: Settings, tmp_path: Path
+) -> None:
+    artifact = tmp_path / "clip.mp4"
+    artifact.write_bytes(b"payload")
+    adapter = TelegramClientAdapter(replace(settings, topic_id=7))
+
+    await adapter.upload(
+        artifact,
+        caption=None,
+        supports_streaming=False,
+        progress_callback=lambda _s, _t: None,
+    )
+
+    assert telethon[0].send_calls[0]["reply_to"] == 7
 
 
 async def test_an_upload_rejection_is_reported_as_an_upload_error(
