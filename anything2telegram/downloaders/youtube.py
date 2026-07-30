@@ -42,6 +42,7 @@ YTDLP_FORMAT = (
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _PLAYLIST_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 _FINAL_MEDIA_SUFFIXES = frozenset({".mp4", ".mkv", ".webm"})
+_UNSAFE_NAME = re.compile(r"[/\x00-\x1f]+")
 _YTDLP_COMMAND = (sys.executable, "-m", "yt_dlp")
 _QUOTA_POLL_SECONDS = 1.0
 
@@ -389,6 +390,8 @@ class YouTubeArtifactProducer:
         if len(candidates) != 1:
             raise RuntimeError("download output is missing or ambiguous")
         path = candidates[0]
+        caption = caption_prefix + path.stem.replace("_", " ")
+        path = path.rename(path.with_name(_caption_filename(caption, path.suffix)))
         return StagedArtifact(
             job_id,
             artifact_id,
@@ -396,7 +399,7 @@ class YouTubeArtifactProducer:
             path.name,
             mimetypes.guess_type(path.name)[0],
             path.stat().st_size,
-            caption_prefix + path.stem.replace("_", " "),
+            caption,
         )
 
     def _emit_playlist_failure(
@@ -479,6 +482,16 @@ def _caption_prefix(entry: dict) -> str:
         else:
             parts.append(str(index))
     return " - ".join(parts) + " - " if parts else ""
+
+
+def _caption_filename(caption: str, suffix: str) -> str:
+    """The caption as a filename, so Telegram shows the caption as the name too."""
+    # ponytail: only the bytes a POSIX path cannot hold are replaced; keep the
+    # spaces, they are the point. The 255-byte cap is the filesystem's limit.
+    stem = _UNSAFE_NAME.sub("_", caption).strip(" .")
+    limit = 255 - len(suffix.encode())
+    stem = stem.encode()[:limit].decode(errors="ignore").rstrip(" .")
+    return (stem or "video") + suffix
 
 
 class _PlaylistParseError(ValueError):

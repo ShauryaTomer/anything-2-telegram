@@ -16,15 +16,13 @@ You drive it entirely from the FastAPI docs page: start the server, open `/docs`
 - A Telegram API app + bot that is an **admin** of the destination channel
 - YouTube cookies — see [step 4](#4-youtube-cookies)
 
+
+
 ## 2. Install
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
+uv sync
 ```
-
-Reproducible install instead: `pip install -r requirements.lock` then `pip install -e . --no-deps`.
 
 ## 3. Configure
 
@@ -55,9 +53,11 @@ Notes:
 - The session file is created with `0600` and its parent directory must not be group/world-writable — the server refuses to start otherwise.
 - `ARTIFACT_ROOT` cannot be a filesystem root or the repo root.
 - `LOG_LEVEL` applies to this application's loggers only, so `DEBUG` will not also
-  turn on Telethon's internal chatter. When a job fails, the log line carries the job
-  id and yt-dlp's own error text; the HTTP response deliberately keeps only a generic
-  code, since stderr can contain cookie paths and signed URLs.
+turn on Telethon's internal chatter. When a job fails, the log line carries the job
+id and yt-dlp's own error text; the HTTP response deliberately keeps only a generic
+code, since stderr can contain cookie paths and signed URLs.
+
+
 
 ## 4. YouTube cookies
 
@@ -71,17 +71,14 @@ Nothing is exported and nothing is stored here: the server hands yt-dlp a browse
 
 ### Set it up once
 
-1. Create a profile named **`a2tg`** in Chrome or Brave — *profile icon → Add profile* — and call it exactly that.
+1. Create a profile named `a2tg` in Chrome or Brave — *profile icon → Add profile* — and call it exactly that.
 2. Log in to YouTube in that profile with the account that holds your memberships.
 3. Start the server. It logs which profile it found:
-
-   ```
+  ```
    INFO  Found profile 'a2tg' in brave (directory 'Profile 4')
    INFO  Profile 'a2tg' is signed in to YouTube: yt-dlp will read its cookies as brave:Profile 4
-   ```
-
+  ```
    Two lines, because finding the profile and finding a login in it are separate things — a profile you created but never logged in to gets a `WARNING` on the second line and still runs, minus members-only.
-
 4. On the first download macOS asks to release the *Brave Safe Storage* (or *Chrome Safe Storage*) key from your keychain. Choose **Always Allow** — yt-dlp needs it to decrypt the cookies, and it will not ask again.
 
 That is all. The browser may stay open while jobs run; yt-dlp copies the cookie database before reading it.
@@ -91,9 +88,11 @@ Prefer a different name? `YTDLP_COOKIES_PROFILE=whatever`. Blank turns the looku
 ### Things that will bite you
 
 - **Sign the membership account in as that profile's *default* account.** yt-dlp uses the profile's first account. If the membership sits on a secondary one, members-only videos fail with a sign-in error and nothing can warn you — this cannot be detected without decrypting the cookies.
-- **Don't browse YouTube in the `a2tg` profile while jobs run.** YouTube rotates session cookies on use; a download that reads them mid-rotation fails and needs a retry.
+- **Don't browse YouTube in the** `a2tg` **profile while jobs run.** YouTube rotates session cookies on use; a download that reads them mid-rotation fails and needs a retry.
 - Don't reuse your everyday profile. Google occasionally invalidates a session it sees used from two different clients, which signs you out of your own browser.
 - The profile must exist for the user the server runs as, and it is read at **startup** — create it, then start the server.
+
+
 
 ### Verify
 
@@ -105,15 +104,19 @@ Use the directory name the startup log printed. Then submit one video through `/
 
 Symptoms and what they mean:
 
-| Log line | Meaning |
-|---|---|
-| `No Chrome or Brave profile is named 'a2tg'` | Profile missing, misspelled, or another OS user owns it |
-| `Profile 'a2tg' holds no YouTube login cookie` | Profile found, never logged in — public videos only |
-| `cannot decrypt v10 cookies: no key found` (yt-dlp) | Keychain prompt was denied or never answered |
+
+| Log line                                            | Meaning                                                 |
+| --------------------------------------------------- | ------------------------------------------------------- |
+| `No Chrome or Brave profile is named 'a2tg'`        | Profile missing, misspelled, or another OS user owns it |
+| `Profile 'a2tg' holds no YouTube login cookie`      | Profile found, never logged in — public videos only     |
+| `cannot decrypt v10 cookies: no key found` (yt-dlp) | Keychain prompt was denied or never answered            |
+
+
+
 
 ### 4b. Cookie file fallback
 
-A browser profile always wins. If none is found, the server falls back to a **Netscape-format `cookies.txt`** — useful on Linux, in Docker, or when you would rather not have a browser involved.
+A browser profile always wins. If none is found, the server falls back to a **Netscape-format** `cookies.txt` — useful on Linux, in Docker, or when you would rather not have a browser involved.
 
 Export it with a browser extension, or from a browser profile:
 
@@ -140,6 +143,8 @@ Caveats specific to the file:
 - Cookies expire. Expect to re-export every few weeks, sooner if you log out or change your password. Symptom: every YouTube job fails at the `producing` stage while `/health` still reports `ready: true`.
 - Never commit it.
 
+
+
 ## 5. Start the server
 
 ```bash
@@ -152,7 +157,7 @@ Startup connects to Telegram before accepting work. If the config or the Telegra
 
 ## 6. Use it from `/docs`
 
-Open <http://127.0.0.1:8000/docs>. Swagger UI lists every endpoint with a **Try it out** button.
+Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs). Swagger UI lists every endpoint with a **Try it out** button.
 
 ### Check it is alive — `GET /health`
 
@@ -190,10 +195,12 @@ Bad or non-YouTube URL → `422 unsupported_youtube_url`.
 
 `multipart/form-data`:
 
-| field     | required | notes                          |
-|-----------|----------|--------------------------------|
-| `file`    | yes      | exactly one file               |
+
+| field     | required | notes                                 |
+| --------- | -------- | ------------------------------------- |
+| `file`    | yes      | exactly one file                      |
 | `caption` | no       | text attached to the Telegram message |
+
 
 In `/docs` this renders as a file picker plus a caption box.
 
@@ -251,6 +258,8 @@ On `completed`, `telegram_message_id` is the message in your channel. On `failed
 3. `GET /jobs/{id}` every few seconds until `completed` or `failed`
 4. Check your Telegram channel
 
+
+
 ## Behaviour worth knowing
 
 - **One at a time.** Work runs strictly serially; everything else queues. Submitting a 200-video playlist is fine, it just takes a while.
@@ -260,17 +269,23 @@ On `completed`, `telegram_message_id` is the message in your channel. On `failed
 - **Graceful shutdown.** `Ctrl+C` stops accepting new work and gives in-flight work `SHUTDOWN_GRACE_SECONDS` to finish before cancelling.
 - **Quality cap.** YouTube downloads are capped at 1080p mp4 (h264+m4a where available).
 
+
+
 ## Error codes
 
-| HTTP | code | meaning |
-|------|------|---------|
-| 422 | `unsupported_youtube_url` | URL is not a supported YouTube video/playlist |
-| 422 | `invalid_request` | Malformed body or upload form |
-| 422 | `invalid_filename` | Upload filename rejected |
-| 413 | `staging_oversize` | File exceeds `MAX_ARTIFACT_BYTES` |
-| 503 | `service_unavailable` | Not ready — check `GET /health` |
-| 507 | `staging_disk_full` | No space under `ARTIFACT_ROOT` |
-| 500 | `submission_failed`, `upload_staging_failed`, `upload_reservation_failed`, `upload_enqueue_failed`, `internal_error` | Server-side failure, see server logs |
+
+| HTTP | code                                                                                                                 | meaning                                       |
+| ---- | -------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| 422  | `unsupported_youtube_url`                                                                                            | URL is not a supported YouTube video/playlist |
+| 422  | `invalid_request`                                                                                                    | Malformed body or upload form                 |
+| 422  | `invalid_filename`                                                                                                   | Upload filename rejected                      |
+| 413  | `staging_oversize`                                                                                                   | File exceeds `MAX_ARTIFACT_BYTES`             |
+| 503  | `service_unavailable`                                                                                                | Not ready — check `GET /health`               |
+| 507  | `staging_disk_full`                                                                                                  | No space under `ARTIFACT_ROOT`                |
+| 500  | `submission_failed`, `upload_staging_failed`, `upload_reservation_failed`, `upload_enqueue_failed`, `internal_error` | Server-side failure, see server logs          |
+
+
+
 
 ## Troubleshooting
 
@@ -279,6 +294,8 @@ On `completed`, `telegram_message_id` is the message in your channel. On `failed
 - **YouTube job fails immediately** — almost always cookies. Check the startup log for which profile was found, then reproduce with `yt-dlp --cookies-from-browser "<what it printed>" --simulate <url>`. See [step 4](#4-youtube-cookies).
 - **YouTube jobs worked yesterday, all fail today** — the profile got signed out of YouTube, or the keychain prompt was denied. Log in again with that browser profile; restart only if you changed the profile name.
 - **Upload completes but nothing in the channel** — the bot must be an admin of `TG_CHANNEL_ID`, and the id must be the `-100…` form.
+
+
 
 ## Development
 
