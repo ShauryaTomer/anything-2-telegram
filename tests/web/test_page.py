@@ -464,3 +464,28 @@ async def test_copy_button_appears_only_for_rows_with_an_original_url() -> None:
 
     body = response.text
     assert body.count('class="copy"') == 1
+
+
+async def test_copy_button_url_with_an_apostrophe_is_escaped_not_injected() -> None:
+    """Regression: the copy button must never interpolate the URL into a JS
+    string literal, where an escaped apostrophe (decoded by the browser
+    before the JS parser runs) could break out and execute arbitrary code."""
+    bus = AsyncIOEventEmitter()
+    tracker = JobTracker()
+    tracker.register(bus)
+    malicious = "https://www.youtube.com/watch?v=aaaaaaaaaaa&z='-alert(1)-'"
+
+    bus.emit(
+        JOB_QUEUED,
+        JobQueued(uuid4(), None, SourceKind.YOUTUBE, malicious, None, AT),
+    )
+
+    async with await _client(tracker) as client:
+        response = await client.get("/web/queue")
+
+    body = response.text
+    assert "onclick" not in body
+    assert (
+        'data-url="https://www.youtube.com/watch?v=aaaaaaaaaaa&amp;z=&#39;-alert(1)-&#39;"'
+        in body
+    )
