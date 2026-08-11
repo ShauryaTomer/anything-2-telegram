@@ -5,7 +5,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -33,6 +33,22 @@ def _query_or_tail(url: str, param: str) -> str:
     return values[0] if values else url.rsplit("/", 1)[-1]
 
 
+def _parse_open(raw: str) -> tuple[frozenset[str], str]:
+    """The open set as ids (for membership checks) and its canonical query value."""
+    ids = frozenset(part for part in raw.split(",") if part)
+    return ids, ",".join(sorted(ids))
+
+
+def _toggle_open(open_ids: frozenset[str], batch_id: object) -> str:
+    """The open set with batch_id's membership flipped, as a query value."""
+    next_ids = set(open_ids)
+    next_ids.symmetric_difference_update({str(batch_id)})
+    return ",".join(sorted(next_ids))
+
+
+_TEMPLATES.env.globals["toggle_open"] = _toggle_open
+
+
 def _ui_offset(raw: object) -> int | None:
     """Parse the 1-indexed offset form field; None means invalid, not absent."""
     if raw is None:
@@ -53,12 +69,15 @@ def _queue_entries(request: Request) -> tuple[object, ...]:
     return tracker.list_queue()
 
 
-def _row_context(request: Request) -> dict[str, object]:
+def _row_context(request: Request, open: str = "") -> dict[str, object]:
     """Live progress and completed-upload links, keyed by job id.
 
     The template has no app.state access, so every registry/settings read
-    happens here and gets handed over as plain per-job mappings.
+    happens here and gets handed over as plain per-job mappings. `open` is
+    the raw ?open= query value, parsed once here for all four routes that
+    render queue.html so their notion of the open set never drifts apart.
     """
+    open_ids, open_param = _parse_open(open)
     entries = _queue_entries(request)
     registry = getattr(request.app.state, "progress", None)
     settings = getattr(request.app.state, "settings", None)
@@ -87,16 +106,23 @@ def _row_context(request: Request) -> dict[str, object]:
         else:
             collect(entry)
 
-    return {"entries": entries, "progress": progress, "links": links}
+    return {
+        "entries": entries,
+        "progress": progress,
+        "links": links,
+        "open": open_ids,
+        "open_param": open_param,
+    }
 
 
 def _submit_response(
-    request: Request, flash_code: str | None, flash_message: str | None
+    request: Request, flash_code: str | None, flash_message: str | None, open: str = ""
 ) -> HTMLResponse:
     return _TEMPLATES.TemplateResponse(
         request,
         "submit_response.html",
-        _row_context(request) | {"flash_code": flash_code, "flash_message": flash_message},
+        _row_context(request, open)
+        | {"flash_code": flash_code, "flash_message": flash_message},
     )
 
 
@@ -117,15 +143,15 @@ def register_web_routes(app: FastAPI) -> None:
     )
 
     @app.get("/", response_class=HTMLResponse)
-    async def page(request: Request) -> HTMLResponse:
-        return _TEMPLATES.TemplateResponse(request, "page.html", _row_context(request))
+    async def page(request: Request, open: str = Query("")) -> HTMLResponse:
+        return _TEMPLATES.TemplateResponse(request, "page.html", _row_context(request, open))
 
     @app.get("/web/queue", response_class=HTMLResponse)
-    async def queue_fragment(request: Request) -> HTMLResponse:
-        return _TEMPLATES.TemplateResponse(request, "queue.html", _row_context(request))
+    async def queue_fragment(request: Request, open: str = Query("")) -> HTMLResponse:
+        return _TEMPLATES.TemplateResponse(request, "queue.html", _row_context(request, open))
 
     @app.post("/web/youtube", response_class=HTMLResponse)
-    async def submit_youtube(request: Request) -> HTMLResponse:
+    async def submit_youtube(request: Request, open: str = Query("")) -> HTMLResponse:
         # Parsed from the raw form (not a typed FastAPI Form(...) param): a
         # binding failure there raises RequestValidationError before this body
         # runs, which the app-wide handler turns into a JSON 422 — breaking
@@ -133,19 +159,19 @@ def register_web_routes(app: FastAPI) -> None:
         form = await request.form()
         url = form.get("url")
         if not isinstance(url, str) or not url:
-            return _submit_response(request, "422", "Not a supported YouTube URL.")
+            return _submit_response(request, "422", "Not a supported YouTube URL.", open)
 
         offset = _ui_offset(form.get("offset"))
         if offset is None:
-            return _submit_response(request, "422", "Request is invalid.")
+            return _submit_response(request, "422", "Request is invalid.", open)
 
         try:
             kind = classify_youtube_url(url)
         except UnsupportedYouTubeUrl:
-            return _submit_response(request, "422", "Not a supported YouTube URL.")
+            return _submit_response(request, "422", "Not a supported YouTube URL.", open)
 
         if not _is_ready(request):
-            return _submit_response(request, "503", _NOT_READY)
+            return _submit_response(request, "503", _NOT_READY, open)
 
         scheduler = request.app.state.scheduler
         try:
@@ -154,25 +180,25 @@ def register_web_routes(app: FastAPI) -> None:
             else:
                 scheduler.submit_playlist(url, offset - 1)
         except SchedulerError:
-            return _submit_response(request, "503", _NOT_READY)
+            return _submit_response(request, "503", _NOT_READY, open)
 
-        return _submit_response(request, None, None)
+        return _submit_response(request, None, None, open)
 
     @app.post("/web/upload", response_class=HTMLResponse)
-    async def submit_upload(request: Request) -> HTMLResponse:
+    async def submit_upload(request: Request, open: str = Query("")) -> HTMLResponse:
         if not _is_ready(request):
-            return _submit_response(request, "503", _NOT_READY)
+            return _submit_response(request, "503", _NOT_READY, open)
 
         state = request.app.state
         max_bytes = state.settings.max_artifact_bytes
         if _declared_size(request) > max_bytes:
             return _submit_response(
-                request, "413", "The file is larger than the staging limit."
+                request, "413", "The file is larger than the staging limit.", open
             )
 
         try:
             await _stage_upload_and_enqueue(request, state, max_bytes)
         except _UploadSubmitError as error:
-            return _submit_response(request, str(error.status_code), error.message)
+            return _submit_response(request, str(error.status_code), error.message, open)
 
-        return _submit_response(request, None, None)
+        return _submit_response(request, None, None, open)

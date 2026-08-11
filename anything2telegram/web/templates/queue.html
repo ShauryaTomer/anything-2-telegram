@@ -22,7 +22,7 @@
     {{ status.value }}
   {%- endif -%}
 {%- endmacro %}
-<div id="queue" hx-get="/web/queue" hx-trigger="every 2s" hx-swap="outerHTML">
+<div id="queue" hx-get="/web/queue{% if open_param %}?open={{ open_param }}{% endif %}" hx-trigger="every 2s" hx-swap="outerHTML">
   <table>
     <thead>
       <tr><th>Source</th><th>Status</th><th>Progress</th><th>Link</th></tr>
@@ -33,12 +33,21 @@
       {% endif %}
       {% for entry in entries %}
         {% if entry.jobs is defined %}
+        {% set expanded = entry.batch.id|string in open %}
         <tr>
-          <td>{{ source_cell(entry.batch.title, entry.batch.source_url|playlist_id, entry.batch.source_url) }}</td>
+          <td>
+            {%- if entry.jobs -%}
+            <a class="toggle" hx-get="/web/queue?open={{ toggle_open(open, entry.batch.id) }}" hx-target="#queue" hx-swap="outerHTML">{{ "▾" if expanded else "▸" }}</a>
+            {%- else -%}
+            <span class="toggle"></span>
+            {%- endif %}
+            {{ source_cell(entry.batch.title, entry.batch.source_url|playlist_id, entry.batch.source_url) }}
+          </td>
           <td>{{ status_cell(entry.batch.status, entry.batch.error) }}</td>
           <td>{% if entry.batch.status.value == "expanding" %}waiting{% else %}{{ entry.batch.completed }}/{{ entry.batch.total_jobs }} done{% endif %}</td>
           <td></td>
         </tr>
+        {% if expanded %}
         {% set width = entry.jobs|length|string|length %}
         {% for job in entry.jobs %}
         <tr class="queue-child">
@@ -48,6 +57,7 @@
           <td>{{ link_cell(job) }}</td>
         </tr>
         {% endfor %}
+        {% endif %}
         {% else %}
         <tr>
           <td>

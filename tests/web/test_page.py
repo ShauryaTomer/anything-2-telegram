@@ -255,7 +255,7 @@ async def test_batch_children_are_numbered_zero_padded_to_the_batchs_width() -> 
     bus.emit(BATCH_JOBS_CREATED, BatchJobsCreated(BATCH, children, 0, AT))
 
     async with await _client(tracker) as client:
-        response = await client.get("/web/queue")
+        response = await client.get(f"/web/queue?open={BATCH}")
 
     body = response.text
     assert f'03/10 <span class="muted">{children[2]}</span>' in body
@@ -266,8 +266,8 @@ async def test_page_and_fragment_render_the_same_live_queue_rows() -> None:
     tracker = _tracker_with_a_standalone_job_and_a_batch()
 
     async with await _client(tracker) as client:
-        page = await client.get("/")
-        fragment = await client.get("/web/queue")
+        page = await client.get(f"/?open={BATCH}")
+        fragment = await client.get(f"/web/queue?open={BATCH}")
 
     assert page.status_code == fragment.status_code == 200
     for body in (page.text, fragment.text):
@@ -432,7 +432,7 @@ async def test_source_cell_shows_names_and_falls_back_to_muted_identifiers() -> 
     )
 
     async with await _client(tracker) as client:
-        response = await client.get("/web/queue")
+        response = await client.get(f"/web/queue?open={BATCH}")
 
     body = response.text
     assert "Rust Fundamentals" in body
@@ -592,7 +592,7 @@ async def test_aggregate_count_on_partially_completed_batch_carries_no_title() -
     )
 
     async with await _client(tracker) as client:
-        response = await client.get("/web/queue")
+        response = await client.get(f"/web/queue?open={batch_id}")
 
     body = response.text
     # The failed child should have its own title attribute in its status cell
@@ -607,3 +607,84 @@ async def test_aggregate_count_on_partially_completed_batch_carries_no_title() -
     assert batch_row is not None, "Batch row found"
     counts_cell = batch_row.group(1)
     assert 'title=' not in counts_cell, "Aggregate counts cell should not have a title attribute"
+
+
+def _tracker_with_two_batches() -> tuple[JobTracker, UUID, UUID]:
+    bus = AsyncIOEventEmitter()
+    tracker = JobTracker()
+    tracker.register(bus)
+    batch_x, batch_y = uuid4(), uuid4()
+    for batch_id, tag in ((batch_x, "x"), (batch_y, "y")):
+        bus.emit(BATCH_CREATED, BatchCreated(batch_id, f"https://youtu.be/playlist?list={tag}", AT))
+        child = uuid4()
+        bus.emit(
+            JOB_QUEUED,
+            JobQueued(child, batch_id, SourceKind.YOUTUBE, f"https://youtu.be/{tag}-child", None, AT),
+        )
+        bus.emit(BATCH_JOBS_CREATED, BatchJobsCreated(batch_id, (child,), 0, AT))
+    return tracker, batch_x, batch_y
+
+
+async def test_batch_children_are_collapsed_by_default() -> None:
+    tracker = _tracker_with_a_standalone_job_and_a_batch()
+
+    async with await _client(tracker) as client:
+        response = await client.get("/web/queue")
+
+    assert response.status_code == 200
+    assert 'class="queue-child"' not in response.text
+
+
+async def test_open_query_param_expands_exactly_the_named_batch() -> None:
+    tracker, batch_x, batch_y = _tracker_with_two_batches()
+
+    async with await _client(tracker) as client:
+        response = await client.get(f"/web/queue?open={batch_x}")
+
+    body = response.text
+    assert response.status_code == 200
+    assert "https://youtu.be/x-child" in body
+    assert "https://youtu.be/y-child" not in body
+
+
+async def test_unknown_batch_ids_in_open_are_ignored_not_rejected() -> None:
+    tracker = _tracker_with_a_standalone_job_and_a_batch()
+
+    async with await _client(tracker) as client:
+        response = await client.get("/web/queue?open=not-a-real-id,also-garbage")
+
+    assert response.status_code == 200
+    assert 'class="queue-child"' not in response.text
+
+
+async def test_queue_fragment_restates_the_open_set_in_its_own_poll_url() -> None:
+    tracker = _tracker_with_a_standalone_job_and_a_batch()
+
+    async with await _client(tracker) as client:
+        response = await client.get(f"/web/queue?open={BATCH}")
+
+    assert f'hx-get="/web/queue?open={BATCH}"' in response.text
+
+
+async def test_submit_response_carries_the_open_set_through() -> None:
+    tracker = _tracker_with_a_standalone_job_and_a_batch()
+
+    async with await _client(tracker) as client:
+        response = await client.post(f"/web/youtube?open={BATCH}", data={"url": "not-a-url"})
+
+    assert response.status_code == 200
+    body = response.text
+    assert body.count('class="queue-child"') == 2
+    assert f'hx-get="/web/queue?open={BATCH}"' in body
+
+
+async def test_page_reload_with_open_query_param_renders_already_expanded() -> None:
+    tracker, batch_x, batch_y = _tracker_with_two_batches()
+
+    async with await _client(tracker) as client:
+        response = await client.get(f"/?open={batch_x},{batch_y}")
+
+    body = response.text
+    assert response.status_code == 200
+    assert "https://youtu.be/x-child" in body
+    assert "https://youtu.be/y-child" in body
