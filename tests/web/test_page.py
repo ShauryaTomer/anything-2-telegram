@@ -566,7 +566,7 @@ async def test_aggregate_count_on_partially_completed_batch_carries_no_title() -
     )
     bus.emit(BATCH_JOBS_CREATED, BatchJobsCreated(batch_id, (child_1, child_2), 0, AT))
 
-    # Emit a failure for one child
+    # Emit a failure for child_1
     from anything2telegram.domain import ErrorInfo
     from anything2telegram.events import ARTIFACT_PRODUCTION_FAILED, ArtifactProductionFailed
 
@@ -577,15 +577,33 @@ async def test_aggregate_count_on_partially_completed_batch_carries_no_title() -
         ArtifactProductionFailed(child_1, None, error, AT),
     )
 
+    # Drive child_2 to COMPLETED to reach PARTIALLY_COMPLETED batch status (one completed + one failed)
+    artifact_id_2 = uuid4()
+    bus.emit(JOB_STARTED, JobStarted(child_2, JobPhase.PRODUCING, AT))
+    bus.emit(
+        ARTIFACT_READY,
+        ArtifactReady(
+            child_2, artifact_id_2, Path("/tmp/clip.mp4"), "clip.mp4", "video/mp4", 200, None, AT
+        ),
+    )
+    bus.emit(
+        ARTIFACT_UPLOADED,
+        ArtifactUploaded(child_2, artifact_id_2, -1001234567890, 55, AT),
+    )
+
     async with await _client(tracker) as client:
         response = await client.get("/web/queue")
 
     body = response.text
     # The failed child should have its own title attribute in its status cell
     assert '<span class="failed" title="child_failed — Child job failed">failed</span>' in body
-    # The aggregate counts cell should not have a title attribute on the batch row
-    # Verify the batch status cell does not have a title (batch itself is not failed)
-    assert '<td>processing</td>' in body
-    # Ensure there are no title attributes on the batch-level counts, which appear in the progress column
-    # The counts cell is just "0/2 done" with no title attribute
-    assert '<td>0/2 done</td>' in body
+    # Batch is now in partially_completed state (one completed, one failed)
+    assert '<td>partially_completed</td>' in body
+    # The aggregate counts cell should not have a title attribute—it shows "1/2 done" with no title
+    assert '1/2 done' in body
+    # Verify no title attribute exists on the aggregate count cell itself (should be plain text, not a span with title)
+    import re
+    batch_row = re.search(r'<tr>\s+<td>.*?PLtest.*?</td>\s+<td>partially_completed</td>\s+<td>(.*?)</td>\s+<td></td>\s+</tr>', body, re.DOTALL)
+    assert batch_row is not None, "Batch row found"
+    counts_cell = batch_row.group(1)
+    assert 'title=' not in counts_cell, "Aggregate counts cell should not have a title attribute"
