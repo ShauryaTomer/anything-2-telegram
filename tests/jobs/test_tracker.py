@@ -26,6 +26,7 @@ from anything2telegram.events import (
     BATCH_JOBS_CREATED,
     JOB_QUEUED,
     JOB_STARTED,
+    YOUTUBE_PLAYLIST_EXPANDED,
     YOUTUBE_PLAYLIST_EXPANSION_FAILED,
     ArtifactProductionFailed,
     ArtifactReady,
@@ -35,6 +36,7 @@ from anything2telegram.events import (
     BatchJobsCreated,
     JobQueued,
     JobStarted,
+    PlaylistExpanded,
     PlaylistExpansionFailed,
 )
 from anything2telegram.jobs.tracker import (
@@ -294,10 +296,12 @@ def test_job_queued_creates_exact_waiting_snapshot(tracked_bus) -> None:
         batch_id=None,
         source_kind=SourceKind.YOUTUBE,
         source="https://example.test/watch?v=one",
+        title=None,
         status=JobStatus.WAITING,
         artifact_id=None,
         filename=None,
         size_bytes=None,
+        telegram_chat_id=None,
         telegram_message_id=None,
         error=None,
         created_at=NOW,
@@ -342,10 +346,12 @@ def test_youtube_job_success_lifecycle_has_exact_fields_and_timestamps(tracked_b
         batch_id=None,
         source_kind=SourceKind.YOUTUBE,
         source="https://example.test/watch?v=one",
+        title=None,
         status=JobStatus.COMPLETED,
         artifact_id=ARTIFACT_1,
         filename="video.mp4",
         size_bytes=123,
+        telegram_chat_id=-100123,
         telegram_message_id=77,
         error=None,
         created_at=NOW,
@@ -747,6 +753,7 @@ def test_batch_created_has_exact_expanding_snapshot_and_zero_counts(tracked_bus)
     assert tracker.get_batch(BATCH) == BatchSnapshot(
         id=BATCH,
         source_url="https://example.test/playlist",
+        title=None,
         status=BatchStatus.EXPANDING,
         job_ids=(),
         skipped_entries=0,
@@ -774,6 +781,54 @@ def test_duplicate_batch_id_is_invalid_and_preserves_first_batch(tracked_bus) ->
     )
 
     assert tracker.get_batch(BATCH).source_url == first.source_url  # type: ignore[union-attr]
+
+
+def test_playlist_expanded_records_the_batch_title(tracked_bus) -> None:
+    tracker, bus, errors = tracked_bus
+    emit_valid(
+        bus,
+        errors,
+        BATCH_CREATED,
+        BatchCreated(BATCH, "https://example.test/playlist", NOW),
+    )
+    emit_valid(
+        bus,
+        errors,
+        YOUTUBE_PLAYLIST_EXPANDED,
+        PlaylistExpanded(BATCH, (), 0, time(1), "Rust Fundamentals"),
+    )
+
+    assert tracker.get_batch(BATCH).title == "Rust Fundamentals"  # type: ignore[union-attr]
+
+
+def test_playlist_expanded_rejects_missing_batch(tracked_bus) -> None:
+    _, bus, errors = tracked_bus
+    emit_invalid(
+        bus,
+        errors,
+        YOUTUBE_PLAYLIST_EXPANDED,
+        PlaylistExpanded(BATCH, (), 0, NOW, "Rust Fundamentals"),
+    )
+
+
+def test_job_queued_with_a_title_is_recorded_on_the_snapshot(tracked_bus) -> None:
+    tracker, bus, errors = tracked_bus
+    emit_valid(
+        bus,
+        errors,
+        JOB_QUEUED,
+        JobQueued(
+            JOB_1,
+            None,
+            SourceKind.YOUTUBE,
+            "https://example.test/watch?v=one",
+            None,
+            NOW,
+            title="Episode One",
+        ),
+    )
+
+    assert tracker.get_job(JOB_1).title == "Episode One"  # type: ignore[union-attr]
 
 
 @pytest.mark.parametrize(

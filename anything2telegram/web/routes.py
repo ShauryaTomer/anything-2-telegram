@@ -2,21 +2,35 @@
 
 from pathlib import Path
 
+from urllib.parse import parse_qs, urlsplit
+from uuid import UUID
+
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from anything2telegram.domain import BatchEntry, JobSnapshot, JobStatus, telegram_message_url
 from anything2telegram.downloaders.youtube import (
     UnsupportedYouTubeUrl,
     YouTubeUrlKind,
     classify_youtube_url,
 )
 from anything2telegram.jobs.scheduler import SchedulerError
+from anything2telegram.tui import format_bytes
 
 _WEB_ROOT = Path(__file__).parent
 _TEMPLATES = Jinja2Templates(directory=_WEB_ROOT / "templates")
+_TEMPLATES.env.filters["format_bytes"] = format_bytes
+_TEMPLATES.env.filters["video_id"] = lambda url: _query_or_tail(url, "v")
+_TEMPLATES.env.filters["playlist_id"] = lambda url: _query_or_tail(url, "list")
 _NOT_READY = "Not ready — the Telegram client is still connecting. Try again in a moment."
+
+
+def _query_or_tail(url: str, param: str) -> str:
+    """A muted fallback id: the URL's own query param, or its last path segment."""
+    values = parse_qs(urlsplit(url).query).get(param)
+    return values[0] if values else url.rsplit("/", 1)[-1]
 
 
 def _ui_offset(raw: object) -> int | None:
@@ -39,17 +53,50 @@ def _queue_entries(request: Request) -> tuple[object, ...]:
     return tracker.list_queue()
 
 
+def _row_context(request: Request) -> dict[str, object]:
+    """Live progress and completed-upload links, keyed by job id.
+
+    The template has no app.state access, so every registry/settings read
+    happens here and gets handed over as plain per-job mappings.
+    """
+    entries = _queue_entries(request)
+    registry = getattr(request.app.state, "progress", None)
+    settings = getattr(request.app.state, "settings", None)
+    topic_id = getattr(settings, "topic_id", None)
+    progress: dict[UUID, object] = {}
+    links: dict[UUID, str] = {}
+
+    def collect(job: JobSnapshot) -> None:
+        if registry is not None:
+            current = registry.get(job.id)
+            if current is not None:
+                progress[job.id] = current
+        if (
+            job.status is JobStatus.COMPLETED
+            and job.telegram_chat_id is not None
+            and job.telegram_message_id is not None
+        ):
+            links[job.id] = telegram_message_url(
+                job.telegram_chat_id, job.telegram_message_id, topic_id
+            )
+
+    for entry in entries:
+        if isinstance(entry, BatchEntry):
+            for job in entry.jobs:
+                collect(job)
+        else:
+            collect(entry)
+
+    return {"entries": entries, "progress": progress, "links": links}
+
+
 def _submit_response(
     request: Request, flash_code: str | None, flash_message: str | None
 ) -> HTMLResponse:
     return _TEMPLATES.TemplateResponse(
         request,
         "submit_response.html",
-        {
-            "entries": _queue_entries(request),
-            "flash_code": flash_code,
-            "flash_message": flash_message,
-        },
+        _row_context(request) | {"flash_code": flash_code, "flash_message": flash_message},
     )
 
 
@@ -71,15 +118,11 @@ def register_web_routes(app: FastAPI) -> None:
 
     @app.get("/", response_class=HTMLResponse)
     async def page(request: Request) -> HTMLResponse:
-        return _TEMPLATES.TemplateResponse(
-            request, "page.html", {"entries": _queue_entries(request)}
-        )
+        return _TEMPLATES.TemplateResponse(request, "page.html", _row_context(request))
 
     @app.get("/web/queue", response_class=HTMLResponse)
     async def queue_fragment(request: Request) -> HTMLResponse:
-        return _TEMPLATES.TemplateResponse(
-            request, "queue.html", {"entries": _queue_entries(request)}
-        )
+        return _TEMPLATES.TemplateResponse(request, "queue.html", _row_context(request))
 
     @app.post("/web/youtube", response_class=HTMLResponse)
     async def submit_youtube(request: Request) -> HTMLResponse:

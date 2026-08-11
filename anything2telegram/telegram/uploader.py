@@ -10,7 +10,7 @@ from uuid import UUID
 
 from ..artifacts.storage import ArtifactStorage, ArtifactStorageError
 from ..config import Settings
-from ..domain import ErrorInfo, StagedArtifact
+from ..domain import ErrorInfo, JobPhase, StagedArtifact
 from ..events import (
     ARTIFACT_READY,
     ARTIFACT_UPLOAD_FAILED,
@@ -24,6 +24,7 @@ from ..events import (
     PlaylistExpanded,
     TelegramUnavailable,
 )
+from ..jobs.progress import ProgressRegistry
 from ..tui import transfer
 from .client import (
     TelegramClientError,
@@ -54,12 +55,14 @@ class TelegramArtifactUploader:
         storage: ArtifactStorage,
         client,
         settings: Settings,
+        progress_registry: ProgressRegistry,
     ) -> None:
         self._bus = bus
         self._storage = storage
         self._client = client
         self._max_bytes = settings.max_artifact_bytes
         self._timeout_seconds = settings.tg_upload_timeout_seconds
+        self._progress = progress_registry
         self._handled: set[tuple[UUID, UUID]] = set()
         self._emitted: set[tuple[UUID, UUID]] = set()
         self._inflight: set[asyncio.Task[object]] = set()
@@ -173,13 +176,18 @@ class TelegramArtifactUploader:
             self._emit_failure(event, failure)
             return
         try:
-            with transfer("Upload", event.filename, event.size_bytes) as progress:
+            with transfer(
+                "Upload",
+                event.filename,
+                event.size_bytes,
+                self._progress.writer(event.job_id, JobPhase.UPLOADING),
+            ) as report:
                 result = await asyncio.wait_for(
                     self._client.upload(
                         event.local_path,
                         caption=event.caption,
                         supports_streaming=_supports_streaming(event),
-                        progress_callback=progress,
+                        progress_callback=report,
                         file_size=event.size_bytes,
                     ),
                     timeout=self._timeout_seconds,

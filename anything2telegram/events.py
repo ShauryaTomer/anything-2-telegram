@@ -37,6 +37,7 @@ class JobQueued:
     source: str
     staged_artifact: StagedArtifact | None
     occurred_at: datetime
+    title: str | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,7 @@ class DownloadTarget:
     source_id: str
     source_url: str
     caption_prefix: str = ""
+    title: str | None = None
 
 
 @dataclass(frozen=True)

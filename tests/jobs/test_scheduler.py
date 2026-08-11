@@ -249,6 +249,30 @@ async def test_a_playlist_expands_into_children_that_run_before_later_work(
     # The child jumps the queue ahead of the video submitted after the playlist.
     assert [event.job_id for event in recorder.only(JOB_STARTED)] == [child_id]
     assert later.id not in {event.job_id for event in recorder.only(JOB_STARTED)}
+    assert child_queued[0].title is None
+
+
+async def test_a_playlist_expansions_target_titles_reach_the_job_queued_event(
+    scheduler: JobScheduler, bus: EventEmitter, recorder: Recorder
+) -> None:
+    batch = scheduler.submit_playlist(PLAYLIST)
+    await settle()
+
+    bus.emit(
+        YOUTUBE_PLAYLIST_EXPANDED,
+        PlaylistExpanded(
+            batch.id,
+            (DownloadTarget("aaaaaaaaaaa", VIDEO, title="Episode One"),),
+            0,
+            _stamp(),
+        ),
+    )
+    await settle()
+
+    [queued] = [
+        event for event in recorder.only(JOB_QUEUED) if event.batch_id == batch.id
+    ]
+    assert queued.title == "Episode One"
 
 
 async def test_a_failed_expansion_releases_the_slot(

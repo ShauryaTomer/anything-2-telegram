@@ -17,6 +17,7 @@ from anything2telegram.events import (
     DownloadTarget,
     PlaylistExpanded,
 )
+from anything2telegram.jobs.progress import ProgressRegistry
 from anything2telegram.telegram.client import (
     TelegramClientError,
     TelegramUnavailableError,
@@ -62,13 +63,19 @@ def telegram() -> FakeTelegram:
 
 
 @pytest.fixture
+def progress_registry() -> ProgressRegistry:
+    return ProgressRegistry()
+
+
+@pytest.fixture
 async def uploader(
     bus: AsyncIOEventEmitter,
     storage: ArtifactStorage,
     telegram: FakeTelegram,
     settings: Settings,
+    progress_registry: ProgressRegistry,
 ):
-    instance = TelegramArtifactUploader(bus, storage, telegram, settings)
+    instance = TelegramArtifactUploader(bus, storage, telegram, settings, progress_registry)
     await instance.start()
     yield instance
     await instance.stop()
@@ -238,7 +245,7 @@ async def test_an_artifact_over_the_configured_limit_is_rejected(
     bus, storage, telegram, recorder, tmp_path
 ) -> None:
     small = settings_for(tmp_path, max_artifact_bytes=4)
-    uploader = TelegramArtifactUploader(bus, storage, telegram, small)
+    uploader = TelegramArtifactUploader(bus, storage, telegram, small, ProgressRegistry())
     await uploader.start()
     try:
         bus.emit("artifact.ready", ready_artifact(storage, payload=b"much too long"))
@@ -274,7 +281,7 @@ async def test_a_timeout_fails_the_job_without_stopping_the_uploader(
 ) -> None:
     telegram = FakeTelegram(manual_release=True)
     impatient = settings_for(tmp_path, tg_upload_timeout_seconds=0.01)
-    uploader = TelegramArtifactUploader(bus, storage, telegram, impatient)
+    uploader = TelegramArtifactUploader(bus, storage, telegram, impatient, ProgressRegistry())
     await uploader.start()
     try:
         bus.emit("artifact.ready", ready_artifact(storage))
@@ -315,7 +322,7 @@ async def test_the_pause_signal_waits_for_the_in_flight_upload_to_settle(
     bus, storage, settings, recorder
 ) -> None:
     telegram = FakeTelegram(manual_release=True)
-    uploader = TelegramArtifactUploader(bus, storage, telegram, settings)
+    uploader = TelegramArtifactUploader(bus, storage, telegram, settings, ProgressRegistry())
     await uploader.start()
     try:
         bus.emit("artifact.ready", ready_artifact(storage))
@@ -352,7 +359,7 @@ async def test_a_monitor_crash_is_published_on_the_error_topic(
         async def wait_until_disconnected(self) -> None:
             raise RuntimeError("monitor exploded")
 
-    uploader = TelegramArtifactUploader(bus, storage, BrokenMonitor(), settings)
+    uploader = TelegramArtifactUploader(bus, storage, BrokenMonitor(), settings, ProgressRegistry())
     await uploader.start()
     await asyncio.sleep(0)
     await asyncio.sleep(0)
@@ -368,7 +375,7 @@ async def test_a_client_monitor_failure_is_not_an_application_error(
         async def wait_until_disconnected(self) -> None:
             raise TelegramClientError("monitor lost")
 
-    uploader = TelegramArtifactUploader(bus, storage, DroppingMonitor(), settings)
+    uploader = TelegramArtifactUploader(bus, storage, DroppingMonitor(), settings, ProgressRegistry())
     await uploader.start()
     await asyncio.sleep(0)
     await asyncio.sleep(0)
@@ -383,7 +390,7 @@ async def test_a_failed_connect_rolls_back_and_propagates(
 ) -> None:
     telegram = FakeTelegram()
     telegram.connect_error = TelegramUnavailableError()
-    uploader = TelegramArtifactUploader(bus, storage, telegram, settings)
+    uploader = TelegramArtifactUploader(bus, storage, telegram, settings, ProgressRegistry())
 
     with pytest.raises(TelegramUnavailableError):
         await uploader.start()
@@ -407,7 +414,7 @@ async def test_begin_shutdown_refuses_new_artifacts_but_keeps_the_connection(
 async def test_stop_can_leave_the_connection_open_for_a_later_disconnect(
     bus, storage, telegram, settings
 ) -> None:
-    uploader = TelegramArtifactUploader(bus, storage, telegram, settings)
+    uploader = TelegramArtifactUploader(bus, storage, telegram, settings, ProgressRegistry())
     await uploader.start()
 
     await uploader.stop(disconnect=False)
@@ -419,7 +426,7 @@ async def test_stop_cancels_an_upload_that_is_still_running(
     bus, storage, settings, recorder
 ) -> None:
     telegram = FakeTelegram(manual_release=True)
-    uploader = TelegramArtifactUploader(bus, storage, telegram, settings)
+    uploader = TelegramArtifactUploader(bus, storage, telegram, settings, ProgressRegistry())
     await uploader.start()
     bus.emit("artifact.ready", ready_artifact(storage))
     await asyncio.wait_for(telegram.started[0].wait(), timeout=1)

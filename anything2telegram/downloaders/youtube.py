@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 
 from ..artifacts.storage import ArtifactStorage
 from ..config import Settings
-from ..domain import ErrorInfo, StagedArtifact
+from ..domain import ErrorInfo, JobPhase, StagedArtifact
 from ..events import (
     ARTIFACT_PRODUCTION_FAILED,
     ARTIFACT_READY,
@@ -29,6 +29,7 @@ from ..events import (
     PlaylistExpansionRequested,
     YouTubeDownloadRequested,
 )
+from ..jobs.progress import ProgressRegistry
 from ..tui import transfer
 from .process import ProcessResult, ProcessTimeoutError
 
@@ -128,6 +129,7 @@ class YouTubeArtifactProducer:
         storage: ArtifactStorage,
         process_runner,
         settings: Settings,
+        progress_registry: ProgressRegistry,
     ) -> None:
         self._bus = bus
         self._storage = storage
@@ -136,6 +138,7 @@ class YouTubeArtifactProducer:
         self._max_artifact_bytes = settings.max_artifact_bytes
         self._cookies_path = settings.cookies_path
         self._cookies_browser = settings.cookies_browser
+        self._progress = progress_registry
         bus.on(
             YOUTUBE_PLAYLIST_EXPANSION_REQUESTED,
             self.handle_playlist_expansion_requested,
@@ -310,7 +313,9 @@ class YouTubeArtifactProducer:
             # ponytail: bytes on disk, so no percentage — the final size is
             # unknown until yt-dlp merges. Parse --progress-template if a
             # percentage is ever worth streaming yt-dlp's stdout for.
-            with transfer("Download", label, 0) as report:
+            with transfer(
+                "Download", label, 0, self._progress.writer(job_id, JobPhase.PRODUCING)
+            ) as report:
                 while True:
                     done, _ = await asyncio.wait(
                         (runner_task,), timeout=_QUOTA_POLL_SECONDS
@@ -364,11 +369,13 @@ class YouTubeArtifactProducer:
             seen.add(source_id)
             if playlist_title is None:
                 playlist_title = _playlist_title(entry)
+            title = entry.get("title")
             targets.append(
                 DownloadTarget(
                     source_id,
                     f"https://www.youtube.com/watch?v={source_id}",
                     _caption_prefix(entry),
+                    title=title if isinstance(title, str) else None,
                 )
             )
         return targets, skipped, playlist_title

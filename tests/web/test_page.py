@@ -1,19 +1,30 @@
 from datetime import UTC, datetime, timedelta
-from uuid import UUID
+from pathlib import Path
+from types import SimpleNamespace
+from uuid import UUID, uuid4
 
 from httpx import ASGITransport, AsyncClient
 from pyee.asyncio import AsyncIOEventEmitter
 
 from anything2telegram.api.jobs import create_jobs_app
-from anything2telegram.domain import SourceKind
+from anything2telegram.domain import JobPhase, SourceKind, StagedArtifact
 from anything2telegram.events import (
+    ARTIFACT_READY,
+    ARTIFACT_UPLOADED,
     BATCH_CREATED,
     BATCH_JOBS_CREATED,
     JOB_QUEUED,
+    JOB_STARTED,
+    YOUTUBE_PLAYLIST_EXPANDED,
+    ArtifactReady,
+    ArtifactUploaded,
     BatchCreated,
     BatchJobsCreated,
     JobQueued,
+    JobStarted,
+    PlaylistExpanded,
 )
+from anything2telegram.jobs.progress import Progress
 from anything2telegram.jobs.tracker import JobTracker
 
 AT = datetime(2026, 7, 26, 12, 0, tzinfo=UTC)
@@ -23,10 +34,27 @@ CHILD_1 = UUID("10000000-0000-0000-0000-000000000002")
 CHILD_2 = UUID("10000000-0000-0000-0000-000000000003")
 
 
-async def _client(tracker: JobTracker | None = None) -> AsyncClient:
+class FakeProgressRegistry:
+    def __init__(self) -> None:
+        self.values: dict[UUID, Progress] = {}
+
+    def get(self, job_id: UUID) -> Progress | None:
+        return self.values.get(job_id)
+
+
+async def _client(
+    tracker: JobTracker | None = None,
+    *,
+    progress: FakeProgressRegistry | None = None,
+    topic_id: int | None = None,
+) -> AsyncClient:
     app = create_jobs_app()
     if tracker is not None:
         app.state.tracker = tracker
+    if progress is not None:
+        app.state.progress = progress
+    if topic_id is not None:
+        app.state.settings = SimpleNamespace(topic_id=topic_id)
     transport = ASGITransport(app=app)
     return AsyncClient(transport=transport, base_url="http://service")
 
@@ -230,8 +258,8 @@ async def test_batch_children_are_numbered_zero_padded_to_the_batchs_width() -> 
         response = await client.get("/web/queue")
 
     body = response.text
-    assert f"03/10 {children[2]}" in body
-    assert f"10/10 {children[9]}" in body
+    assert f'03/10 <span class="muted">{children[2]}</span>' in body
+    assert f'10/10 <span class="muted">{children[9]}</span>' in body
 
 
 async def test_page_and_fragment_render_the_same_live_queue_rows() -> None:
@@ -247,5 +275,192 @@ async def test_page_and_fragment_render_the_same_live_queue_rows() -> None:
         assert "https://youtu.be/playlist?list=x" in body
         assert "waiting" in body
         assert body.count('class="queue-child"') == 2
-        assert f"1/2 https://youtu.be/{CHILD_1}" in body
-        assert f"2/2 https://youtu.be/{CHILD_2}" in body
+        # Titles are unknown, so the Source cell falls back to the bare video
+        # id; the full URL still appears once, behind the row's copy button.
+        assert f'1/2 <span class="muted">{CHILD_1}</span>' in body
+        assert f'2/2 <span class="muted">{CHILD_2}</span>' in body
+
+
+async def test_progress_cell_renders_indeterminate_bytes_determinate_percentage_or_blank() -> None:
+    bus = AsyncIOEventEmitter()
+    tracker = JobTracker()
+    tracker.register(bus)
+    producing_id, uploading_id, waiting_id = uuid4(), uuid4(), uuid4()
+
+    bus.emit(
+        JOB_QUEUED,
+        JobQueued(producing_id, None, SourceKind.YOUTUBE, "https://youtu.be/aaaaaaaaaaa", None, AT),
+    )
+    bus.emit(JOB_STARTED, JobStarted(producing_id, JobPhase.PRODUCING, AT))
+
+    bus.emit(
+        JOB_QUEUED,
+        JobQueued(uploading_id, None, SourceKind.YOUTUBE, "https://youtu.be/bbbbbbbbbbb", None, AT),
+    )
+    bus.emit(JOB_STARTED, JobStarted(uploading_id, JobPhase.PRODUCING, AT))
+    bus.emit(
+        ARTIFACT_READY,
+        ArtifactReady(
+            uploading_id, uuid4(), Path("/tmp/clip.mp4"), "clip.mp4", "video/mp4", 200, None, AT
+        ),
+    )
+
+    bus.emit(
+        JOB_QUEUED,
+        JobQueued(waiting_id, None, SourceKind.YOUTUBE, "https://youtu.be/ccccccccccc", None, AT),
+    )
+
+    progress = FakeProgressRegistry()
+    progress.values[producing_id] = Progress(JobPhase.PRODUCING, 2_500_000, 0)
+    progress.values[uploading_id] = Progress(JobPhase.UPLOADING, 50, 200)
+
+    async with await _client(tracker, progress=progress) as client:
+        response = await client.get("/web/queue")
+
+    body = response.text
+    assert "<progress></progress>" in body
+    assert "2.5 MB" in body
+    assert '<progress value="50" max="200">' in body
+    assert "25%" in body
+    # The waiting job has no live transfer, so its Progress cell stays blank.
+    assert body.count("<progress") == 2
+
+
+async def test_link_cell_is_empty_until_completed_then_carries_the_derived_url_and_never_for_batches() -> None:
+    bus = AsyncIOEventEmitter()
+    tracker = JobTracker()
+    tracker.register(bus)
+    completed_id, waiting_id, artifact_id = uuid4(), uuid4(), uuid4()
+
+    bus.emit(
+        JOB_QUEUED,
+        JobQueued(completed_id, None, SourceKind.YOUTUBE, "https://youtu.be/aaaaaaaaaaa", None, AT),
+    )
+    bus.emit(JOB_STARTED, JobStarted(completed_id, JobPhase.PRODUCING, AT))
+    bus.emit(
+        ARTIFACT_READY,
+        ArtifactReady(
+            completed_id, artifact_id, Path("/tmp/clip.mp4"), "clip.mp4", "video/mp4", 200, None, AT
+        ),
+    )
+    bus.emit(
+        ARTIFACT_UPLOADED,
+        ArtifactUploaded(completed_id, artifact_id, -1001234567890, 55, AT),
+    )
+
+    bus.emit(
+        JOB_QUEUED,
+        JobQueued(waiting_id, None, SourceKind.YOUTUBE, "https://youtu.be/bbbbbbbbbbb", None, AT),
+    )
+    bus.emit(BATCH_CREATED, BatchCreated(BATCH, "https://youtu.be/playlist?list=x", AT))
+
+    async with await _client(tracker, topic_id=7) as client:
+        response = await client.get("/web/queue")
+
+    body = response.text
+    assert '<a href="https://t.me/c/1234567890/7/55">open</a>' in body
+    # Neither the waiting job nor the (unrelated, expanding) batch link out.
+    assert body.count("<a href=") == 1
+
+
+async def test_source_cell_shows_names_and_falls_back_to_muted_identifiers() -> None:
+    bus = AsyncIOEventEmitter()
+    tracker = JobTracker()
+    tracker.register(bus)
+
+    bus.emit(
+        BATCH_CREATED,
+        BatchCreated(BATCH, "https://www.youtube.com/playlist?list=PL123", AT),
+    )
+    bus.emit(
+        JOB_QUEUED,
+        JobQueued(
+            CHILD_1,
+            BATCH,
+            SourceKind.YOUTUBE,
+            "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+            None,
+            AT,
+            title="Episode One",
+        ),
+    )
+    bus.emit(
+        JOB_QUEUED,
+        JobQueued(
+            CHILD_2, BATCH, SourceKind.YOUTUBE, "https://www.youtube.com/watch?v=bbbbbbbbbbb", None, AT
+        ),
+    )
+    bus.emit(BATCH_JOBS_CREATED, BatchJobsCreated(BATCH, (CHILD_1, CHILD_2), 0, AT))
+    bus.emit(
+        YOUTUBE_PLAYLIST_EXPANDED,
+        PlaylistExpanded(BATCH, (), 0, AT, "Rust Fundamentals"),
+    )
+
+    batch_2 = uuid4()
+    bus.emit(
+        BATCH_CREATED,
+        BatchCreated(batch_2, "https://www.youtube.com/playlist?list=PLNOEXPAND", AT),
+    )
+
+    pre_filename_id = uuid4()
+    bus.emit(
+        JOB_QUEUED,
+        JobQueued(
+            pre_filename_id, None, SourceKind.YOUTUBE, "https://www.youtube.com/watch?v=ccccccccccc", None, AT
+        ),
+    )
+
+    post_filename_id = uuid4()
+    bus.emit(
+        JOB_QUEUED,
+        JobQueued(
+            post_filename_id, None, SourceKind.YOUTUBE, "https://www.youtube.com/watch?v=ddddddddddd", None, AT
+        ),
+    )
+    bus.emit(JOB_STARTED, JobStarted(post_filename_id, JobPhase.PRODUCING, AT))
+    bus.emit(
+        ARTIFACT_READY,
+        ArtifactReady(
+            post_filename_id, uuid4(), Path("/tmp/known.mp4"), "known.mp4", "video/mp4", 5, None, AT
+        ),
+    )
+
+    staged = StagedArtifact(uuid4(), uuid4(), Path("/tmp/upload.mp4"), "upload.mp4", "video/mp4", 5, None)
+    bus.emit(
+        JOB_QUEUED,
+        JobQueued(staged.job_id, None, SourceKind.LOCAL_UPLOAD, staged.filename, staged, AT),
+    )
+
+    async with await _client(tracker) as client:
+        response = await client.get("/web/queue")
+
+    body = response.text
+    assert "Rust Fundamentals" in body
+    assert "Episode One" in body
+    assert '<span class="muted">bbbbbbbbbbb</span>' in body
+    assert '<span class="muted">PLNOEXPAND</span>' in body
+    assert '<span class="muted">ccccccccccc</span>' in body
+    assert "known.mp4" in body
+    assert "upload.mp4" in body
+
+
+async def test_copy_button_appears_only_for_rows_with_an_original_url() -> None:
+    bus = AsyncIOEventEmitter()
+    tracker = JobTracker()
+    tracker.register(bus)
+
+    bus.emit(
+        JOB_QUEUED,
+        JobQueued(uuid4(), None, SourceKind.YOUTUBE, "https://youtu.be/aaaaaaaaaaa", None, AT),
+    )
+    staged = StagedArtifact(uuid4(), uuid4(), Path("/tmp/upload.mp4"), "upload.mp4", "video/mp4", 5, None)
+    bus.emit(
+        JOB_QUEUED,
+        JobQueued(staged.job_id, None, SourceKind.LOCAL_UPLOAD, staged.filename, staged, AT),
+    )
+
+    async with await _client(tracker) as client:
+        response = await client.get("/web/queue")
+
+    body = response.text
+    assert body.count('class="copy"') == 1

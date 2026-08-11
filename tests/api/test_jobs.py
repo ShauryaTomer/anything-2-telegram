@@ -14,6 +14,7 @@ from anything2telegram.domain import (
     BatchSnapshot,
     BatchStatus,
     ErrorInfo,
+    JobPhase,
     JobRef,
     JobSnapshot,
     JobStatus,
@@ -21,6 +22,7 @@ from anything2telegram.domain import (
     StagedArtifact,
     UploadReservation,
 )
+from anything2telegram.jobs.progress import Progress
 from anything2telegram.jobs.scheduler import SchedulerError
 
 
@@ -122,16 +124,25 @@ class FakeTracker:
         return self.queue
 
 
+class FakeProgressRegistry:
+    def __init__(self) -> None:
+        self.values: dict[UUID, Progress] = {}
+
+    def get(self, job_id: UUID) -> Progress | None:
+        return self.values.get(job_id)
+
+
 @pytest.fixture
 def api():
     app = create_jobs_app()
     state = app.state
-    state.settings = SimpleNamespace(max_artifact_bytes=1024)
+    state.settings = SimpleNamespace(max_artifact_bytes=1024, topic_id=None)
     state.readiness = SimpleNamespace(is_accepting=lambda: True)
     state.telegram = SimpleNamespace(is_connected=True)
     state.scheduler = FakeScheduler()
     state.storage = FakeStorage()
     state.tracker = FakeTracker()
+    state.progress = FakeProgressRegistry()
     return app
 
 
@@ -353,10 +364,12 @@ async def test_a_job_snapshot_is_rendered_exactly(client, api) -> None:
         batch_id=None,
         source_kind=SourceKind.YOUTUBE,
         source=VIDEO,
+        title=None,
         status=JobStatus.FAILED,
         artifact_id=artifact_id,
         filename="clip.mp4",
         size_bytes=12,
+        telegram_chat_id=None,
         telegram_message_id=None,
         error=ErrorInfo("youtube_timeout", "YouTube operation timed out"),
         created_at=AT,
@@ -375,7 +388,12 @@ async def test_a_job_snapshot_is_rendered_exactly(client, api) -> None:
         "artifact_id": str(artifact_id),
         "filename": "clip.mp4",
         "size_bytes": 12,
+        "telegram_chat_id": None,
         "telegram_message_id": None,
+        "telegram_message_url": None,
+        "progress_phase": None,
+        "progress_sent": None,
+        "progress_total": None,
         "error": {
             "code": "youtube_timeout",
             "message": "YouTube operation timed out",
@@ -390,6 +408,7 @@ async def test_a_batch_snapshot_is_rendered_exactly(client, api) -> None:
     api.state.tracker.batches[batch_id] = BatchSnapshot(
         id=batch_id,
         source_url=PLAYLIST,
+        title=None,
         status=BatchStatus.PROCESSING,
         job_ids=(job_id,),
         skipped_entries=2,
@@ -457,10 +476,12 @@ async def test_queue_json_discriminates_jobs_and_batches_by_type(client, api) ->
         batch_id=None,
         source_kind=SourceKind.YOUTUBE,
         source=VIDEO,
+        title=None,
         status=JobStatus.WAITING,
         artifact_id=None,
         filename=None,
         size_bytes=None,
+        telegram_chat_id=None,
         telegram_message_id=None,
         error=None,
         created_at=AT,
@@ -470,6 +491,7 @@ async def test_queue_json_discriminates_jobs_and_batches_by_type(client, api) ->
     batch = BatchSnapshot(
         id=batch_id,
         source_url=PLAYLIST,
+        title=None,
         status=BatchStatus.PROCESSING,
         job_ids=(child_id,),
         skipped_entries=0,
@@ -490,10 +512,12 @@ async def test_queue_json_discriminates_jobs_and_batches_by_type(client, api) ->
         batch_id=batch_id,
         source_kind=SourceKind.YOUTUBE,
         source="https://youtu.be/child",
+        title=None,
         status=JobStatus.PRODUCING,
         artifact_id=None,
         filename=None,
         size_bytes=None,
+        telegram_chat_id=None,
         telegram_message_id=None,
         error=None,
         created_at=AT,
@@ -519,7 +543,12 @@ async def test_queue_json_discriminates_jobs_and_batches_by_type(client, api) ->
                 "artifact_id": None,
                 "filename": None,
                 "size_bytes": None,
+                "telegram_chat_id": None,
                 "telegram_message_id": None,
+                "telegram_message_url": None,
+                "progress_phase": None,
+                "progress_sent": None,
+                "progress_total": None,
                 "error": None,
                 "created_at": "2026-07-26T12:00:00Z",
                 "updated_at": "2026-07-26T12:00:00Z",
@@ -527,6 +556,113 @@ async def test_queue_json_discriminates_jobs_and_batches_by_type(client, api) ->
         ],
     }
     assert job_row == job_response.json() | {"type": "job"}
+
+
+async def test_job_json_carries_live_progress_from_the_registry(client, api) -> None:
+    job_id = uuid4()
+    api.state.tracker.jobs[job_id] = JobSnapshot(
+        id=job_id,
+        batch_id=None,
+        source_kind=SourceKind.YOUTUBE,
+        source=VIDEO,
+        title=None,
+        status=JobStatus.PRODUCING,
+        artifact_id=None,
+        filename=None,
+        size_bytes=None,
+        telegram_chat_id=None,
+        telegram_message_id=None,
+        error=None,
+        created_at=AT,
+        updated_at=AT,
+    )
+    api.state.progress.values[job_id] = Progress(JobPhase.PRODUCING, 42, 0)
+
+    response = await client.get(f"/jobs/{job_id}")
+
+    body = response.json()
+    assert body["progress_phase"] == "producing"
+    assert body["progress_sent"] == 42
+    assert body["progress_total"] == 0
+
+
+async def test_job_json_derives_the_telegram_link_only_once_completed(client, api) -> None:
+    job_id, artifact_id = uuid4(), uuid4()
+    api.state.settings.topic_id = 7
+    api.state.tracker.jobs[job_id] = JobSnapshot(
+        id=job_id,
+        batch_id=None,
+        source_kind=SourceKind.YOUTUBE,
+        source=VIDEO,
+        title=None,
+        status=JobStatus.COMPLETED,
+        artifact_id=artifact_id,
+        filename="clip.mp4",
+        size_bytes=12,
+        telegram_chat_id=-1001234567890,
+        telegram_message_id=55,
+        error=None,
+        created_at=AT,
+        updated_at=AT,
+    )
+
+    response = await client.get(f"/jobs/{job_id}")
+
+    body = response.json()
+    assert body["telegram_chat_id"] == -1001234567890
+    assert body["telegram_message_url"] == "https://t.me/c/1234567890/7/55"
+
+
+async def test_queue_json_reads_progress_per_child_job_independently(client, api) -> None:
+    batch_id, child_a, child_b = uuid4(), uuid4(), uuid4()
+
+    def job(job_id: UUID, status: JobStatus) -> JobSnapshot:
+        return JobSnapshot(
+            id=job_id,
+            batch_id=batch_id,
+            source_kind=SourceKind.YOUTUBE,
+            source=f"https://youtu.be/{job_id}",
+            title=None,
+            status=status,
+            artifact_id=None,
+            filename=None,
+            size_bytes=None,
+            telegram_chat_id=None,
+            telegram_message_id=None,
+            error=None,
+            created_at=AT,
+            updated_at=AT,
+        )
+
+    batch = BatchSnapshot(
+        id=batch_id,
+        source_url=PLAYLIST,
+        title=None,
+        status=BatchStatus.PROCESSING,
+        job_ids=(child_a, child_b),
+        skipped_entries=0,
+        error=None,
+        created_at=AT,
+        updated_at=AT,
+        total_jobs=2,
+        waiting=0,
+        producing=1,
+        uploading=1,
+        completed=0,
+        failed=0,
+    )
+    api.state.tracker.queue = (
+        BatchEntry(batch, (job(child_a, JobStatus.PRODUCING), job(child_b, JobStatus.UPLOADING))),
+    )
+    api.state.progress.values[child_a] = Progress(JobPhase.PRODUCING, 10, 0)
+    api.state.progress.values[child_b] = Progress(JobPhase.UPLOADING, 5, 20)
+
+    response = await client.get("/queue")
+
+    [batch_row] = response.json()
+    child_a_row, child_b_row = batch_row["jobs"]
+    assert (child_a_row["progress_sent"], child_a_row["progress_total"]) == (10, 0)
+    assert (child_b_row["progress_sent"], child_b_row["progress_total"]) == (5, 20)
 
 
 async def test_health_reports_readiness_and_telegram_separately(client, api) -> None:

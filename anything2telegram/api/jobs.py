@@ -2,6 +2,7 @@
 
 import errno
 import logging
+from collections.abc import Callable
 from datetime import datetime
 from uuid import UUID
 
@@ -23,12 +24,14 @@ from anything2telegram.domain import (
     ErrorInfo,
     JobRef,
     JobSnapshot,
+    telegram_message_url,
 )
 from anything2telegram.downloaders.youtube import (
     UnsupportedYouTubeUrl,
     YouTubeUrlKind,
     classify_youtube_url,
 )
+from anything2telegram.jobs.progress import Progress
 from anything2telegram.jobs.scheduler import SchedulerError
 from anything2telegram.web.routes import register_web_routes
 
@@ -83,7 +86,16 @@ def _error_info(value: ErrorInfo | None) -> dict[str, str] | None:
     return {"code": value.code, "message": value.message}
 
 
-def _job_body(snapshot: JobSnapshot) -> dict[str, object]:
+def _job_body(
+    snapshot: JobSnapshot, progress: Progress | None, topic_id: int | None
+) -> dict[str, object]:
+    chat_id = snapshot.telegram_chat_id
+    message_id = snapshot.telegram_message_id
+    message_url = (
+        telegram_message_url(chat_id, message_id, topic_id)
+        if chat_id is not None and message_id is not None
+        else None
+    )
     return {
         "id": str(snapshot.id),
         "batch_id": str(snapshot.batch_id) if snapshot.batch_id else None,
@@ -93,7 +105,12 @@ def _job_body(snapshot: JobSnapshot) -> dict[str, object]:
         "artifact_id": str(snapshot.artifact_id) if snapshot.artifact_id else None,
         "filename": snapshot.filename,
         "size_bytes": snapshot.size_bytes,
-        "telegram_message_id": snapshot.telegram_message_id,
+        "telegram_chat_id": chat_id,
+        "telegram_message_id": message_id,
+        "telegram_message_url": message_url,
+        "progress_phase": progress.phase.value if progress else None,
+        "progress_sent": progress.sent if progress else None,
+        "progress_total": progress.total if progress else None,
         "error": _error_info(snapshot.error),
         "created_at": _timestamp(snapshot.created_at),
         "updated_at": _timestamp(snapshot.updated_at),
@@ -119,13 +136,19 @@ def _batch_body(snapshot: BatchSnapshot) -> dict[str, object]:
     }
 
 
-def _queue_row(entry: JobSnapshot | BatchEntry) -> dict[str, object]:
+def _queue_row(
+    entry: JobSnapshot | BatchEntry,
+    progress_lookup: Callable[[UUID], Progress | None],
+    topic_id: int | None,
+) -> dict[str, object]:
     if isinstance(entry, BatchEntry):
         return _batch_body(entry.batch) | {
             "type": "batch",
-            "jobs": [_job_body(job) for job in entry.jobs],
+            "jobs": [
+                _job_body(job, progress_lookup(job.id), topic_id) for job in entry.jobs
+            ],
         }
-    return _job_body(entry) | {"type": "job"}
+    return _job_body(entry, progress_lookup(entry.id), topic_id) | {"type": "job"}
 
 
 def _submission_body(kind: str, ref: JobRef | BatchRef) -> dict[str, str]:
@@ -346,7 +369,9 @@ def create_jobs_app() -> FastAPI:
         )
         if snapshot is None:
             return _response(404, "job_not_found", "Job not found")
-        return _job_body(snapshot)
+        progress = request.app.state.progress.get(snapshot.id)
+        topic_id = request.app.state.settings.topic_id
+        return _job_body(snapshot, progress, topic_id)
 
     @app.get("/batches/{batch_id}")
     async def get_batch(request: Request, batch_id: str) -> object:
@@ -363,7 +388,9 @@ def create_jobs_app() -> FastAPI:
     @app.get("/queue")
     async def get_queue(request: Request) -> object:
         entries = request.app.state.tracker.list_queue()
-        return [_queue_row(entry) for entry in entries]
+        topic_id = request.app.state.settings.topic_id
+        progress_lookup = request.app.state.progress.get
+        return [_queue_row(entry, progress_lookup, topic_id) for entry in entries]
 
     @app.get("/health")
     async def health(request: Request) -> JSONResponse:

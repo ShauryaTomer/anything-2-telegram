@@ -28,6 +28,7 @@ from anything2telegram.events import (
     PlaylistExpansionRequested,
     YouTubeDownloadRequested,
 )
+from anything2telegram.jobs.progress import ProgressRegistry
 from tests.conftest import settings_for
 
 
@@ -130,7 +131,7 @@ def storage(tmp_path: Path) -> ArtifactStorage:
 
 
 def make_producer(bus, storage, runner, settings: Settings):
-    return YouTubeArtifactProducer(bus, storage, runner, settings)
+    return YouTubeArtifactProducer(bus, storage, runner, settings, ProgressRegistry())
 
 
 async def settle(bus: AsyncIOEventEmitter) -> None:
@@ -241,6 +242,30 @@ async def test_playlist_entries_carry_a_numbered_caption_prefix(
         "Rust Fundamentals - 03/12 - ",
         "Rust Fundamentals - 11/12 - ",
         "",
+    ]
+
+
+async def test_playlist_entries_carry_their_own_title(
+    bus, storage, settings, recorder
+) -> None:
+    runner = ScriptedRunner(
+        ProcessResult(
+            0,
+            playlist_stdout(
+                {"id": VIDEO_ID, "title": "Episode One"},
+                {"id": "bbbbbbbbbbb"},
+            ),
+            "",
+        )
+    )
+    make_producer(bus, storage, runner, settings)
+
+    bus.emit("youtube.playlist.expansion.requested", expansion_request())
+    await settle(bus)
+
+    assert [target.title for target in recorder.expanded[0].targets] == [
+        "Episode One",
+        None,
     ]
 
 
