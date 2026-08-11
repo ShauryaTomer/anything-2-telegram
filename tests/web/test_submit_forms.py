@@ -147,6 +147,49 @@ async def test_an_unsupported_youtube_url_flashes_422_with_an_intact_queue(
     assert wired_app.state.scheduler.calls == []
 
 
+async def test_youtube_playlist_submit_with_offset_one_skips_nothing(
+    wired_app,
+) -> None:
+    async with await _client(wired_app) as client:
+        response = await client.post(
+            "/web/youtube", data={"url": PLAYLIST, "offset": "1"}
+        )
+
+    assert response.status_code == 200
+    assert wired_app.state.scheduler.calls == [("playlist", (PLAYLIST, 0))]
+
+
+async def test_youtube_submit_without_a_url_field_flashes_422_not_json(
+    wired_app,
+) -> None:
+    async with await _client(wired_app) as client:
+        response = await client.post("/web/youtube", data={"offset": "1"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    body = response.text
+    assert "<strong>422</strong>" in body
+    assert 'id="queue"' in body
+    assert wired_app.state.scheduler.calls == []
+
+
+@pytest.mark.parametrize("bad_offset", ["", "0", "-1", "abc", "1.5"])
+async def test_youtube_submit_with_a_bad_offset_flashes_422_not_json(
+    wired_app, bad_offset: str
+) -> None:
+    async with await _client(wired_app) as client:
+        response = await client.post(
+            "/web/youtube", data={"url": VIDEO, "offset": bad_offset}
+        )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    body = response.text
+    assert "<strong>422</strong>" in body
+    assert 'id="queue"' in body
+    assert wired_app.state.scheduler.calls == []
+
+
 async def test_youtube_submit_while_not_ready_flashes_503(wired_app) -> None:
     wired_app.state.telegram = SimpleNamespace(is_connected=False)
 

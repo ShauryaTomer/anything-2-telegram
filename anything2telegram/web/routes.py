@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -17,6 +17,19 @@ from anything2telegram.jobs.scheduler import SchedulerError
 _WEB_ROOT = Path(__file__).parent
 _TEMPLATES = Jinja2Templates(directory=_WEB_ROOT / "templates")
 _NOT_READY = "Not ready — the Telegram client is still connecting. Try again in a moment."
+
+
+def _ui_offset(raw: object) -> int | None:
+    """Parse the 1-indexed offset form field; None means invalid, not absent."""
+    if raw is None:
+        return 1
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value >= 1 else None
 
 
 def _queue_entries(request: Request) -> tuple[object, ...]:
@@ -69,11 +82,20 @@ def register_web_routes(app: FastAPI) -> None:
         )
 
     @app.post("/web/youtube", response_class=HTMLResponse)
-    async def submit_youtube(
-        request: Request,
-        url: str = Form(...),
-        offset: int = Form(default=1, ge=1),
-    ) -> HTMLResponse:
+    async def submit_youtube(request: Request) -> HTMLResponse:
+        # Parsed from the raw form (not a typed FastAPI Form(...) param): a
+        # binding failure there raises RequestValidationError before this body
+        # runs, which the app-wide handler turns into a JSON 422 — breaking
+        # this route's "always 200" contract.
+        form = await request.form()
+        url = form.get("url")
+        if not isinstance(url, str) or not url:
+            return _submit_response(request, "422", "Not a supported YouTube URL.")
+
+        offset = _ui_offset(form.get("offset"))
+        if offset is None:
+            return _submit_response(request, "422", "Request is invalid.")
+
         try:
             kind = classify_youtube_url(url)
         except UnsupportedYouTubeUrl:
