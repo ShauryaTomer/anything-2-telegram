@@ -18,7 +18,7 @@
   <article>
     <header><strong>Queue work</strong></header>
     <div class="two-col">
-      <form>
+      <form hx-post="/web/youtube" hx-target="#queue" hx-swap="outerHTML">
         <label>YouTube URL
           <input type="url" name="url" placeholder="https://youtu.be/… or /playlist?list=…" required>
         </label>
@@ -27,7 +27,7 @@
         </label>
         <button type="submit">Queue</button>
       </form>
-      <form enctype="multipart/form-data">
+      <form hx-post="/web/upload" hx-encoding="multipart/form-data" hx-target="#queue" hx-swap="outerHTML" enctype="multipart/form-data">
         <label>Local file <input type="file" name="file" required></label>
         <progress class="up-progress" value="0" max="100" hidden></progress>
         <button type="submit">Upload</button>
@@ -37,5 +37,14 @@
   <div id="flash"></div>
   {% include "queue.html" %}
 </main>
+<script>
+  document.body.addEventListener('htmx:xhr:progress', (e) => {
+    const bar = e.target.querySelector('.up-progress');
+    if (bar && e.detail.lengthComputable) {
+      bar.hidden = false;
+      bar.value = (e.detail.loaded / e.detail.total) * 100;
+    }
+  });
+</script>
 </body>
 </html>
