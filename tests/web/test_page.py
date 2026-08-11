@@ -489,3 +489,103 @@ async def test_copy_button_url_with_an_apostrophe_is_escaped_not_injected() -> N
         'data-url="https://www.youtube.com/watch?v=aaaaaaaaaaa&amp;z=&#39;-alert(1)-&#39;"'
         in body
     )
+
+
+async def test_failed_job_status_cell_carries_title_with_error_code_and_message() -> None:
+    from anything2telegram.domain import ErrorInfo
+    from anything2telegram.events import ARTIFACT_PRODUCTION_FAILED, ArtifactProductionFailed
+
+    bus = AsyncIOEventEmitter()
+    tracker = JobTracker()
+    tracker.register(bus)
+    job_id = uuid4()
+
+    bus.emit(
+        JOB_QUEUED,
+        JobQueued(job_id, None, SourceKind.YOUTUBE, "https://youtu.be/aaaaaaaaaaa", None, AT),
+    )
+    bus.emit(JOB_STARTED, JobStarted(job_id, JobPhase.PRODUCING, AT))
+    error = ErrorInfo("youtube_timeout", "YouTube operation timed out")
+    bus.emit(
+        ARTIFACT_PRODUCTION_FAILED,
+        ArtifactProductionFailed(job_id, None, error, AT),
+    )
+
+    async with await _client(tracker) as client:
+        response = await client.get("/web/queue")
+
+    body = response.text
+    assert '<span class="failed" title="youtube_timeout — YouTube operation timed out">failed</span>' in body
+
+
+async def test_failed_batch_status_cell_carries_title_with_error_code_and_message() -> None:
+    from anything2telegram.domain import ErrorInfo
+    from anything2telegram.events import YOUTUBE_PLAYLIST_EXPANSION_FAILED, PlaylistExpansionFailed
+
+    bus = AsyncIOEventEmitter()
+    tracker = JobTracker()
+    tracker.register(bus)
+    batch_id = uuid4()
+
+    bus.emit(
+        BATCH_CREATED,
+        BatchCreated(batch_id, "https://www.youtube.com/playlist?list=PLexpand", AT),
+    )
+    error = ErrorInfo("youtube_playlist_expansion_failed", "Playlist expansion failed")
+    bus.emit(
+        YOUTUBE_PLAYLIST_EXPANSION_FAILED,
+        PlaylistExpansionFailed(batch_id, error, AT),
+    )
+
+    async with await _client(tracker) as client:
+        response = await client.get("/web/queue")
+
+    body = response.text
+    assert '<span class="failed" title="youtube_playlist_expansion_failed — Playlist expansion failed">failed</span>' in body
+
+
+async def test_aggregate_count_on_partially_completed_batch_carries_no_title() -> None:
+    bus = AsyncIOEventEmitter()
+    tracker = JobTracker()
+    tracker.register(bus)
+    batch_id = uuid4()
+    child_1 = uuid4()
+    child_2 = uuid4()
+
+    bus.emit(
+        BATCH_CREATED,
+        BatchCreated(batch_id, "https://www.youtube.com/playlist?list=PLtest", AT),
+    )
+    bus.emit(
+        JOB_QUEUED,
+        JobQueued(child_1, batch_id, SourceKind.YOUTUBE, "https://youtu.be/child1", None, AT),
+    )
+    bus.emit(
+        JOB_QUEUED,
+        JobQueued(child_2, batch_id, SourceKind.YOUTUBE, "https://youtu.be/child2", None, AT),
+    )
+    bus.emit(BATCH_JOBS_CREATED, BatchJobsCreated(batch_id, (child_1, child_2), 0, AT))
+
+    # Emit a failure for one child
+    from anything2telegram.domain import ErrorInfo
+    from anything2telegram.events import ARTIFACT_PRODUCTION_FAILED, ArtifactProductionFailed
+
+    bus.emit(JOB_STARTED, JobStarted(child_1, JobPhase.PRODUCING, AT))
+    error = ErrorInfo("child_failed", "Child job failed")
+    bus.emit(
+        ARTIFACT_PRODUCTION_FAILED,
+        ArtifactProductionFailed(child_1, None, error, AT),
+    )
+
+    async with await _client(tracker) as client:
+        response = await client.get("/web/queue")
+
+    body = response.text
+    # The failed child should have its own title attribute in its status cell
+    assert '<span class="failed" title="child_failed — Child job failed">failed</span>' in body
+    # The aggregate counts cell should not have a title attribute on the batch row
+    # Verify the batch status cell does not have a title (batch itself is not failed)
+    assert '<td>processing</td>' in body
+    # Ensure there are no title attributes on the batch-level counts, which appear in the progress column
+    # The counts cell is just "0/2 done" with no title attribute
+    assert '<td>0/2 done</td>' in body
