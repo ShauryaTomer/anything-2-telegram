@@ -68,17 +68,6 @@ def _oversize() -> JSONResponse:
     return _response(413, "staging_oversize", "Upload exceeds maximum allowed size")
 
 
-def _storage_error(error: ArtifactStorageError) -> JSONResponse:
-    _LOGGER.warning("Upload staging failed: code=%s", error.code)
-    if error.code == "invalid_filename":
-        return _response(422, "invalid_filename", "Artifact filename is invalid")
-    if error.code == "staging_oversize":
-        return _oversize()
-    if error.code == "staging_disk_full":
-        return _response(507, "staging_disk_full", "Artifact storage is full")
-    return _response(500, "upload_staging_failed", "Upload could not be stored")
-
-
 def _timestamp(value: datetime) -> str:
     rendered = value.isoformat()
     if rendered.endswith("+00:00"):
@@ -180,6 +169,7 @@ class _UploadSubmitError(Exception):
 
 def _storage_error_to_submit_error(error: ArtifactStorageError) -> _UploadSubmitError:
     """Map storage error to upload submit error."""
+    _LOGGER.warning("Upload staging failed: code=%s", error.code)
     if error.code == "invalid_filename":
         return _UploadSubmitError("invalid_filename", 422, "Artifact filename is invalid")
     if error.code == "staging_oversize":
