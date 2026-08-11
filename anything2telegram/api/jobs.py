@@ -29,6 +29,7 @@ from anything2telegram.downloaders.youtube import (
     classify_youtube_url,
 )
 from anything2telegram.jobs.scheduler import SchedulerError
+from anything2telegram.web.routes import register_web_routes
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -358,5 +359,7 @@ def create_jobs_app() -> FastAPI:
             status_code=200 if ready else 503,
             content={"ready": ready, "telegram_connected": connected},
         )
+
+    register_web_routes(app)
 
     return app
