@@ -45,6 +45,13 @@
       bar.value = (e.detail.loaded / e.detail.total) * 100;
     }
   });
+  // Delegated so it keeps working after htmx swaps #queue's rows back in.
+  document.body.addEventListener('click', (e) => {
+    const button = e.target.closest('.copy');
+    if (button) {
+      navigator.clipboard.writeText(button.dataset.url);
+    }
+  });
 </script>
 </body>
 </html>

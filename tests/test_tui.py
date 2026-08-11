@@ -1,6 +1,7 @@
 import io
 from uuid import uuid4
 
+import pytest
 from rich.console import Console
 
 from anything2telegram import tui
@@ -84,5 +85,23 @@ async def test_a_registry_writer_records_progress_on_a_headless_console(
         progress(42, 100)
         assert registry.get(job_id).sent == 42
         assert registry.get(job_id).total == 100
+
+    assert registry.get(job_id) is None
+
+
+async def test_an_exception_inside_the_transfer_still_clears_the_registry_entry(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(tui, "CONSOLE", Console(file=io.StringIO()))
+    registry = ProgressRegistry(clock=_ticking_clock())
+    job_id = uuid4()
+
+    with pytest.raises(RuntimeError):
+        with tui.transfer(
+            "Upload", "clip.mp4", 100, registry.writer(job_id, JobPhase.UPLOADING)
+        ) as progress:
+            progress(42, 100)
+            assert registry.get(job_id) is not None
+            raise RuntimeError("boom")
 
     assert registry.get(job_id) is None

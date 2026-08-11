@@ -1,6 +1,6 @@
 {% macro source_cell(name, fallback_id, url) -%}
   {%- if name -%}{{ name }}{%- else -%}<span class="muted">{{ fallback_id }}</span>{%- endif -%}
-  <button type="button" class="copy" onclick="navigator.clipboard.writeText('{{ url }}')" aria-label="copy link">⧉</button>
+  <button type="button" class="copy" data-url="{{ url }}" aria-label="copy link">⧉</button>
 {%- endmacro %}
 {% macro progress_cell(job) -%}
   {%- set p = progress.get(job.id) -%}

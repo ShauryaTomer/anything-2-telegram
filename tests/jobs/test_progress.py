@@ -31,33 +31,3 @@ def test_a_second_update_within_one_second_is_invisible_until_the_clock_advances
     clock.advance(0.51)
     writer.update(20, 0)
     assert registry.get(job_id).sent == 20
-
-
-def test_done_clears_the_entry() -> None:
-    clock = FakeClock()
-    registry = ProgressRegistry(clock=clock)
-    job_id = uuid4()
-    writer = registry.writer(job_id, JobPhase.UPLOADING)
-    writer.update(5, 10)
-
-    writer.done()
-
-    assert registry.get(job_id) is None
-
-
-def test_done_clears_the_entry_even_when_the_transfer_exits_via_an_exception() -> None:
-    clock = FakeClock()
-    registry = ProgressRegistry(clock=clock)
-    job_id = uuid4()
-    writer = registry.writer(job_id, JobPhase.UPLOADING)
-    writer.update(5, 10)
-
-    try:
-        try:
-            raise RuntimeError("boom")
-        finally:
-            writer.done()
-    except RuntimeError:
-        pass
-
-    assert registry.get(job_id) is None
