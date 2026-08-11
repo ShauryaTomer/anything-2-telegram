@@ -168,6 +168,99 @@ def _declared_size(request: Request) -> int:
     return int(declared) if declared.isdigit() else 0
 
 
+class _UploadSubmitError(Exception):
+    """Upload submission failure with status code for response mapping."""
+
+    def __init__(self, code: str, status_code: int, message: str) -> None:
+        self.code = code
+        self.status_code = status_code
+        self.message = message
+        super().__init__(message)
+
+
+def _storage_error_to_submit_error(error: ArtifactStorageError) -> _UploadSubmitError:
+    """Map storage error to upload submit error."""
+    if error.code == "invalid_filename":
+        return _UploadSubmitError("invalid_filename", 422, "Artifact filename is invalid")
+    if error.code == "staging_oversize":
+        return _UploadSubmitError(
+            "staging_oversize", 413, "Upload exceeds maximum allowed size"
+        )
+    if error.code == "staging_disk_full":
+        return _UploadSubmitError(
+            "staging_disk_full", 507, "Artifact storage is full"
+        )
+    return _UploadSubmitError(
+        "upload_staging_failed", 500, "Upload could not be stored"
+    )
+
+
+async def _stage_upload_and_enqueue(
+    request: Request, state: object, max_bytes: int
+) -> JobRef:
+    """Stage upload and enqueue job, or raise _UploadSubmitError.
+
+    Returns JobRef on success. Raises _UploadSubmitError for expected failures
+    (invalid form, storage errors, scheduler unavailable). Cancels reservation
+    and re-raises on unexpected errors (e.g., RuntimeError during enqueue).
+    """
+    try:
+        form = await request.form(max_files=1, max_fields=1)
+    except OSError as error:
+        _LOGGER.exception("Multipart body could not be buffered")
+        if error.errno == errno.ENOSPC:
+            raise _UploadSubmitError(
+                "staging_disk_full", 507, "Artifact storage is full"
+            )
+        raise _UploadSubmitError(
+            "upload_staging_failed", 500, "Upload could not be stored"
+        )
+    except (MultiPartException, MultipartParseError):
+        raise _UploadSubmitError("invalid_request", 422, "Request is invalid")
+
+    try:
+        file = form.get("file")
+        caption = form.get("caption")
+        if (
+            not isinstance(file, UploadFile)
+            or not file.filename
+            or not isinstance(caption, (str, type(None)))
+            or set(form.keys()) - _UPLOAD_FIELDS
+        ):
+            raise _UploadSubmitError("invalid_request", 422, "Request is invalid")
+
+        try:
+            reservation = state.scheduler.reserve_local_upload(
+                file.filename, file.content_type, caption
+            )
+        except SchedulerError:
+            raise _UploadSubmitError(
+                "service_unavailable", 503, "Service is not ready"
+            )
+        except ArtifactStorageError as error:
+            raise _storage_error_to_submit_error(error)
+
+        try:
+            staged = await state.storage.stage(
+                _DisconnectAwareUpload(request, file), reservation, max_bytes
+            )
+            return state.scheduler.enqueue_reserved_upload(
+                reservation, staged.size_bytes
+            )
+        except ArtifactStorageError as error:
+            raise _storage_error_to_submit_error(error)
+        except SchedulerError:
+            state.scheduler.cancel_reserved_upload(reservation.job_id)
+            raise _UploadSubmitError(
+                "service_unavailable", 503, "Service is not ready"
+            )
+        except BaseException:
+            state.scheduler.cancel_reserved_upload(reservation.job_id)
+            raise
+    finally:
+        await form.close()
+
+
 def create_jobs_app() -> FastAPI:
     app = FastAPI()
 
@@ -237,55 +330,10 @@ def create_jobs_app() -> FastAPI:
             return _oversize()
 
         try:
-            form = await request.form(max_files=1, max_fields=1)
-        except OSError as error:
-            _LOGGER.exception("Multipart body could not be buffered")
-            if error.errno == errno.ENOSPC:
-                return _response(507, "staging_disk_full", "Artifact storage is full")
-            return _response(500, "upload_staging_failed", "Upload could not be stored")
-        except (MultiPartException, MultipartParseError):
-            return _invalid_request()
-
-        try:
-            file = form.get("file")
-            caption = form.get("caption")
-            if (
-                not isinstance(file, UploadFile)
-                or not file.filename
-                or not isinstance(caption, (str, type(None)))
-                or set(form.keys()) - _UPLOAD_FIELDS
-            ):
-                return _invalid_request()
-
-            try:
-                reservation = state.scheduler.reserve_local_upload(
-                    file.filename, file.content_type, caption
-                )
-            except SchedulerError:
-                return _service_unavailable()
-            except ArtifactStorageError as error:
-                return _storage_error(error)
-
-            try:
-                staged = await state.storage.stage(
-                    _DisconnectAwareUpload(request, file), reservation, max_bytes
-                )
-                return _submission_body(
-                    "job",
-                    state.scheduler.enqueue_reserved_upload(
-                        reservation, staged.size_bytes
-                    ),
-                )
-            except ArtifactStorageError as error:
-                return _storage_error(error)
-            except SchedulerError:
-                state.scheduler.cancel_reserved_upload(reservation.job_id)
-                return _service_unavailable()
-            except BaseException:
-                state.scheduler.cancel_reserved_upload(reservation.job_id)
-                raise
-        finally:
-            await form.close()
+            job_ref = await _stage_upload_and_enqueue(request, state, max_bytes)
+            return _submission_body("job", job_ref)
+        except _UploadSubmitError as error:
+            return _response(error.status_code, error.code, error.message)
 
     @app.get("/jobs/{job_id}")
     async def get_job(request: Request, job_id: str) -> object:
