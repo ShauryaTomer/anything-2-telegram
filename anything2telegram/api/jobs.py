@@ -17,6 +17,7 @@ from starlette.requests import ClientDisconnect
 
 from anything2telegram.artifacts.storage import ArtifactStorageError
 from anything2telegram.domain import (
+    BatchEntry,
     BatchRef,
     BatchSnapshot,
     ErrorInfo,
@@ -116,6 +117,15 @@ def _batch_body(snapshot: BatchSnapshot) -> dict[str, object]:
         "created_at": _timestamp(snapshot.created_at),
         "updated_at": _timestamp(snapshot.updated_at),
     }
+
+
+def _queue_row(entry: JobSnapshot | BatchEntry) -> dict[str, object]:
+    if isinstance(entry, BatchEntry):
+        return _batch_body(entry.batch) | {
+            "type": "batch",
+            "jobs": [_job_body(job) for job in entry.jobs],
+        }
+    return _job_body(entry) | {"type": "job"}
 
 
 def _submission_body(kind: str, ref: JobRef | BatchRef) -> dict[str, str]:
@@ -349,6 +359,11 @@ def create_jobs_app() -> FastAPI:
         if snapshot is None:
             return _response(404, "batch_not_found", "Batch not found")
         return _batch_body(snapshot)
+
+    @app.get("/queue")
+    async def get_queue(request: Request) -> object:
+        entries = request.app.state.tracker.list_queue()
+        return [_queue_row(entry) for entry in entries]
 
     @app.get("/health")
     async def health(request: Request) -> JSONResponse:

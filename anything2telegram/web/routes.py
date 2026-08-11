@@ -11,6 +11,13 @@ _WEB_ROOT = Path(__file__).parent
 _TEMPLATES = Jinja2Templates(directory=_WEB_ROOT / "templates")
 
 
+def _queue_entries(request: Request) -> tuple[object, ...]:
+    tracker = getattr(request.app.state, "tracker", None)
+    if tracker is None:
+        return ()
+    return tracker.list_queue()
+
+
 def register_web_routes(app: FastAPI) -> None:
     app.mount(
         "/web/static",
@@ -20,4 +27,12 @@ def register_web_routes(app: FastAPI) -> None:
 
     @app.get("/", response_class=HTMLResponse)
     async def page(request: Request) -> HTMLResponse:
-        return _TEMPLATES.TemplateResponse(request, "page.html", {})
+        return _TEMPLATES.TemplateResponse(
+            request, "page.html", {"entries": _queue_entries(request)}
+        )
+
+    @app.get("/web/queue", response_class=HTMLResponse)
+    async def queue_fragment(request: Request) -> HTMLResponse:
+        return _TEMPLATES.TemplateResponse(
+            request, "queue.html", {"entries": _queue_entries(request)}
+        )

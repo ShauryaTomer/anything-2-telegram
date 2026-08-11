@@ -3,6 +3,7 @@ from datetime import datetime
 from uuid import UUID
 
 from ..domain import (
+    BatchEntry,
     BatchSnapshot,
     BatchStatus,
     ErrorInfo,
@@ -138,6 +139,19 @@ class JobTracker:
             completed=counts[JobStatus.COMPLETED],
             failed=counts[JobStatus.FAILED],
         )
+
+    def list_queue(self) -> tuple[JobSnapshot | BatchEntry, ...]:
+        entries: list[tuple[datetime, JobSnapshot | BatchEntry]] = []
+        for job_id, job_record in self._jobs.items():
+            if job_record.batch_id is None:
+                snapshot = self.get_job(job_id)
+                entries.append((snapshot.created_at, snapshot))
+        for batch_id, batch_record in self._batches.items():
+            batch_snapshot = self.get_batch(batch_id)
+            children = tuple(self.get_job(job_id) for job_id in batch_record.job_ids)
+            entries.append((batch_snapshot.created_at, BatchEntry(batch_snapshot, children)))
+        entries.sort(key=lambda entry: entry[0], reverse=True)
+        return tuple(entry for _, entry in entries)
 
     def _on_batch_created(self, event: BatchCreated) -> None:
         if event.batch_id in self._batches:

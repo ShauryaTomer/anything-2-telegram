@@ -9,6 +9,7 @@ from httpx import ASGITransport, AsyncClient
 from anything2telegram.api.jobs import create_jobs_app
 from anything2telegram.artifacts.storage import ArtifactStorageError
 from anything2telegram.domain import (
+    BatchEntry,
     BatchRef,
     BatchSnapshot,
     BatchStatus,
@@ -109,12 +110,16 @@ class FakeTracker:
     def __init__(self) -> None:
         self.jobs: dict[UUID, JobSnapshot] = {}
         self.batches: dict[UUID, BatchSnapshot] = {}
+        self.queue: tuple[JobSnapshot | BatchEntry, ...] = ()
 
     def get_job(self, job_id: UUID) -> JobSnapshot | None:
         return self.jobs.get(job_id)
 
     def get_batch(self, batch_id: UUID) -> BatchSnapshot | None:
         return self.batches.get(batch_id)
+
+    def list_queue(self) -> tuple[JobSnapshot | BatchEntry, ...]:
+        return self.queue
 
 
 @pytest.fixture
@@ -436,6 +441,92 @@ async def test_unknown_and_malformed_identifiers_are_404(
 
     assert response.status_code == 404
     assert detail(response)["code"] == code
+
+
+async def test_queue_json_is_empty_when_nothing_is_queued(client) -> None:
+    response = await client.get("/queue")
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+async def test_queue_json_discriminates_jobs_and_batches_by_type(client, api) -> None:
+    job_id = uuid4()
+    job = JobSnapshot(
+        id=job_id,
+        batch_id=None,
+        source_kind=SourceKind.YOUTUBE,
+        source=VIDEO,
+        status=JobStatus.WAITING,
+        artifact_id=None,
+        filename=None,
+        size_bytes=None,
+        telegram_message_id=None,
+        error=None,
+        created_at=AT,
+        updated_at=AT,
+    )
+    batch_id, child_id = uuid4(), uuid4()
+    batch = BatchSnapshot(
+        id=batch_id,
+        source_url=PLAYLIST,
+        status=BatchStatus.PROCESSING,
+        job_ids=(child_id,),
+        skipped_entries=0,
+        error=None,
+        created_at=AT,
+        updated_at=AT,
+        total_jobs=1,
+        waiting=0,
+        producing=1,
+        uploading=0,
+        completed=0,
+        failed=0,
+    )
+    api.state.tracker.batches[batch_id] = batch
+    api.state.tracker.jobs[job_id] = job
+    child = JobSnapshot(
+        id=child_id,
+        batch_id=batch_id,
+        source_kind=SourceKind.YOUTUBE,
+        source="https://youtu.be/child",
+        status=JobStatus.PRODUCING,
+        artifact_id=None,
+        filename=None,
+        size_bytes=None,
+        telegram_message_id=None,
+        error=None,
+        created_at=AT,
+        updated_at=AT,
+    )
+    api.state.tracker.queue = (BatchEntry(batch, (child,)), job)
+
+    response = await client.get("/queue")
+    batch_response = await client.get(f"/batches/{batch_id}")
+    job_response = await client.get(f"/jobs/{job_id}")
+
+    assert response.status_code == 200
+    batch_row, job_row = response.json()
+    assert batch_row == batch_response.json() | {
+        "type": "batch",
+        "jobs": [
+            {
+                "id": str(child_id),
+                "batch_id": str(batch_id),
+                "source_kind": "youtube",
+                "source": "https://youtu.be/child",
+                "status": "producing",
+                "artifact_id": None,
+                "filename": None,
+                "size_bytes": None,
+                "telegram_message_id": None,
+                "error": None,
+                "created_at": "2026-07-26T12:00:00Z",
+                "updated_at": "2026-07-26T12:00:00Z",
+            }
+        ],
+    }
+    assert job_row == job_response.json() | {"type": "job"}
 
 
 async def test_health_reports_readiness_and_telegram_separately(client, api) -> None:

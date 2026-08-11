@@ -84,6 +84,12 @@ class BatchSnapshot:
 
 
 @dataclass(frozen=True)
+class BatchEntry:
+    batch: BatchSnapshot
+    jobs: tuple[JobSnapshot, ...]
+
+
+@dataclass(frozen=True)
 class JobRef:
     id: UUID
     status_url: str
