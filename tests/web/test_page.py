@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from httpx import ASGITransport, AsyncClient
@@ -125,6 +125,91 @@ async def test_web_queue_fragment_always_answers_200_with_its_own_poll_attrs() -
     assert 'hx-trigger="every 2s"' in body
     assert 'hx-swap="outerHTML"' in body
     assert "Nothing queued. Paste a YouTube URL or pick a file above." in body
+
+
+async def test_page_indents_batch_children_with_css() -> None:
+    async with await _client() as client:
+        response = await client.get("/")
+
+    body = response.text
+    assert ".queue-child" in body
+    assert "padding-left" in body
+
+
+async def test_web_queue_orders_interleaved_jobs_and_batches_newest_first() -> None:
+    bus = AsyncIOEventEmitter()
+    tracker = JobTracker()
+    tracker.register(bus)
+    job_a = UUID("10000000-0000-0000-0000-0000000000a1")
+    batch_a = UUID("20000000-0000-0000-0000-0000000000a1")
+    job_b = UUID("10000000-0000-0000-0000-0000000000b1")
+    batch_b = UUID("20000000-0000-0000-0000-0000000000b1")
+
+    bus.emit(
+        JOB_QUEUED,
+        JobQueued(job_a, None, SourceKind.YOUTUBE, "https://youtu.be/job-a", None, AT),
+    )
+    bus.emit(
+        BATCH_CREATED,
+        BatchCreated(
+            batch_a, "https://youtu.be/playlist?list=a", AT + timedelta(seconds=1)
+        ),
+    )
+    bus.emit(
+        JOB_QUEUED,
+        JobQueued(
+            job_b,
+            None,
+            SourceKind.YOUTUBE,
+            "https://youtu.be/job-b",
+            None,
+            AT + timedelta(seconds=2),
+        ),
+    )
+    bus.emit(
+        BATCH_CREATED,
+        BatchCreated(
+            batch_b, "https://youtu.be/playlist?list=b", AT + timedelta(seconds=3)
+        ),
+    )
+
+    async with await _client(tracker) as client:
+        page = await client.get("/")
+        fragment = await client.get("/web/queue")
+
+    for body in (page.text, fragment.text):
+        positions = [
+            body.index(marker)
+            for marker in (
+                "https://youtu.be/playlist?list=b",
+                "https://youtu.be/job-b",
+                "https://youtu.be/playlist?list=a",
+                "https://youtu.be/job-a",
+            )
+        ]
+        assert positions == sorted(positions)
+
+
+async def test_web_queue_renders_an_expanding_batch_with_no_children() -> None:
+    bus = AsyncIOEventEmitter()
+    tracker = JobTracker()
+    tracker.register(bus)
+    batch_id = UUID("20000000-0000-0000-0000-000000000099")
+    bus.emit(
+        BATCH_CREATED,
+        BatchCreated(batch_id, "https://youtu.be/playlist?list=expanding", AT),
+    )
+
+    async with await _client(tracker) as client:
+        page = await client.get("/")
+        fragment = await client.get("/web/queue")
+
+    assert page.status_code == fragment.status_code == 200
+    for body in (page.text, fragment.text):
+        assert "https://youtu.be/playlist?list=expanding" in body
+        assert "expanding" in body
+        assert "waiting" in body
+        assert 'class="queue-child"' not in body
 
 
 async def test_batch_children_are_numbered_zero_padded_to_the_batchs_width() -> None:
