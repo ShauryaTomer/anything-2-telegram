@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 
 from ..artifacts.storage import ArtifactStorage
 from ..config import Settings
-from ..domain import ErrorInfo, StagedArtifact
+from ..domain import ErrorInfo, JobPhase, StagedArtifact
 from ..events import (
     ARTIFACT_PRODUCTION_FAILED,
     ARTIFACT_READY,
@@ -29,6 +29,7 @@ from ..events import (
     PlaylistExpansionRequested,
     YouTubeDownloadRequested,
 )
+from ..jobs.progress import ProgressRegistry
 from ..tui import transfer
 from .process import ProcessResult, ProcessTimeoutError
 
@@ -42,6 +43,7 @@ YTDLP_FORMAT = (
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _PLAYLIST_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 _FINAL_MEDIA_SUFFIXES = frozenset({".mp4", ".mkv", ".webm"})
+_UNSAFE_NAME = re.compile(r"[/\x00-\x1f]+")
 _YTDLP_COMMAND = (sys.executable, "-m", "yt_dlp")
 _QUOTA_POLL_SECONDS = 1.0
 
@@ -127,6 +129,7 @@ class YouTubeArtifactProducer:
         storage: ArtifactStorage,
         process_runner,
         settings: Settings,
+        progress_registry: ProgressRegistry,
     ) -> None:
         self._bus = bus
         self._storage = storage
@@ -135,6 +138,7 @@ class YouTubeArtifactProducer:
         self._max_artifact_bytes = settings.max_artifact_bytes
         self._cookies_path = settings.cookies_path
         self._cookies_browser = settings.cookies_browser
+        self._progress = progress_registry
         bus.on(
             YOUTUBE_PLAYLIST_EXPANSION_REQUESTED,
             self.handle_playlist_expansion_requested,
@@ -309,7 +313,9 @@ class YouTubeArtifactProducer:
             # ponytail: bytes on disk, so no percentage — the final size is
             # unknown until yt-dlp merges. Parse --progress-template if a
             # percentage is ever worth streaming yt-dlp's stdout for.
-            with transfer("Download", label, 0) as report:
+            with transfer(
+                "Download", label, 0, self._progress.writer(job_id, JobPhase.PRODUCING)
+            ) as report:
                 while True:
                     done, _ = await asyncio.wait(
                         (runner_task,), timeout=_QUOTA_POLL_SECONDS
@@ -363,11 +369,13 @@ class YouTubeArtifactProducer:
             seen.add(source_id)
             if playlist_title is None:
                 playlist_title = _playlist_title(entry)
+            title = entry.get("title")
             targets.append(
                 DownloadTarget(
                     source_id,
                     f"https://www.youtube.com/watch?v={source_id}",
                     _caption_prefix(entry),
+                    title=title if isinstance(title, str) else None,
                 )
             )
         return targets, skipped, playlist_title
@@ -389,6 +397,8 @@ class YouTubeArtifactProducer:
         if len(candidates) != 1:
             raise RuntimeError("download output is missing or ambiguous")
         path = candidates[0]
+        caption = caption_prefix + path.stem.replace("_", " ")
+        path = path.rename(path.with_name(_caption_filename(caption, path.suffix)))
         return StagedArtifact(
             job_id,
             artifact_id,
@@ -396,7 +406,7 @@ class YouTubeArtifactProducer:
             path.name,
             mimetypes.guess_type(path.name)[0],
             path.stat().st_size,
-            caption_prefix + path.stem.replace("_", " "),
+            caption,
         )
 
     def _emit_playlist_failure(
@@ -479,6 +489,16 @@ def _caption_prefix(entry: dict) -> str:
         else:
             parts.append(str(index))
     return " - ".join(parts) + " - " if parts else ""
+
+
+def _caption_filename(caption: str, suffix: str) -> str:
+    """The caption as a filename, so Telegram shows the caption as the name too."""
+    # ponytail: only the bytes a POSIX path cannot hold are replaced; keep the
+    # spaces, they are the point. The 255-byte cap is the filesystem's limit.
+    stem = _UNSAFE_NAME.sub("_", caption).strip(" .")
+    limit = 255 - len(suffix.encode())
+    stem = stem.encode()[:limit].decode(errors="ignore").rstrip(" .")
+    return (stem or "video") + suffix
 
 
 class _PlaylistParseError(ValueError):

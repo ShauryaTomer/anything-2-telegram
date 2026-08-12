@@ -1,8 +1,12 @@
 import io
+from uuid import uuid4
 
+import pytest
 from rich.console import Console
 
 from anything2telegram import tui
+from anything2telegram.domain import JobPhase
+from anything2telegram.jobs.progress import ProgressRegistry
 
 
 async def test_a_terminal_transfer_renders_a_live_bar(monkeypatch) -> None:
@@ -37,3 +41,67 @@ async def test_an_unknown_total_is_reported_as_bytes(monkeypatch, caplog) -> Non
             progress(2_500_000, 0)
 
     assert "Download progress: 2.5 MB" in caplog.text
+
+
+def _ticking_clock():
+    """Advances by 2 seconds per read, clearing the registry's 1/s throttle."""
+    ticks = iter(range(0, 1000, 2))
+
+    def clock() -> float:
+        return next(ticks)
+
+    return clock
+
+
+async def test_a_registry_writer_records_progress_on_a_terminal_console(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        tui, "CONSOLE", Console(file=io.StringIO(), force_terminal=True, width=120)
+    )
+    registry = ProgressRegistry(clock=_ticking_clock())
+    job_id = uuid4()
+
+    with tui.transfer(
+        "Upload", "clip.mp4", 100, registry.writer(job_id, JobPhase.UPLOADING)
+    ) as progress:
+        progress(42, 100)
+        assert registry.get(job_id).sent == 42
+        assert registry.get(job_id).total == 100
+
+    assert registry.get(job_id) is None
+
+
+async def test_a_registry_writer_records_progress_on_a_headless_console(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(tui, "CONSOLE", Console(file=io.StringIO()))
+    registry = ProgressRegistry(clock=_ticking_clock())
+    job_id = uuid4()
+
+    with tui.transfer(
+        "Upload", "clip.mp4", 100, registry.writer(job_id, JobPhase.UPLOADING)
+    ) as progress:
+        progress(42, 100)
+        assert registry.get(job_id).sent == 42
+        assert registry.get(job_id).total == 100
+
+    assert registry.get(job_id) is None
+
+
+async def test_an_exception_inside_the_transfer_still_clears_the_registry_entry(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(tui, "CONSOLE", Console(file=io.StringIO()))
+    registry = ProgressRegistry(clock=_ticking_clock())
+    job_id = uuid4()
+
+    with pytest.raises(RuntimeError):
+        with tui.transfer(
+            "Upload", "clip.mp4", 100, registry.writer(job_id, JobPhase.UPLOADING)
+        ) as progress:
+            progress(42, 100)
+            assert registry.get(job_id) is not None
+            raise RuntimeError("boom")
+
+    assert registry.get(job_id) is None

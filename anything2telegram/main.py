@@ -15,6 +15,7 @@ from .config import Settings
 from .downloaders.process import YouTubeProcessRunner
 from .downloaders.youtube import YouTubeArtifactProducer
 from .events import ERROR, TELEGRAM_UNAVAILABLE
+from .jobs.progress import ProgressRegistry
 from .jobs.scheduler import JobScheduler
 from .jobs.tracker import JobTracker
 from .telegram.client import TelegramClientAdapter
@@ -103,15 +104,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         state.bus = AsyncIOEventEmitter()
         state.tracker = JobTracker()
         state.tracker.register(state.bus)
+        state.progress = ProgressRegistry()
         state.scheduler = JobScheduler(state.bus, state.storage)
         state.cleanup = ArtifactCleanup(state.storage)
         state.cleanup.register(state.bus)
         state.youtube = YouTubeArtifactProducer(
-            state.bus, state.storage, YouTubeProcessRunner(), resolved
+            state.bus, state.storage, YouTubeProcessRunner(), resolved, state.progress
         )
         state.telegram = TelegramClientAdapter(resolved)
         state.uploader = TelegramArtifactUploader(
-            state.bus, state.storage, state.telegram, resolved
+            state.bus, state.storage, state.telegram, resolved, state.progress
         )
 
         def on_event_error(error: object) -> None:

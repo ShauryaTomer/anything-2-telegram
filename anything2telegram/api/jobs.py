@@ -2,6 +2,7 @@
 
 import errno
 import logging
+from collections.abc import Callable
 from datetime import datetime
 from uuid import UUID
 
@@ -17,18 +18,22 @@ from starlette.requests import ClientDisconnect
 
 from anything2telegram.artifacts.storage import ArtifactStorageError
 from anything2telegram.domain import (
+    BatchEntry,
     BatchRef,
     BatchSnapshot,
     ErrorInfo,
     JobRef,
     JobSnapshot,
+    telegram_message_url,
 )
 from anything2telegram.downloaders.youtube import (
     UnsupportedYouTubeUrl,
     YouTubeUrlKind,
     classify_youtube_url,
 )
+from anything2telegram.jobs.progress import Progress
 from anything2telegram.jobs.scheduler import SchedulerError
+from anything2telegram.web.routes import register_web_routes
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -68,17 +73,6 @@ def _oversize() -> JSONResponse:
     return _response(413, "staging_oversize", "Upload exceeds maximum allowed size")
 
 
-def _storage_error(error: ArtifactStorageError) -> JSONResponse:
-    _LOGGER.warning("Upload staging failed: code=%s", error.code)
-    if error.code == "invalid_filename":
-        return _response(422, "invalid_filename", "Artifact filename is invalid")
-    if error.code == "staging_oversize":
-        return _oversize()
-    if error.code == "staging_disk_full":
-        return _response(507, "staging_disk_full", "Artifact storage is full")
-    return _response(500, "upload_staging_failed", "Upload could not be stored")
-
-
 def _timestamp(value: datetime) -> str:
     rendered = value.isoformat()
     if rendered.endswith("+00:00"):
@@ -92,7 +86,16 @@ def _error_info(value: ErrorInfo | None) -> dict[str, str] | None:
     return {"code": value.code, "message": value.message}
 
 
-def _job_body(snapshot: JobSnapshot) -> dict[str, object]:
+def _job_body(
+    snapshot: JobSnapshot, progress: Progress | None, topic_id: int | None
+) -> dict[str, object]:
+    chat_id = snapshot.telegram_chat_id
+    message_id = snapshot.telegram_message_id
+    message_url = (
+        telegram_message_url(chat_id, message_id, topic_id)
+        if chat_id is not None and message_id is not None
+        else None
+    )
     return {
         "id": str(snapshot.id),
         "batch_id": str(snapshot.batch_id) if snapshot.batch_id else None,
@@ -102,7 +105,12 @@ def _job_body(snapshot: JobSnapshot) -> dict[str, object]:
         "artifact_id": str(snapshot.artifact_id) if snapshot.artifact_id else None,
         "filename": snapshot.filename,
         "size_bytes": snapshot.size_bytes,
-        "telegram_message_id": snapshot.telegram_message_id,
+        "telegram_chat_id": chat_id,
+        "telegram_message_id": message_id,
+        "telegram_message_url": message_url,
+        "progress_phase": progress.phase.value if progress else None,
+        "progress_sent": progress.sent if progress else None,
+        "progress_total": progress.total if progress else None,
         "error": _error_info(snapshot.error),
         "created_at": _timestamp(snapshot.created_at),
         "updated_at": _timestamp(snapshot.updated_at),
@@ -126,6 +134,21 @@ def _batch_body(snapshot: BatchSnapshot) -> dict[str, object]:
         "created_at": _timestamp(snapshot.created_at),
         "updated_at": _timestamp(snapshot.updated_at),
     }
+
+
+def _queue_row(
+    entry: JobSnapshot | BatchEntry,
+    progress_lookup: Callable[[UUID], Progress | None],
+    topic_id: int | None,
+) -> dict[str, object]:
+    if isinstance(entry, BatchEntry):
+        return _batch_body(entry.batch) | {
+            "type": "batch",
+            "jobs": [
+                _job_body(job, progress_lookup(job.id), topic_id) for job in entry.jobs
+            ],
+        }
+    return _job_body(entry, progress_lookup(entry.id), topic_id) | {"type": "job"}
 
 
 def _submission_body(kind: str, ref: JobRef | BatchRef) -> dict[str, str]:
@@ -166,6 +189,100 @@ def _is_ready(request: Request) -> bool:
 def _declared_size(request: Request) -> int:
     declared = request.headers.get("content-length", "")
     return int(declared) if declared.isdigit() else 0
+
+
+class _UploadSubmitError(Exception):
+    """Upload submission failure with status code for response mapping."""
+
+    def __init__(self, code: str, status_code: int, message: str) -> None:
+        self.code = code
+        self.status_code = status_code
+        self.message = message
+        super().__init__(message)
+
+
+def _storage_error_to_submit_error(error: ArtifactStorageError) -> _UploadSubmitError:
+    """Map storage error to upload submit error."""
+    _LOGGER.warning("Upload staging failed: code=%s", error.code)
+    if error.code == "invalid_filename":
+        return _UploadSubmitError("invalid_filename", 422, "Artifact filename is invalid")
+    if error.code == "staging_oversize":
+        return _UploadSubmitError(
+            "staging_oversize", 413, "Upload exceeds maximum allowed size"
+        )
+    if error.code == "staging_disk_full":
+        return _UploadSubmitError(
+            "staging_disk_full", 507, "Artifact storage is full"
+        )
+    return _UploadSubmitError(
+        "upload_staging_failed", 500, "Upload could not be stored"
+    )
+
+
+async def _stage_upload_and_enqueue(
+    request: Request, state: object, max_bytes: int
+) -> JobRef:
+    """Stage upload and enqueue job, or raise _UploadSubmitError.
+
+    Returns JobRef on success. Raises _UploadSubmitError for expected failures
+    (invalid form, storage errors, scheduler unavailable). Cancels reservation
+    and re-raises on unexpected errors (e.g., RuntimeError during enqueue).
+    """
+    try:
+        form = await request.form(max_files=1, max_fields=1)
+    except OSError as error:
+        _LOGGER.exception("Multipart body could not be buffered")
+        if error.errno == errno.ENOSPC:
+            raise _UploadSubmitError(
+                "staging_disk_full", 507, "Artifact storage is full"
+            )
+        raise _UploadSubmitError(
+            "upload_staging_failed", 500, "Upload could not be stored"
+        )
+    except (MultiPartException, MultipartParseError):
+        raise _UploadSubmitError("invalid_request", 422, "Request is invalid")
+
+    try:
+        file = form.get("file")
+        caption = form.get("caption")
+        if (
+            not isinstance(file, UploadFile)
+            or not file.filename
+            or not isinstance(caption, (str, type(None)))
+            or set(form.keys()) - _UPLOAD_FIELDS
+        ):
+            raise _UploadSubmitError("invalid_request", 422, "Request is invalid")
+
+        try:
+            reservation = state.scheduler.reserve_local_upload(
+                file.filename, file.content_type, caption
+            )
+        except SchedulerError:
+            raise _UploadSubmitError(
+                "service_unavailable", 503, "Service is not ready"
+            )
+        except ArtifactStorageError as error:
+            raise _storage_error_to_submit_error(error)
+
+        try:
+            staged = await state.storage.stage(
+                _DisconnectAwareUpload(request, file), reservation, max_bytes
+            )
+            return state.scheduler.enqueue_reserved_upload(
+                reservation, staged.size_bytes
+            )
+        except ArtifactStorageError as error:
+            raise _storage_error_to_submit_error(error)
+        except SchedulerError:
+            state.scheduler.cancel_reserved_upload(reservation.job_id)
+            raise _UploadSubmitError(
+                "service_unavailable", 503, "Service is not ready"
+            )
+        except BaseException:
+            state.scheduler.cancel_reserved_upload(reservation.job_id)
+            raise
+    finally:
+        await form.close()
 
 
 def create_jobs_app() -> FastAPI:
@@ -237,55 +354,10 @@ def create_jobs_app() -> FastAPI:
             return _oversize()
 
         try:
-            form = await request.form(max_files=1, max_fields=1)
-        except OSError as error:
-            _LOGGER.exception("Multipart body could not be buffered")
-            if error.errno == errno.ENOSPC:
-                return _response(507, "staging_disk_full", "Artifact storage is full")
-            return _response(500, "upload_staging_failed", "Upload could not be stored")
-        except (MultiPartException, MultipartParseError):
-            return _invalid_request()
-
-        try:
-            file = form.get("file")
-            caption = form.get("caption")
-            if (
-                not isinstance(file, UploadFile)
-                or not file.filename
-                or not isinstance(caption, (str, type(None)))
-                or set(form.keys()) - _UPLOAD_FIELDS
-            ):
-                return _invalid_request()
-
-            try:
-                reservation = state.scheduler.reserve_local_upload(
-                    file.filename, file.content_type, caption
-                )
-            except SchedulerError:
-                return _service_unavailable()
-            except ArtifactStorageError as error:
-                return _storage_error(error)
-
-            try:
-                staged = await state.storage.stage(
-                    _DisconnectAwareUpload(request, file), reservation, max_bytes
-                )
-                return _submission_body(
-                    "job",
-                    state.scheduler.enqueue_reserved_upload(
-                        reservation, staged.size_bytes
-                    ),
-                )
-            except ArtifactStorageError as error:
-                return _storage_error(error)
-            except SchedulerError:
-                state.scheduler.cancel_reserved_upload(reservation.job_id)
-                return _service_unavailable()
-            except BaseException:
-                state.scheduler.cancel_reserved_upload(reservation.job_id)
-                raise
-        finally:
-            await form.close()
+            job_ref = await _stage_upload_and_enqueue(request, state, max_bytes)
+            return _submission_body("job", job_ref)
+        except _UploadSubmitError as error:
+            return _response(error.status_code, error.code, error.message)
 
     @app.get("/jobs/{job_id}")
     async def get_job(request: Request, job_id: str) -> object:
@@ -297,7 +369,9 @@ def create_jobs_app() -> FastAPI:
         )
         if snapshot is None:
             return _response(404, "job_not_found", "Job not found")
-        return _job_body(snapshot)
+        progress = request.app.state.progress.get(snapshot.id)
+        topic_id = request.app.state.settings.topic_id
+        return _job_body(snapshot, progress, topic_id)
 
     @app.get("/batches/{batch_id}")
     async def get_batch(request: Request, batch_id: str) -> object:
@@ -311,6 +385,13 @@ def create_jobs_app() -> FastAPI:
             return _response(404, "batch_not_found", "Batch not found")
         return _batch_body(snapshot)
 
+    @app.get("/queue")
+    async def get_queue(request: Request) -> object:
+        entries = request.app.state.tracker.list_queue()
+        topic_id = request.app.state.settings.topic_id
+        progress_lookup = request.app.state.progress.get
+        return [_queue_row(entry, progress_lookup, topic_id) for entry in entries]
+
     @app.get("/health")
     async def health(request: Request) -> JSONResponse:
         telegram = getattr(request.app.state, "telegram", None)
@@ -320,5 +401,7 @@ def create_jobs_app() -> FastAPI:
             status_code=200 if ready else 503,
             content={"ready": ready, "telegram_connected": connected},
         )
+
+    register_web_routes(app)
 
     return app

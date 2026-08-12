@@ -3,6 +3,7 @@ from datetime import datetime
 from uuid import UUID
 
 from ..domain import (
+    BatchEntry,
     BatchSnapshot,
     BatchStatus,
     ErrorInfo,
@@ -20,6 +21,7 @@ from ..events import (
     BATCH_JOBS_CREATED,
     JOB_QUEUED,
     JOB_STARTED,
+    YOUTUBE_PLAYLIST_EXPANDED,
     YOUTUBE_PLAYLIST_EXPANSION_FAILED,
     ArtifactProductionFailed,
     ArtifactReady,
@@ -29,6 +31,7 @@ from ..events import (
     BatchJobsCreated,
     JobQueued,
     JobStarted,
+    PlaylistExpanded,
     PlaylistExpansionFailed,
 )
 
@@ -47,10 +50,12 @@ class _JobRecord:
     batch_id: UUID | None
     source_kind: SourceKind
     source: str
+    title: str | None
     status: JobStatus
     artifact_id: UUID | None
     filename: str | None
     size_bytes: int | None
+    telegram_chat_id: int | None
     telegram_message_id: int | None
     error: ErrorInfo | None
     created_at: datetime
@@ -71,6 +76,7 @@ class _BatchRecord:
     updated_at: datetime
     pending_job_ids: tuple[UUID, ...] = ()
     terminal_event: object | None = None
+    title: str | None = None
 
 
 class JobTracker:
@@ -87,6 +93,7 @@ class JobTracker:
         bus.on(ARTIFACT_PRODUCTION_FAILED, self._on_artifact_production_failed)
         bus.on(ARTIFACT_UPLOADED, self._on_artifact_uploaded)
         bus.on(ARTIFACT_UPLOAD_FAILED, self._on_artifact_upload_failed)
+        bus.on(YOUTUBE_PLAYLIST_EXPANDED, self._on_playlist_expanded)
         bus.on(
             YOUTUBE_PLAYLIST_EXPANSION_FAILED,
             self._on_playlist_expansion_failed,
@@ -101,10 +108,12 @@ class JobTracker:
             batch_id=record.batch_id,
             source_kind=record.source_kind,
             source=record.source,
+            title=record.title,
             status=record.status,
             artifact_id=record.artifact_id,
             filename=record.filename,
             size_bytes=record.size_bytes,
+            telegram_chat_id=record.telegram_chat_id,
             telegram_message_id=record.telegram_message_id,
             error=record.error,
             created_at=record.created_at,
@@ -125,6 +134,7 @@ class JobTracker:
         return BatchSnapshot(
             id=record.id,
             source_url=record.source_url,
+            title=record.title,
             status=status,
             job_ids=record.job_ids,
             skipped_entries=record.skipped_entries,
@@ -138,6 +148,19 @@ class JobTracker:
             completed=counts[JobStatus.COMPLETED],
             failed=counts[JobStatus.FAILED],
         )
+
+    def list_queue(self) -> tuple[JobSnapshot | BatchEntry, ...]:
+        entries: list[tuple[datetime, JobSnapshot | BatchEntry]] = []
+        for job_id, job_record in self._jobs.items():
+            if job_record.batch_id is None:
+                snapshot = self.get_job(job_id)
+                entries.append((snapshot.created_at, snapshot))
+        for batch_id, batch_record in self._batches.items():
+            batch_snapshot = self.get_batch(batch_id)
+            children = tuple(self.get_job(job_id) for job_id in batch_record.job_ids)
+            entries.append((batch_snapshot.created_at, BatchEntry(batch_snapshot, children)))
+        entries.sort(key=lambda entry: entry[0], reverse=True)
+        return tuple(entry for _, entry in entries)
 
     def _on_batch_created(self, event: BatchCreated) -> None:
         if event.batch_id in self._batches:
@@ -166,10 +189,12 @@ class JobTracker:
             batch_id=event.batch_id,
             source_kind=event.source_kind,
             source=event.source,
+            title=event.title,
             status=JobStatus.WAITING,
             artifact_id=staged.artifact_id if staged is not None else None,
             filename=staged.filename if staged is not None else None,
             size_bytes=staged.size_bytes if staged is not None else None,
+            telegram_chat_id=None,
             telegram_message_id=None,
             error=None,
             created_at=event.occurred_at,
@@ -232,6 +257,7 @@ class JobTracker:
         self._require_status(record, JobStatus.UPLOADING)
         self._require_artifact(record, event.artifact_id)
         record.status = JobStatus.COMPLETED
+        record.telegram_chat_id = event.telegram_chat_id
         record.telegram_message_id = event.telegram_message_id
         record.terminal_event = event
         self._advance(record, event.occurred_at)
@@ -263,6 +289,10 @@ class JobTracker:
         record.pending_job_ids = ()
         record.skipped_entries = event.skipped_entries
         record.updated_at = event.occurred_at
+
+    def _on_playlist_expanded(self, event: PlaylistExpanded) -> None:
+        record = self._require_batch(event.batch_id)
+        record.title = event.playlist_title
 
     def _on_playlist_expansion_failed(
         self, event: PlaylistExpansionFailed

@@ -1,0 +1,78 @@
+{% macro source_cell(name, fallback_id, url) -%}
+  {%- if name -%}{{ name }}{%- else -%}<span class="muted">{{ fallback_id }}</span>{%- endif -%}
+  <button type="button" class="copy" data-url="{{ url }}" aria-label="copy link">⧉</button>
+{%- endmacro %}
+{% macro progress_cell(job) -%}
+  {%- set p = progress.get(job.id) -%}
+  {%- if p -%}
+    {%- if p.total == 0 -%}
+      <progress></progress> <span>{{ p.sent|format_bytes }}</span>
+    {%- else -%}
+      <progress value="{{ p.sent }}" max="{{ p.total }}"></progress> <span>{{ p.sent * 100 // p.total }}%</span>
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro %}
+{% macro link_cell(job) -%}
+  {%- if job.id in links -%}<a href="{{ links[job.id] }}">open</a>{%- endif -%}
+{%- endmacro %}
+{% macro status_cell(status, error) -%}
+  {%- if status.value == "failed" and error -%}
+    <span class="failed" title="{{ error.code }} — {{ error.message }}">failed</span>
+  {%- else -%}
+    {{ status.value }}
+  {%- endif -%}
+{%- endmacro %}
+<div id="queue" hx-get="/web/queue{% if open_param %}?open={{ open_param }}{% endif %}" hx-trigger="every 2s" hx-swap="outerHTML">
+  <table>
+    <thead>
+      <tr><th>Source</th><th>Status</th><th>Progress</th><th>Link</th></tr>
+    </thead>
+    <tbody>
+      {% if not entries %}
+      <tr><td colspan="4">Nothing queued. Paste a YouTube URL or pick a file above.</td></tr>
+      {% endif %}
+      {% for entry in entries %}
+        {% if entry.jobs is defined %}
+        {% set expanded = entry.batch.id|string in open %}
+        <tr>
+          <td>
+            {%- if entry.jobs -%}
+            <a class="toggle" hx-get="/web/queue?open={{ toggle_open(open, entry.batch.id) }}" hx-target="#queue" hx-swap="outerHTML">{{ "▾" if expanded else "▸" }}</a>
+            {%- else -%}
+            <span class="toggle"></span>
+            {%- endif %}
+            {{ source_cell(entry.batch.title, entry.batch.source_url|playlist_id, entry.batch.source_url) }}
+          </td>
+          <td>{{ status_cell(entry.batch.status, entry.batch.error) }}</td>
+          <td>{% if entry.batch.status.value == "expanding" %}waiting{% else %}{{ entry.batch.completed }}/{{ entry.batch.total_jobs }} done{% endif %}</td>
+          <td></td>
+        </tr>
+        {% if expanded %}
+        {% set width = entry.jobs|length|string|length %}
+        {% for job in entry.jobs %}
+        <tr class="queue-child">
+          <td>{{ ("%0" ~ width ~ "d")|format(loop.index) }}/{{ entry.jobs|length }} {{ source_cell(job.title, job.source|video_id, job.source) }}</td>
+          <td>{{ status_cell(job.status, job.error) }}</td>
+          <td>{{ progress_cell(job) }}</td>
+          <td>{{ link_cell(job) }}</td>
+        </tr>
+        {% endfor %}
+        {% endif %}
+        {% else %}
+        <tr>
+          <td>
+            {%- if entry.source_kind.value == "local_upload" -%}
+              {{ entry.filename }}
+            {%- else -%}
+              {{ source_cell(entry.filename, entry.source|video_id, entry.source) }}
+            {%- endif -%}
+          </td>
+          <td>{{ status_cell(entry.status, entry.error) }}</td>
+          <td>{{ progress_cell(entry) }}</td>
+          <td>{{ link_cell(entry) }}</td>
+        </tr>
+        {% endif %}
+      {% endfor %}
+    </tbody>
+  </table>
+</div>

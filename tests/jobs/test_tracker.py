@@ -7,6 +7,7 @@ import pytest
 from pyee.asyncio import AsyncIOEventEmitter
 
 from anything2telegram.domain import (
+    BatchEntry,
     BatchSnapshot,
     BatchStatus,
     ErrorInfo,
@@ -25,6 +26,7 @@ from anything2telegram.events import (
     BATCH_JOBS_CREATED,
     JOB_QUEUED,
     JOB_STARTED,
+    YOUTUBE_PLAYLIST_EXPANDED,
     YOUTUBE_PLAYLIST_EXPANSION_FAILED,
     ArtifactProductionFailed,
     ArtifactReady,
@@ -34,6 +36,7 @@ from anything2telegram.events import (
     BatchJobsCreated,
     JobQueued,
     JobStarted,
+    PlaylistExpanded,
     PlaylistExpansionFailed,
 )
 from anything2telegram.jobs.tracker import (
@@ -293,10 +296,12 @@ def test_job_queued_creates_exact_waiting_snapshot(tracked_bus) -> None:
         batch_id=None,
         source_kind=SourceKind.YOUTUBE,
         source="https://example.test/watch?v=one",
+        title=None,
         status=JobStatus.WAITING,
         artifact_id=None,
         filename=None,
         size_bytes=None,
+        telegram_chat_id=None,
         telegram_message_id=None,
         error=None,
         created_at=NOW,
@@ -341,10 +346,12 @@ def test_youtube_job_success_lifecycle_has_exact_fields_and_timestamps(tracked_b
         batch_id=None,
         source_kind=SourceKind.YOUTUBE,
         source="https://example.test/watch?v=one",
+        title=None,
         status=JobStatus.COMPLETED,
         artifact_id=ARTIFACT_1,
         filename="video.mp4",
         size_bytes=123,
+        telegram_chat_id=-100123,
         telegram_message_id=77,
         error=None,
         created_at=NOW,
@@ -746,6 +753,7 @@ def test_batch_created_has_exact_expanding_snapshot_and_zero_counts(tracked_bus)
     assert tracker.get_batch(BATCH) == BatchSnapshot(
         id=BATCH,
         source_url="https://example.test/playlist",
+        title=None,
         status=BatchStatus.EXPANDING,
         job_ids=(),
         skipped_entries=0,
@@ -773,6 +781,54 @@ def test_duplicate_batch_id_is_invalid_and_preserves_first_batch(tracked_bus) ->
     )
 
     assert tracker.get_batch(BATCH).source_url == first.source_url  # type: ignore[union-attr]
+
+
+def test_playlist_expanded_records_the_batch_title(tracked_bus) -> None:
+    tracker, bus, errors = tracked_bus
+    emit_valid(
+        bus,
+        errors,
+        BATCH_CREATED,
+        BatchCreated(BATCH, "https://example.test/playlist", NOW),
+    )
+    emit_valid(
+        bus,
+        errors,
+        YOUTUBE_PLAYLIST_EXPANDED,
+        PlaylistExpanded(BATCH, (), 0, time(1), "Rust Fundamentals"),
+    )
+
+    assert tracker.get_batch(BATCH).title == "Rust Fundamentals"  # type: ignore[union-attr]
+
+
+def test_playlist_expanded_rejects_missing_batch(tracked_bus) -> None:
+    _, bus, errors = tracked_bus
+    emit_invalid(
+        bus,
+        errors,
+        YOUTUBE_PLAYLIST_EXPANDED,
+        PlaylistExpanded(BATCH, (), 0, NOW, "Rust Fundamentals"),
+    )
+
+
+def test_job_queued_with_a_title_is_recorded_on_the_snapshot(tracked_bus) -> None:
+    tracker, bus, errors = tracked_bus
+    emit_valid(
+        bus,
+        errors,
+        JOB_QUEUED,
+        JobQueued(
+            JOB_1,
+            None,
+            SourceKind.YOUTUBE,
+            "https://example.test/watch?v=one",
+            None,
+            NOW,
+            title="Episode One",
+        ),
+    )
+
+    assert tracker.get_job(JOB_1).title == "Episode One"  # type: ignore[union-attr]
 
 
 @pytest.mark.parametrize(
@@ -1148,6 +1204,85 @@ def test_returned_snapshots_are_frozen_and_do_not_expose_internal_mutation(track
     assert batch.waiting == 2
     assert tracker.get_job(JOB_1).status is JobStatus.PRODUCING  # type: ignore[union-attr]
     assert tracker.get_batch(BATCH).waiting == 1  # type: ignore[union-attr]
+
+
+def test_list_queue_is_empty_when_nothing_is_tracked(tracked_bus) -> None:
+    tracker, _, _ = tracked_bus
+    assert tracker.list_queue() == ()
+
+
+def test_list_queue_returns_an_expanding_batch_with_no_children(tracked_bus) -> None:
+    tracker, bus, errors = tracked_bus
+    emit_valid(
+        bus,
+        errors,
+        BATCH_CREATED,
+        BatchCreated(BATCH, "https://example.test/playlist", NOW),
+    )
+
+    entries = tracker.list_queue()
+
+    assert len(entries) == 1
+    entry = entries[0]
+    assert isinstance(entry, BatchEntry)
+    assert entry.batch.status is BatchStatus.EXPANDING
+    assert entry.jobs == ()
+
+
+def test_list_queue_groups_batch_children_in_the_batchs_own_order(tracked_bus) -> None:
+    tracker, bus, errors = tracked_bus
+    create_batch_and_jobs(bus, errors, (JOB_2, JOB_1))
+
+    entries = tracker.list_queue()
+
+    assert len(entries) == 1
+    entry = entries[0]
+    assert isinstance(entry, BatchEntry)
+    assert [job.id for job in entry.jobs] == [JOB_2, JOB_1]
+
+
+def test_list_queue_excludes_batched_jobs_from_the_standalone_list(tracked_bus) -> None:
+    tracker, bus, errors = tracked_bus
+    create_batch_and_jobs(bus, errors)
+
+    entries = tracker.list_queue()
+
+    assert len(entries) == 1
+    assert isinstance(entries[0], BatchEntry)
+
+
+def test_list_queue_interleaves_standalone_jobs_and_batches_newest_first(
+    tracked_bus,
+) -> None:
+    tracker, bus, errors = tracked_bus
+    batch_2 = UUID("20000000-0000-0000-0000-000000000002")
+    emit_valid(bus, errors, JOB_QUEUED, youtube_queued(JOB_1, occurred_at=time(0)))
+    emit_valid(
+        bus,
+        errors,
+        BATCH_CREATED,
+        BatchCreated(BATCH, "https://example.test/first", time(1)),
+    )
+    emit_valid(bus, errors, JOB_QUEUED, youtube_queued(JOB_2, occurred_at=time(2)))
+    emit_valid(
+        bus,
+        errors,
+        BATCH_CREATED,
+        BatchCreated(batch_2, "https://example.test/second", time(3)),
+    )
+
+    entries = tracker.list_queue()
+
+    kinds = [
+        ("batch", entry.batch.id) if isinstance(entry, BatchEntry) else ("job", entry.id)
+        for entry in entries
+    ]
+    assert kinds == [
+        ("batch", batch_2),
+        ("job", JOB_2),
+        ("batch", BATCH),
+        ("job", JOB_1),
+    ]
 
 
 @pytest.mark.parametrize("register_tracker_first", [True, False])

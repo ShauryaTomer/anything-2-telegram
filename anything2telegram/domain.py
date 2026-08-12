@@ -55,10 +55,12 @@ class JobSnapshot:
     batch_id: UUID | None
     source_kind: SourceKind
     source: str
+    title: str | None
     status: JobStatus
     artifact_id: UUID | None
     filename: str | None
     size_bytes: int | None
+    telegram_chat_id: int | None
     telegram_message_id: int | None
     error: ErrorInfo | None
     created_at: datetime
@@ -69,6 +71,7 @@ class JobSnapshot:
 class BatchSnapshot:
     id: UUID
     source_url: str
+    title: str | None
     status: BatchStatus
     job_ids: tuple[UUID, ...]
     skipped_entries: int
@@ -81,6 +84,18 @@ class BatchSnapshot:
     uploading: int
     completed: int
     failed: int
+
+
+def telegram_message_url(chat_id: int, message_id: int, topic_id: int | None) -> str:
+    raw = str(chat_id).removeprefix("-100")
+    parts = [raw, topic_id, message_id] if topic_id else [raw, message_id]
+    return "https://t.me/c/" + "/".join(map(str, parts))
+
+
+@dataclass(frozen=True)
+class BatchEntry:
+    batch: BatchSnapshot
+    jobs: tuple[JobSnapshot, ...]
 
 
 @dataclass(frozen=True)

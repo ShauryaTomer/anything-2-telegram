@@ -54,6 +54,7 @@ class _YouTubeWork:
     job_id: UUID
     source_url: str
     caption_prefix: str = ""
+    title: str | None = None
 
 
 @dataclass(frozen=True)
@@ -277,7 +278,7 @@ class JobScheduler:
         ):
             return
         children = [
-            _YouTubeWork(uuid4(), target.source_url, target.caption_prefix)
+            _YouTubeWork(uuid4(), target.source_url, target.caption_prefix, target.title)
             for target in event.targets
         ]
         self._queue.extendleft(reversed(children))
@@ -292,6 +293,7 @@ class JobScheduler:
                     child.source_url,
                     None,
                     _now(),
+                    title=child.title,
                 ),
             )
         self._emit(

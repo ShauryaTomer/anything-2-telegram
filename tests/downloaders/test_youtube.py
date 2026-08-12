@@ -17,6 +17,7 @@ from anything2telegram.downloaders.youtube import (
     UnsupportedYouTubeUrl,
     YouTubeArtifactProducer,
     YouTubeUrlKind,
+    _caption_filename,
     classify_youtube_url,
 )
 from anything2telegram.events import (
@@ -27,6 +28,7 @@ from anything2telegram.events import (
     PlaylistExpansionRequested,
     YouTubeDownloadRequested,
 )
+from anything2telegram.jobs.progress import ProgressRegistry
 from tests.conftest import settings_for
 
 
@@ -129,7 +131,7 @@ def storage(tmp_path: Path) -> ArtifactStorage:
 
 
 def make_producer(bus, storage, runner, settings: Settings):
-    return YouTubeArtifactProducer(bus, storage, runner, settings)
+    return YouTubeArtifactProducer(bus, storage, runner, settings, ProgressRegistry())
 
 
 async def settle(bus: AsyncIOEventEmitter) -> None:
@@ -243,6 +245,30 @@ async def test_playlist_entries_carry_a_numbered_caption_prefix(
     ]
 
 
+async def test_playlist_entries_carry_their_own_title(
+    bus, storage, settings, recorder
+) -> None:
+    runner = ScriptedRunner(
+        ProcessResult(
+            0,
+            playlist_stdout(
+                {"id": VIDEO_ID, "title": "Episode One"},
+                {"id": "bbbbbbbbbbb"},
+            ),
+            "",
+        )
+    )
+    make_producer(bus, storage, runner, settings)
+
+    bus.emit("youtube.playlist.expansion.requested", expansion_request())
+    await settle(bus)
+
+    assert [target.title for target in recorder.expanded[0].targets] == [
+        "Episode One",
+        None,
+    ]
+
+
 async def test_a_caption_prefix_is_prepended_to_the_artifact_caption(
     bus, storage, settings, recorder
 ) -> None:
@@ -257,6 +283,9 @@ async def test_a_caption_prefix_is_prepended_to_the_artifact_caption(
     await settle(bus)
 
     assert recorder.ready[0].caption == "Rust - 03/12 - My Great Clip"
+    # The slash cannot survive in a path, everything else can.
+    assert recorder.ready[0].filename == "Rust - 03_12 - My Great Clip.mp4"
+    assert recorder.ready[0].local_path.name == recorder.ready[0].filename
 
 
 async def test_an_offset_becomes_a_one_indexed_playlist_start(
@@ -327,7 +356,8 @@ async def test_a_download_produces_a_ready_artifact_with_a_readable_caption(
     assert len(recorder.ready) == 1
     ready = recorder.ready[0]
     assert ready.job_id == event.job_id
-    assert ready.filename == "My_Great_Clip.mp4"
+    assert ready.filename == "My Great Clip.mp4"
+    assert ready.local_path.name == "My Great Clip.mp4"
     assert ready.caption == "My Great Clip"
     assert ready.media_type == "video/mp4"
     assert ready.size_bytes == 7
@@ -530,3 +560,22 @@ async def test_a_failed_playlist_expansion_logs_the_batch_and_reason(
 
     assert str(event.batch_id) in caplog.text
     assert "playlist does not exist" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "caption,expected",
+    [
+        ("My Great Clip", "My Great Clip.mp4"),
+        ("Rust - 03/12 - Traits", "Rust - 03_12 - Traits.mp4"),
+        ("  .hidden ", "hidden.mp4"),
+        ("..", "video.mp4"),
+        ("é" * 200, "é" * 125 + ".mp4"),
+    ],
+)
+def test_a_caption_becomes_a_filesystem_safe_filename(
+    caption: str, expected: str
+) -> None:
+    name = _caption_filename(caption, ".mp4")
+
+    assert name == expected
+    assert len(name.encode()) <= 255
