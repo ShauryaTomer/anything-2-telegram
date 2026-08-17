@@ -23,6 +23,7 @@ class Settings:
     bot_token: str = field(repr=False)
     channel_id: int
     session_path: Path
+    db_path: Path
     cookies_path: Path | None
     cookies_browser: str | None
     artifact_root: Path
@@ -55,6 +56,9 @@ class Settings:
             bot_token=_required(values, "TG_BOT_TOKEN"),
             channel_id=_integer(values, "TG_CHANNEL_ID"),
             session_path=session_path,
+            db_path=_path(
+                resolved_base, _value(values, "TG_DB_PATH", "./yt2tg.sqlite3")
+            ),
             cookies_path=_cookies_path(resolved_base, values),
             cookies_browser=_cookies_browser(values),
             artifact_root=_artifact_root(resolved_base, values),

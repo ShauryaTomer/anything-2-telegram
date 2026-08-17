@@ -16,6 +16,7 @@ class JobStatus(str, Enum):
     UPLOADING = "uploading"
     COMPLETED = "completed"
     FAILED = "failed"
+    INTERRUPTED = "interrupted"
 
 
 class BatchStatus(str, Enum):

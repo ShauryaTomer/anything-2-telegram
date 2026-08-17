@@ -25,6 +25,7 @@ from anything2telegram.events import (
     PlaylistExpanded,
 )
 from anything2telegram.jobs.progress import Progress
+from anything2telegram.jobs.repositories import BatchesRepository, JobsRepository, open_database
 from anything2telegram.jobs.tracker import JobTracker
 
 AT = datetime(2026, 7, 26, 12, 0, tzinfo=UTC)
@@ -40,6 +41,23 @@ class FakeProgressRegistry:
 
     def get(self, job_id: UUID) -> Progress | None:
         return self.values.get(job_id)
+
+
+async def _build_tracker(tmp_path: Path) -> tuple[JobTracker, object]:
+    conn = await open_database(tmp_path / "yt2tg.sqlite3")
+    return JobTracker(JobsRepository(conn), BatchesRepository(conn)), conn
+
+
+async def _drain(bus: AsyncIOEventEmitter) -> None:
+    """Async handlers run as scheduled tasks, not inline; let them finish."""
+    while not bus.complete:
+        await bus.wait_for_complete()
+
+
+async def _emit(bus: AsyncIOEventEmitter, topic: str, event: object) -> None:
+    """Emit, then drain, since handlers are causally dependent across calls."""
+    bus.emit(topic, event)
+    await _drain(bus)
 
 
 async def _client(
@@ -59,24 +77,25 @@ async def _client(
     return AsyncClient(transport=transport, base_url="http://service")
 
 
-def _tracker_with_a_standalone_job_and_a_batch() -> JobTracker:
+async def _tracker_with_a_standalone_job_and_a_batch(tmp_path: Path) -> JobTracker:
     bus = AsyncIOEventEmitter()
-    tracker = JobTracker()
+    tracker, _conn = await _build_tracker(tmp_path)
     tracker.register(bus)
 
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(JOB, None, SourceKind.YOUTUBE, "https://youtu.be/standalone", None, AT),
     )
-    bus.emit(BATCH_CREATED, BatchCreated(BATCH, "https://youtu.be/playlist?list=x", AT))
+    await _emit(bus, BATCH_CREATED, BatchCreated(BATCH, "https://youtu.be/playlist?list=x", AT))
     for child_id in (CHILD_1, CHILD_2):
-        bus.emit(
+        await _emit(bus, 
             JOB_QUEUED,
             JobQueued(
                 child_id, BATCH, SourceKind.YOUTUBE, f"https://youtu.be/{child_id}", None, AT
             ),
         )
-    bus.emit(BATCH_JOBS_CREATED, BatchJobsCreated(BATCH, (CHILD_1, CHILD_2), 0, AT))
+    await _emit(bus, BATCH_JOBS_CREATED, BatchJobsCreated(BATCH, (CHILD_1, CHILD_2), 0, AT))
+    await _drain(bus)
     return tracker
 
 
@@ -164,26 +183,26 @@ async def test_page_indents_batch_children_with_css() -> None:
     assert "padding-left" in body
 
 
-async def test_web_queue_orders_interleaved_jobs_and_batches_newest_first() -> None:
+async def test_web_queue_orders_interleaved_jobs_and_batches_newest_first(tmp_path: Path) -> None:
     bus = AsyncIOEventEmitter()
-    tracker = JobTracker()
+    tracker, _conn = await _build_tracker(tmp_path)
     tracker.register(bus)
     job_a = UUID("10000000-0000-0000-0000-0000000000a1")
     batch_a = UUID("20000000-0000-0000-0000-0000000000a1")
     job_b = UUID("10000000-0000-0000-0000-0000000000b1")
     batch_b = UUID("20000000-0000-0000-0000-0000000000b1")
 
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(job_a, None, SourceKind.YOUTUBE, "https://youtu.be/job-a", None, AT),
     )
-    bus.emit(
+    await _emit(bus, 
         BATCH_CREATED,
         BatchCreated(
             batch_a, "https://youtu.be/playlist?list=a", AT + timedelta(seconds=1)
         ),
     )
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(
             job_b,
@@ -194,12 +213,14 @@ async def test_web_queue_orders_interleaved_jobs_and_batches_newest_first() -> N
             AT + timedelta(seconds=2),
         ),
     )
-    bus.emit(
+    await _emit(bus, 
         BATCH_CREATED,
         BatchCreated(
             batch_b, "https://youtu.be/playlist?list=b", AT + timedelta(seconds=3)
         ),
     )
+
+    await _drain(bus)
 
     async with await _client(tracker) as client:
         page = await client.get("/")
@@ -218,15 +239,17 @@ async def test_web_queue_orders_interleaved_jobs_and_batches_newest_first() -> N
         assert positions == sorted(positions)
 
 
-async def test_web_queue_renders_an_expanding_batch_with_no_children() -> None:
+async def test_web_queue_renders_an_expanding_batch_with_no_children(tmp_path: Path) -> None:
     bus = AsyncIOEventEmitter()
-    tracker = JobTracker()
+    tracker, _conn = await _build_tracker(tmp_path)
     tracker.register(bus)
     batch_id = UUID("20000000-0000-0000-0000-000000000099")
-    bus.emit(
+    await _emit(bus, 
         BATCH_CREATED,
         BatchCreated(batch_id, "https://youtu.be/playlist?list=expanding", AT),
     )
+
+    await _drain(bus)
 
     async with await _client(tracker) as client:
         page = await client.get("/")
@@ -240,19 +263,21 @@ async def test_web_queue_renders_an_expanding_batch_with_no_children() -> None:
         assert 'class="queue-child"' not in body
 
 
-async def test_batch_children_are_numbered_zero_padded_to_the_batchs_width() -> None:
+async def test_batch_children_are_numbered_zero_padded_to_the_batchs_width(tmp_path: Path) -> None:
     bus = AsyncIOEventEmitter()
-    tracker = JobTracker()
+    tracker, _conn = await _build_tracker(tmp_path)
     tracker.register(bus)
     children = tuple(UUID(f"30000000-0000-0000-0000-{index:012d}") for index in range(1, 11))
 
-    bus.emit(BATCH_CREATED, BatchCreated(BATCH, "https://youtu.be/playlist?list=big", AT))
+    await _emit(bus, BATCH_CREATED, BatchCreated(BATCH, "https://youtu.be/playlist?list=big", AT))
     for child_id in children:
-        bus.emit(
+        await _emit(bus, 
             JOB_QUEUED,
             JobQueued(child_id, BATCH, SourceKind.YOUTUBE, str(child_id), None, AT),
         )
-    bus.emit(BATCH_JOBS_CREATED, BatchJobsCreated(BATCH, children, 0, AT))
+    await _emit(bus, BATCH_JOBS_CREATED, BatchJobsCreated(BATCH, children, 0, AT))
+
+    await _drain(bus)
 
     async with await _client(tracker) as client:
         response = await client.get(f"/web/queue?open={BATCH}")
@@ -262,8 +287,8 @@ async def test_batch_children_are_numbered_zero_padded_to_the_batchs_width() -> 
     assert f'10/10 <span class="muted">{children[9]}</span>' in body
 
 
-async def test_page_and_fragment_render_the_same_live_queue_rows() -> None:
-    tracker = _tracker_with_a_standalone_job_and_a_batch()
+async def test_page_and_fragment_render_the_same_live_queue_rows(tmp_path: Path) -> None:
+    tracker = await _tracker_with_a_standalone_job_and_a_batch(tmp_path)
 
     async with await _client(tracker) as client:
         page = await client.get(f"/?open={BATCH}")
@@ -281,31 +306,31 @@ async def test_page_and_fragment_render_the_same_live_queue_rows() -> None:
         assert f'2/2 <span class="muted">{CHILD_2}</span>' in body
 
 
-async def test_progress_cell_renders_indeterminate_bytes_determinate_percentage_or_blank() -> None:
+async def test_progress_cell_renders_indeterminate_bytes_determinate_percentage_or_blank(tmp_path: Path) -> None:
     bus = AsyncIOEventEmitter()
-    tracker = JobTracker()
+    tracker, _conn = await _build_tracker(tmp_path)
     tracker.register(bus)
     producing_id, uploading_id, waiting_id = uuid4(), uuid4(), uuid4()
 
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(producing_id, None, SourceKind.YOUTUBE, "https://youtu.be/aaaaaaaaaaa", None, AT),
     )
-    bus.emit(JOB_STARTED, JobStarted(producing_id, JobPhase.PRODUCING, AT))
+    await _emit(bus, JOB_STARTED, JobStarted(producing_id, JobPhase.PRODUCING, AT))
 
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(uploading_id, None, SourceKind.YOUTUBE, "https://youtu.be/bbbbbbbbbbb", None, AT),
     )
-    bus.emit(JOB_STARTED, JobStarted(uploading_id, JobPhase.PRODUCING, AT))
-    bus.emit(
+    await _emit(bus, JOB_STARTED, JobStarted(uploading_id, JobPhase.PRODUCING, AT))
+    await _emit(bus, 
         ARTIFACT_READY,
         ArtifactReady(
             uploading_id, uuid4(), Path("/tmp/clip.mp4"), "clip.mp4", "video/mp4", 200, None, AT
         ),
     )
 
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(waiting_id, None, SourceKind.YOUTUBE, "https://youtu.be/ccccccccccc", None, AT),
     )
@@ -313,6 +338,8 @@ async def test_progress_cell_renders_indeterminate_bytes_determinate_percentage_
     progress = FakeProgressRegistry()
     progress.values[producing_id] = Progress(JobPhase.PRODUCING, 2_500_000, 0)
     progress.values[uploading_id] = Progress(JobPhase.UPLOADING, 50, 200)
+
+    await _drain(bus)
 
     async with await _client(tracker, progress=progress) as client:
         response = await client.get("/web/queue")
@@ -326,33 +353,35 @@ async def test_progress_cell_renders_indeterminate_bytes_determinate_percentage_
     assert body.count("<progress") == 2
 
 
-async def test_link_cell_is_empty_until_completed_then_carries_the_derived_url_and_never_for_batches() -> None:
+async def test_link_cell_is_empty_until_completed_then_carries_the_derived_url_and_never_for_batches(tmp_path: Path) -> None:
     bus = AsyncIOEventEmitter()
-    tracker = JobTracker()
+    tracker, _conn = await _build_tracker(tmp_path)
     tracker.register(bus)
     completed_id, waiting_id, artifact_id = uuid4(), uuid4(), uuid4()
 
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(completed_id, None, SourceKind.YOUTUBE, "https://youtu.be/aaaaaaaaaaa", None, AT),
     )
-    bus.emit(JOB_STARTED, JobStarted(completed_id, JobPhase.PRODUCING, AT))
-    bus.emit(
+    await _emit(bus, JOB_STARTED, JobStarted(completed_id, JobPhase.PRODUCING, AT))
+    await _emit(bus, 
         ARTIFACT_READY,
         ArtifactReady(
             completed_id, artifact_id, Path("/tmp/clip.mp4"), "clip.mp4", "video/mp4", 200, None, AT
         ),
     )
-    bus.emit(
+    await _emit(bus, 
         ARTIFACT_UPLOADED,
         ArtifactUploaded(completed_id, artifact_id, -1001234567890, 55, AT),
     )
 
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(waiting_id, None, SourceKind.YOUTUBE, "https://youtu.be/bbbbbbbbbbb", None, AT),
     )
-    bus.emit(BATCH_CREATED, BatchCreated(BATCH, "https://youtu.be/playlist?list=x", AT))
+    await _emit(bus, BATCH_CREATED, BatchCreated(BATCH, "https://youtu.be/playlist?list=x", AT))
+
+    await _drain(bus)
 
     async with await _client(tracker, topic_id=7) as client:
         response = await client.get("/web/queue")
@@ -363,16 +392,16 @@ async def test_link_cell_is_empty_until_completed_then_carries_the_derived_url_a
     assert body.count("<a href=") == 1
 
 
-async def test_source_cell_shows_names_and_falls_back_to_muted_identifiers() -> None:
+async def test_source_cell_shows_names_and_falls_back_to_muted_identifiers(tmp_path: Path) -> None:
     bus = AsyncIOEventEmitter()
-    tracker = JobTracker()
+    tracker, _conn = await _build_tracker(tmp_path)
     tracker.register(bus)
 
-    bus.emit(
+    await _emit(bus, 
         BATCH_CREATED,
         BatchCreated(BATCH, "https://www.youtube.com/playlist?list=PL123", AT),
     )
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(
             CHILD_1,
@@ -384,26 +413,26 @@ async def test_source_cell_shows_names_and_falls_back_to_muted_identifiers() -> 
             title="Episode One",
         ),
     )
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(
             CHILD_2, BATCH, SourceKind.YOUTUBE, "https://www.youtube.com/watch?v=bbbbbbbbbbb", None, AT
         ),
     )
-    bus.emit(BATCH_JOBS_CREATED, BatchJobsCreated(BATCH, (CHILD_1, CHILD_2), 0, AT))
-    bus.emit(
+    await _emit(bus, BATCH_JOBS_CREATED, BatchJobsCreated(BATCH, (CHILD_1, CHILD_2), 0, AT))
+    await _emit(bus, 
         YOUTUBE_PLAYLIST_EXPANDED,
         PlaylistExpanded(BATCH, (), 0, AT, "Rust Fundamentals"),
     )
 
     batch_2 = uuid4()
-    bus.emit(
+    await _emit(bus, 
         BATCH_CREATED,
         BatchCreated(batch_2, "https://www.youtube.com/playlist?list=PLNOEXPAND", AT),
     )
 
     pre_filename_id = uuid4()
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(
             pre_filename_id, None, SourceKind.YOUTUBE, "https://www.youtube.com/watch?v=ccccccccccc", None, AT
@@ -411,14 +440,14 @@ async def test_source_cell_shows_names_and_falls_back_to_muted_identifiers() -> 
     )
 
     post_filename_id = uuid4()
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(
             post_filename_id, None, SourceKind.YOUTUBE, "https://www.youtube.com/watch?v=ddddddddddd", None, AT
         ),
     )
-    bus.emit(JOB_STARTED, JobStarted(post_filename_id, JobPhase.PRODUCING, AT))
-    bus.emit(
+    await _emit(bus, JOB_STARTED, JobStarted(post_filename_id, JobPhase.PRODUCING, AT))
+    await _emit(bus, 
         ARTIFACT_READY,
         ArtifactReady(
             post_filename_id, uuid4(), Path("/tmp/known.mp4"), "known.mp4", "video/mp4", 5, None, AT
@@ -426,10 +455,12 @@ async def test_source_cell_shows_names_and_falls_back_to_muted_identifiers() -> 
     )
 
     staged = StagedArtifact(uuid4(), uuid4(), Path("/tmp/upload.mp4"), "upload.mp4", "video/mp4", 5, None)
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(staged.job_id, None, SourceKind.LOCAL_UPLOAD, staged.filename, staged, AT),
     )
+
+    await _drain(bus)
 
     async with await _client(tracker) as client:
         response = await client.get(f"/web/queue?open={BATCH}")
@@ -444,20 +475,22 @@ async def test_source_cell_shows_names_and_falls_back_to_muted_identifiers() -> 
     assert "upload.mp4" in body
 
 
-async def test_copy_button_appears_only_for_rows_with_an_original_url() -> None:
+async def test_copy_button_appears_only_for_rows_with_an_original_url(tmp_path: Path) -> None:
     bus = AsyncIOEventEmitter()
-    tracker = JobTracker()
+    tracker, _conn = await _build_tracker(tmp_path)
     tracker.register(bus)
 
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(uuid4(), None, SourceKind.YOUTUBE, "https://youtu.be/aaaaaaaaaaa", None, AT),
     )
     staged = StagedArtifact(uuid4(), uuid4(), Path("/tmp/upload.mp4"), "upload.mp4", "video/mp4", 5, None)
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(staged.job_id, None, SourceKind.LOCAL_UPLOAD, staged.filename, staged, AT),
     )
+
+    await _drain(bus)
 
     async with await _client(tracker) as client:
         response = await client.get("/web/queue")
@@ -466,19 +499,21 @@ async def test_copy_button_appears_only_for_rows_with_an_original_url() -> None:
     assert body.count('class="copy"') == 1
 
 
-async def test_copy_button_url_with_an_apostrophe_is_escaped_not_injected() -> None:
+async def test_copy_button_url_with_an_apostrophe_is_escaped_not_injected(tmp_path: Path) -> None:
     """Regression: the copy button must never interpolate the URL into a JS
     string literal, where an escaped apostrophe (decoded by the browser
     before the JS parser runs) could break out and execute arbitrary code."""
     bus = AsyncIOEventEmitter()
-    tracker = JobTracker()
+    tracker, _conn = await _build_tracker(tmp_path)
     tracker.register(bus)
     malicious = "https://www.youtube.com/watch?v=aaaaaaaaaaa&z='-alert(1)-'"
 
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(uuid4(), None, SourceKind.YOUTUBE, malicious, None, AT),
     )
+
+    await _drain(bus)
 
     async with await _client(tracker) as client:
         response = await client.get("/web/queue")
@@ -491,25 +526,27 @@ async def test_copy_button_url_with_an_apostrophe_is_escaped_not_injected() -> N
     )
 
 
-async def test_failed_job_status_cell_carries_title_with_error_code_and_message() -> None:
+async def test_failed_job_status_cell_carries_title_with_error_code_and_message(tmp_path: Path) -> None:
     from anything2telegram.domain import ErrorInfo
     from anything2telegram.events import ARTIFACT_PRODUCTION_FAILED, ArtifactProductionFailed
 
     bus = AsyncIOEventEmitter()
-    tracker = JobTracker()
+    tracker, _conn = await _build_tracker(tmp_path)
     tracker.register(bus)
     job_id = uuid4()
 
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(job_id, None, SourceKind.YOUTUBE, "https://youtu.be/aaaaaaaaaaa", None, AT),
     )
-    bus.emit(JOB_STARTED, JobStarted(job_id, JobPhase.PRODUCING, AT))
+    await _emit(bus, JOB_STARTED, JobStarted(job_id, JobPhase.PRODUCING, AT))
     error = ErrorInfo("youtube_timeout", "YouTube operation timed out")
-    bus.emit(
+    await _emit(bus, 
         ARTIFACT_PRODUCTION_FAILED,
         ArtifactProductionFailed(job_id, None, error, AT),
     )
+
+    await _drain(bus)
 
     async with await _client(tracker) as client:
         response = await client.get("/web/queue")
@@ -518,24 +555,26 @@ async def test_failed_job_status_cell_carries_title_with_error_code_and_message(
     assert '<span class="failed" title="youtube_timeout — YouTube operation timed out">failed</span>' in body
 
 
-async def test_failed_batch_status_cell_carries_title_with_error_code_and_message() -> None:
+async def test_failed_batch_status_cell_carries_title_with_error_code_and_message(tmp_path: Path) -> None:
     from anything2telegram.domain import ErrorInfo
     from anything2telegram.events import YOUTUBE_PLAYLIST_EXPANSION_FAILED, PlaylistExpansionFailed
 
     bus = AsyncIOEventEmitter()
-    tracker = JobTracker()
+    tracker, _conn = await _build_tracker(tmp_path)
     tracker.register(bus)
     batch_id = uuid4()
 
-    bus.emit(
+    await _emit(bus, 
         BATCH_CREATED,
         BatchCreated(batch_id, "https://www.youtube.com/playlist?list=PLexpand", AT),
     )
     error = ErrorInfo("youtube_playlist_expansion_failed", "Playlist expansion failed")
-    bus.emit(
+    await _emit(bus, 
         YOUTUBE_PLAYLIST_EXPANSION_FAILED,
         PlaylistExpansionFailed(batch_id, error, AT),
     )
+
+    await _drain(bus)
 
     async with await _client(tracker) as client:
         response = await client.get("/web/queue")
@@ -544,52 +583,54 @@ async def test_failed_batch_status_cell_carries_title_with_error_code_and_messag
     assert '<span class="failed" title="youtube_playlist_expansion_failed — Playlist expansion failed">failed</span>' in body
 
 
-async def test_aggregate_count_on_partially_completed_batch_carries_no_title() -> None:
+async def test_aggregate_count_on_partially_completed_batch_carries_no_title(tmp_path: Path) -> None:
     bus = AsyncIOEventEmitter()
-    tracker = JobTracker()
+    tracker, _conn = await _build_tracker(tmp_path)
     tracker.register(bus)
     batch_id = uuid4()
     child_1 = uuid4()
     child_2 = uuid4()
 
-    bus.emit(
+    await _emit(bus, 
         BATCH_CREATED,
         BatchCreated(batch_id, "https://www.youtube.com/playlist?list=PLtest", AT),
     )
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(child_1, batch_id, SourceKind.YOUTUBE, "https://youtu.be/child1", None, AT),
     )
-    bus.emit(
+    await _emit(bus, 
         JOB_QUEUED,
         JobQueued(child_2, batch_id, SourceKind.YOUTUBE, "https://youtu.be/child2", None, AT),
     )
-    bus.emit(BATCH_JOBS_CREATED, BatchJobsCreated(batch_id, (child_1, child_2), 0, AT))
+    await _emit(bus, BATCH_JOBS_CREATED, BatchJobsCreated(batch_id, (child_1, child_2), 0, AT))
 
     # Emit a failure for child_1
     from anything2telegram.domain import ErrorInfo
     from anything2telegram.events import ARTIFACT_PRODUCTION_FAILED, ArtifactProductionFailed
 
-    bus.emit(JOB_STARTED, JobStarted(child_1, JobPhase.PRODUCING, AT))
+    await _emit(bus, JOB_STARTED, JobStarted(child_1, JobPhase.PRODUCING, AT))
     error = ErrorInfo("child_failed", "Child job failed")
-    bus.emit(
+    await _emit(bus, 
         ARTIFACT_PRODUCTION_FAILED,
         ArtifactProductionFailed(child_1, None, error, AT),
     )
 
     # Drive child_2 to COMPLETED to reach PARTIALLY_COMPLETED batch status (one completed + one failed)
     artifact_id_2 = uuid4()
-    bus.emit(JOB_STARTED, JobStarted(child_2, JobPhase.PRODUCING, AT))
-    bus.emit(
+    await _emit(bus, JOB_STARTED, JobStarted(child_2, JobPhase.PRODUCING, AT))
+    await _emit(bus, 
         ARTIFACT_READY,
         ArtifactReady(
             child_2, artifact_id_2, Path("/tmp/clip.mp4"), "clip.mp4", "video/mp4", 200, None, AT
         ),
     )
-    bus.emit(
+    await _emit(bus, 
         ARTIFACT_UPLOADED,
         ArtifactUploaded(child_2, artifact_id_2, -1001234567890, 55, AT),
     )
+
+    await _drain(bus)
 
     async with await _client(tracker) as client:
         response = await client.get(f"/web/queue?open={batch_id}")
@@ -609,24 +650,25 @@ async def test_aggregate_count_on_partially_completed_batch_carries_no_title() -
     assert 'title=' not in counts_cell, "Aggregate counts cell should not have a title attribute"
 
 
-def _tracker_with_two_batches() -> tuple[JobTracker, UUID, UUID]:
+async def _tracker_with_two_batches(tmp_path: Path) -> tuple[JobTracker, UUID, UUID]:
     bus = AsyncIOEventEmitter()
-    tracker = JobTracker()
+    tracker, _conn = await _build_tracker(tmp_path)
     tracker.register(bus)
     batch_x, batch_y = uuid4(), uuid4()
     for batch_id, tag in ((batch_x, "x"), (batch_y, "y")):
-        bus.emit(BATCH_CREATED, BatchCreated(batch_id, f"https://youtu.be/playlist?list={tag}", AT))
+        await _emit(bus, BATCH_CREATED, BatchCreated(batch_id, f"https://youtu.be/playlist?list={tag}", AT))
         child = uuid4()
-        bus.emit(
+        await _emit(bus, 
             JOB_QUEUED,
             JobQueued(child, batch_id, SourceKind.YOUTUBE, f"https://youtu.be/{tag}-child", None, AT),
         )
-        bus.emit(BATCH_JOBS_CREATED, BatchJobsCreated(batch_id, (child,), 0, AT))
+        await _emit(bus, BATCH_JOBS_CREATED, BatchJobsCreated(batch_id, (child,), 0, AT))
+    await _drain(bus)
     return tracker, batch_x, batch_y
 
 
-async def test_batch_children_are_collapsed_by_default() -> None:
-    tracker = _tracker_with_a_standalone_job_and_a_batch()
+async def test_batch_children_are_collapsed_by_default(tmp_path: Path) -> None:
+    tracker = await _tracker_with_a_standalone_job_and_a_batch(tmp_path)
 
     async with await _client(tracker) as client:
         response = await client.get("/web/queue")
@@ -635,8 +677,8 @@ async def test_batch_children_are_collapsed_by_default() -> None:
     assert 'class="queue-child"' not in response.text
 
 
-async def test_open_query_param_expands_exactly_the_named_batch() -> None:
-    tracker, batch_x, batch_y = _tracker_with_two_batches()
+async def test_open_query_param_expands_exactly_the_named_batch(tmp_path: Path) -> None:
+    tracker, batch_x, batch_y = await _tracker_with_two_batches(tmp_path)
 
     async with await _client(tracker) as client:
         response = await client.get(f"/web/queue?open={batch_x}")
@@ -647,8 +689,8 @@ async def test_open_query_param_expands_exactly_the_named_batch() -> None:
     assert "https://youtu.be/y-child" not in body
 
 
-async def test_unknown_batch_ids_in_open_are_ignored_not_rejected() -> None:
-    tracker = _tracker_with_a_standalone_job_and_a_batch()
+async def test_unknown_batch_ids_in_open_are_ignored_not_rejected(tmp_path: Path) -> None:
+    tracker = await _tracker_with_a_standalone_job_and_a_batch(tmp_path)
 
     async with await _client(tracker) as client:
         response = await client.get("/web/queue?open=not-a-real-id,also-garbage")
@@ -657,8 +699,8 @@ async def test_unknown_batch_ids_in_open_are_ignored_not_rejected() -> None:
     assert 'class="queue-child"' not in response.text
 
 
-async def test_queue_fragment_restates_the_open_set_in_its_own_poll_url() -> None:
-    tracker = _tracker_with_a_standalone_job_and_a_batch()
+async def test_queue_fragment_restates_the_open_set_in_its_own_poll_url(tmp_path: Path) -> None:
+    tracker = await _tracker_with_a_standalone_job_and_a_batch(tmp_path)
 
     async with await _client(tracker) as client:
         response = await client.get(f"/web/queue?open={BATCH}")
@@ -666,8 +708,8 @@ async def test_queue_fragment_restates_the_open_set_in_its_own_poll_url() -> Non
     assert f'hx-get="/web/queue?open={BATCH}"' in response.text
 
 
-async def test_submit_response_carries_the_open_set_through() -> None:
-    tracker = _tracker_with_a_standalone_job_and_a_batch()
+async def test_submit_response_carries_the_open_set_through(tmp_path: Path) -> None:
+    tracker = await _tracker_with_a_standalone_job_and_a_batch(tmp_path)
 
     async with await _client(tracker) as client:
         response = await client.post(f"/web/youtube?open={BATCH}", data={"url": "not-a-url"})
@@ -678,8 +720,8 @@ async def test_submit_response_carries_the_open_set_through() -> None:
     assert f'hx-get="/web/queue?open={BATCH}"' in body
 
 
-async def test_page_reload_with_open_query_param_renders_already_expanded() -> None:
-    tracker, batch_x, batch_y = _tracker_with_two_batches()
+async def test_page_reload_with_open_query_param_renders_already_expanded(tmp_path: Path) -> None:
+    tracker, batch_x, batch_y = await _tracker_with_two_batches(tmp_path)
 
     async with await _client(tracker) as client:
         response = await client.get(f"/?open={batch_x},{batch_y}")

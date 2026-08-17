@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
@@ -44,6 +43,7 @@ from ..events import (
     PlaylistExpansionRequested,
     YouTubeDownloadRequested,
 )
+from .repositories import BatchQueueRepository, JobQueueRepository, JobQueueRow, PlaylistQueueRow
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -87,16 +87,61 @@ def _unavailable() -> SchedulerError:
     return SchedulerError("scheduler_unavailable", "Scheduler is unavailable")
 
 
+def _work_to_job_queue_row(work: _YouTubeWork | _StagedWork) -> JobQueueRow:
+    if isinstance(work, _StagedWork):
+        staged = work.staged
+        return JobQueueRow(
+            job_id=staged.job_id,
+            kind="staged",
+            artifact_id=staged.artifact_id,
+            local_path=staged.local_path,
+            filename=staged.filename,
+            media_type=staged.media_type,
+            size_bytes=staged.size_bytes,
+            caption=staged.caption,
+        )
+    return JobQueueRow(
+        job_id=work.job_id,
+        kind="youtube",
+        source_url=work.source_url,
+        caption_prefix=work.caption_prefix,
+        title=work.title,
+    )
+
+
+def _row_to_work(row: JobQueueRow) -> _YouTubeWork | _StagedWork:
+    if row.kind == "staged":
+        staged = StagedArtifact(
+            row.job_id,
+            row.artifact_id,
+            row.local_path,
+            row.filename,
+            row.media_type,
+            row.size_bytes,
+            row.caption,
+        )
+        return _StagedWork(staged)
+    return _YouTubeWork(row.job_id, row.source_url, row.caption_prefix, row.title)
+
+
 class JobScheduler:
-    def __init__(self, bus, storage: ArtifactStorage) -> None:
+    def __init__(
+        self,
+        bus,
+        storage: ArtifactStorage,
+        job_queue: JobQueueRepository,
+        batch_queue: BatchQueueRepository,
+    ) -> None:
         self._bus = bus
         self._storage = storage
-        self._queue: deque[_Work] = deque()
+        self._job_queue = job_queue
+        self._batch_queue = batch_queue
         self._active: _Work | None = None
         self._active_phase: JobPhase | None = None
         self._active_artifact_id: UUID | None = None
         self._reservations: dict[UUID, UploadReservation] = {}
         self._pump_scheduled = False
+        self._pumping = False
         self._paused = False
         self._stopped = False
         bus.on(ARTIFACT_READY, self._on_artifact_ready)
@@ -111,10 +156,20 @@ class JobScheduler:
     def accepting(self) -> bool:
         return not (self._paused or self._stopped)
 
-    def submit_video(self, source_url: str) -> JobRef:
+    def start(self) -> None:
+        """Kick the pump once at boot, in case startup recovery seeded the queue.
+
+        Every other path into the queue (submit_video, submit_playlist,
+        enqueue_reserved_upload, and the terminal-fact handlers) already
+        requests a pump itself; recovery is the one way to populate the
+        queue without going through any of them.
+        """
+        self._request_pump()
+
+    async def submit_video(self, source_url: str) -> JobRef:
         self._require_accepting()
         job_id = uuid4()
-        self._queue.append(_YouTubeWork(job_id, source_url))
+        await self._job_queue.enqueue(JobQueueRow(job_id=job_id, kind="youtube", source_url=source_url))
         self._emit(
             JOB_QUEUED,
             JobQueued(job_id, None, SourceKind.YOUTUBE, source_url, None, _now()),
@@ -122,15 +177,15 @@ class JobScheduler:
         self._request_pump()
         return JobRef(job_id, f"/jobs/{job_id}")
 
-    def submit_playlist(self, source_url: str, offset: int = 0) -> BatchRef:
+    async def submit_playlist(self, source_url: str, offset: int = 0) -> BatchRef:
         self._require_accepting()
         batch_id = uuid4()
-        self._queue.append(_PlaylistWork(batch_id, source_url, offset))
+        await self._batch_queue.enqueue(PlaylistQueueRow(batch_id, source_url, offset))
         self._emit(BATCH_CREATED, BatchCreated(batch_id, source_url, _now()))
         self._request_pump()
         return BatchRef(batch_id, f"/batches/{batch_id}")
 
-    def reserve_local_upload(
+    async def reserve_local_upload(
         self,
         filename: str,
         media_type: str | None,
@@ -144,7 +199,7 @@ class JobScheduler:
         self._reservations[job_id] = reservation
         return reservation
 
-    def enqueue_reserved_upload(
+    async def enqueue_reserved_upload(
         self, reservation: UploadReservation, size_bytes: int
     ) -> JobRef:
         self._require_accepting()
@@ -169,7 +224,7 @@ class JobScheduler:
             ) from None
 
         del self._reservations[staged.job_id]
-        self._queue.append(_StagedWork(staged))
+        await self._job_queue.enqueue(_work_to_job_queue_row(_StagedWork(staged)))
         self._emit(
             JOB_QUEUED,
             JobQueued(
@@ -184,7 +239,7 @@ class JobScheduler:
         self._request_pump()
         return JobRef(staged.job_id, f"/jobs/{staged.job_id}")
 
-    def cancel_reserved_upload(self, job_id: UUID) -> bool:
+    async def cancel_reserved_upload(self, job_id: UUID) -> bool:
         if job_id not in self._reservations:
             return False
         self._release_reservation(job_id)
@@ -192,30 +247,41 @@ class JobScheduler:
 
     def pause(self) -> None:
         if not self._paused:
-            _LOGGER.warning(
-                "Scheduler paused, %d job(s) left waiting", len(self._queue)
-            )
+            _LOGGER.warning("Scheduler paused")
         self._paused = True
 
-    def stop(self) -> None:
+    def _mark_stopped(self) -> None:
         self._stopped = True
         for job_id in tuple(self._reservations):
             self._release_reservation(job_id)
-        for work in tuple(self._queue):
-            if isinstance(work, _StagedWork):
-                self._storage.delete_job_directory(work.job_id)
-                self._queue.remove(work)
+
+    async def _drop_queued_staged_uploads(self) -> None:
+        for entry in await self._job_queue.list_all():
+            if entry.kind == "staged":
+                self._storage.delete_job_directory(entry.job_id)
+                await self._job_queue.remove(entry.job_id)
+
+    async def stop(self) -> None:
+        self._mark_stopped()
+        await self._drop_queued_staged_uploads()
 
     def fail(self) -> None:
+        """A handler crashed. Same as stop(), plus drop the active upload's files.
+
+        Stays sync (unlike stop()) because it is called from the sync `error`
+        bus listener in main.py and from `_emit`'s except block — both need
+        `accepting` to flip immediately. The queued-upload DB cleanup that
+        `stop()` awaits happens here as a best-effort background task instead.
+        """
         if self._stopped:
             return
         _LOGGER.error(
-            "Scheduler failed, discarding %d queued job(s); active=%s",
-            len(self._queue),
+            "Scheduler failed, discarding queued job(s); active=%s",
             getattr(self._active, "job_id", None),
         )
         self._pump_scheduled = False
-        self.stop()
+        self._mark_stopped()
+        asyncio.get_running_loop().create_task(self._drop_queued_staged_uploads())
         if isinstance(self._active, _StagedWork):
             self._storage.delete_job_directory(self._active.job_id)
 
@@ -271,7 +337,7 @@ class JobScheduler:
         self._active_phase = None
         self._active_artifact_id = None
 
-    def _on_playlist_expanded(self, event: PlaylistExpanded) -> None:
+    async def _on_playlist_expanded(self, event: PlaylistExpanded) -> None:
         if (
             not isinstance(self._active, _PlaylistWork)
             or event.batch_id != self._active.batch_id
@@ -281,7 +347,7 @@ class JobScheduler:
             _YouTubeWork(uuid4(), target.source_url, target.caption_prefix, target.title)
             for target in event.targets
         ]
-        self._queue.extendleft(reversed(children))
+        await self._job_queue.prepend([_work_to_job_queue_row(child) for child in children])
         self._clear_active()
         for child in children:
             self._emit(
@@ -322,25 +388,45 @@ class JobScheduler:
         if self._paused or self._stopped or self._pump_scheduled:
             return
         self._pump_scheduled = True
-        asyncio.get_running_loop().call_soon(self._pump)
+        asyncio.get_running_loop().create_task(self._pump())
 
-    def _pump(self) -> None:
+    async def _next_work(self) -> _Work | None:
+        job_sequence = await self._job_queue.peek_sequence()
+        batch_sequence = await self._batch_queue.peek_sequence()
+        if job_sequence is None and batch_sequence is None:
+            return None
+        if batch_sequence is not None and (job_sequence is None or batch_sequence < job_sequence):
+            entry = await self._batch_queue.dequeue()
+            return _PlaylistWork(entry.batch_id, entry.source_url, entry.offset)
+        entry = await self._job_queue.dequeue()
+        return _row_to_work(entry)
+
+    async def _pump(self) -> None:
         self._pump_scheduled = False
-        if not self.accepting or self._active is not None or not self._queue:
+        # `_next_work()` awaits real DB I/O, so a second pump task can start
+        # and pass the `_active is None` check before this one has set
+        # `_active` — this flag closes that window, held for the whole body.
+        if self._pumping or not self.accepting or self._active is not None:
             return
-        work = self._queue.popleft()
-        self._active = work
-        self._active_artifact_id = None
+        self._pumping = True
         try:
-            if isinstance(work, _PlaylistWork):
-                self._start_playlist(work)
-            elif isinstance(work, _StagedWork):
-                self._start_upload(work)
-            else:
-                self._start_download(work)
-        except Exception:
-            self.fail()
-            raise
+            work = await self._next_work()
+            if work is None:
+                return
+            self._active = work
+            self._active_artifact_id = None
+            try:
+                if isinstance(work, _PlaylistWork):
+                    self._start_playlist(work)
+                elif isinstance(work, _StagedWork):
+                    self._start_upload(work)
+                else:
+                    self._start_download(work)
+            except Exception:
+                self.fail()
+                raise
+        finally:
+            self._pumping = False
 
     def _start_playlist(self, work: _PlaylistWork) -> None:
         self._active_phase = None

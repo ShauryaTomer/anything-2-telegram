@@ -10,16 +10,20 @@ from pyee.asyncio import AsyncIOEventEmitter
 from anything2telegram.api.jobs import create_jobs_app
 from anything2telegram.artifacts.storage import ArtifactStorage, ArtifactStorageError
 from anything2telegram.domain import (
-    BatchEntry,
     BatchRef,
-    BatchSnapshot,
-    BatchStatus,
     JobRef,
     JobSnapshot,
     JobStatus,
     SourceKind,
     StagedArtifact,
     UploadReservation,
+)
+from anything2telegram.jobs.repositories import (
+    BatchesRepository,
+    BatchQueueRepository,
+    JobQueueRepository,
+    JobsRepository,
+    open_database,
 )
 from anything2telegram.jobs.scheduler import JobScheduler, SchedulerError
 from anything2telegram.jobs.tracker import JobTracker
@@ -40,28 +44,28 @@ class _RecordingScheduler:
     def accepting(self) -> bool:
         return self._inner.accepting
 
-    def submit_video(self, url: str) -> JobRef:
+    async def submit_video(self, url: str) -> JobRef:
         self.calls.append(("video", url))
-        return self._inner.submit_video(url)
+        return await self._inner.submit_video(url)
 
-    def submit_playlist(self, url: str, offset: int = 0) -> BatchRef:
+    async def submit_playlist(self, url: str, offset: int = 0) -> BatchRef:
         self.calls.append(("playlist", (url, offset)))
-        return self._inner.submit_playlist(url, offset)
+        return await self._inner.submit_playlist(url, offset)
 
-    def reserve_local_upload(
+    async def reserve_local_upload(
         self, filename: str, media_type: str | None, caption: str | None
     ) -> UploadReservation:
         self.calls.append(("reserve", (filename, media_type, caption)))
-        return self._inner.reserve_local_upload(filename, media_type, caption)
+        return await self._inner.reserve_local_upload(filename, media_type, caption)
 
-    def enqueue_reserved_upload(
+    async def enqueue_reserved_upload(
         self, reservation: UploadReservation, size_bytes: int
     ) -> JobRef:
         self.calls.append(("enqueue", size_bytes))
-        return self._inner.enqueue_reserved_upload(reservation, size_bytes)
+        return await self._inner.enqueue_reserved_upload(reservation, size_bytes)
 
-    def cancel_reserved_upload(self, job_id: UUID) -> bool:
-        return self._inner.cancel_reserved_upload(job_id)
+    async def cancel_reserved_upload(self, job_id: UUID) -> bool:
+        return await self._inner.cancel_reserved_upload(job_id)
 
 
 def _ready(app) -> None:
@@ -70,19 +74,31 @@ def _ready(app) -> None:
 
 
 @pytest.fixture
-def wired_app(tmp_path: Path):
+async def wired_app(tmp_path: Path):
     """A real bus + scheduler + tracker, so a submit produces a real queue row."""
     app = create_jobs_app()
     bus = AsyncIOEventEmitter()
     storage = ArtifactStorage(tmp_path / "artifacts")
-    tracker = JobTracker()
+    conn = await open_database(tmp_path / "yt2tg.sqlite3")
+    tracker = JobTracker(JobsRepository(conn), BatchesRepository(conn))
     tracker.register(bus)
     app.state.settings = SimpleNamespace(max_artifact_bytes=1024)
     app.state.storage = storage
     app.state.tracker = tracker
-    app.state.scheduler = _RecordingScheduler(JobScheduler(bus, storage))
+    app.state.scheduler = _RecordingScheduler(
+        JobScheduler(bus, storage, JobQueueRepository(conn), BatchQueueRepository(conn))
+    )
+    app.state.bus = bus
     _ready(app)
-    return app
+    yield app
+    await _drain(bus)
+    await conn.close()
+
+
+async def _drain(bus: AsyncIOEventEmitter) -> None:
+    """Async handlers run as scheduled tasks, not inline; let them finish."""
+    while not bus.complete:
+        await bus.wait_for_complete()
 
 
 async def _client(app) -> AsyncClient:
@@ -99,12 +115,18 @@ async def test_youtube_video_submit_reaches_the_scheduler_and_shows_in_the_queue
 ) -> None:
     async with await _client(wired_app) as client:
         response = await client.post("/web/youtube", data={"url": VIDEO})
+        assert response.status_code == 200
+        body = response.text
+        assert _empty_flash(body)
+        assert "<article>" not in body
 
-    assert response.status_code == 200
-    body = response.text
-    assert VIDEO in body
-    assert _empty_flash(body)
-    assert "<article>" not in body
+        # JOB_QUEUED's tracker handler runs as a scheduled task, not inline,
+        # so the submitted job is not guaranteed to appear in this same
+        # response body — it lands on the next 2s poll. Drain, then poll.
+        await _drain(wired_app.state.bus)
+        queue = await client.get("/web/queue")
+
+    assert VIDEO in queue.text
     assert wired_app.state.scheduler.calls == [("video", VIDEO)]
 
 
@@ -113,11 +135,13 @@ async def test_youtube_playlist_submit_decrements_the_ui_offset(wired_app) -> No
         response = await client.post(
             "/web/youtube", data={"url": PLAYLIST, "offset": "5"}
         )
+        assert response.status_code == 200
+        assert _empty_flash(response.text)
 
-    assert response.status_code == 200
-    body = response.text
-    assert PLAYLIST in body
-    assert _empty_flash(body)
+        await _drain(wired_app.state.bus)
+        queue = await client.get("/web/queue")
+
+    assert PLAYLIST in queue.text
     assert wired_app.state.scheduler.calls == [("playlist", (PLAYLIST, 4))]
 
 
@@ -209,10 +233,10 @@ class _FakeSchedulerThatRefuses:
 
     accepting = True
 
-    def submit_video(self, url: str) -> JobRef:
+    async def submit_video(self, url: str) -> JobRef:
         raise SchedulerError("scheduler_unavailable", "Scheduler is unavailable")
 
-    def submit_playlist(self, url: str, offset: int = 0) -> BatchRef:
+    async def submit_playlist(self, url: str, offset: int = 0) -> BatchRef:
         raise SchedulerError("scheduler_unavailable", "Scheduler is unavailable")
 
 
@@ -220,7 +244,7 @@ class _StaticTracker:
     def __init__(self, queue: tuple[object, ...]) -> None:
         self._queue = queue
 
-    def list_queue(self) -> tuple[object, ...]:
+    async def list_queue(self) -> tuple[object, ...]:
         return self._queue
 
 
@@ -258,11 +282,15 @@ async def test_an_upload_is_staged_and_shows_in_the_queue(wired_app) -> None:
         response = await client.post(
             "/web/upload", files={"file": ("clip.mp4", b"payload", "video/mp4")}
         )
+        assert response.status_code == 200
+        assert _empty_flash(response.text)
 
-    assert response.status_code == 200
-    body = response.text
-    assert "clip.mp4" in body
-    assert _empty_flash(body)
+        # See the video-submit test above: the queued job's tracker write
+        # happens as a scheduled task, not inline within this response.
+        await _drain(wired_app.state.bus)
+        queue = await client.get("/web/queue")
+
+    assert "clip.mp4" in queue.text
     assert ("enqueue", 7) in wired_app.state.scheduler.calls
 
 

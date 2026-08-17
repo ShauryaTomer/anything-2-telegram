@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -12,10 +13,19 @@ from .api.jobs import create_jobs_app
 from .artifacts.cleanup import ArtifactCleanup
 from .artifacts.storage import ArtifactStorage
 from .config import Settings
+from .domain import JobStatus
 from .downloaders.process import YouTubeProcessRunner
 from .downloaders.youtube import YouTubeArtifactProducer
 from .events import ERROR, TELEGRAM_UNAVAILABLE
 from .jobs.progress import ProgressRegistry
+from .jobs.repositories import (
+    BatchesRepository,
+    BatchQueueRepository,
+    JobQueueRepository,
+    JobQueueRow,
+    JobsRepository,
+    open_database,
+)
 from .jobs.scheduler import JobScheduler
 from .jobs.tracker import JobTracker
 from .telegram.client import TelegramClientAdapter
@@ -74,15 +84,49 @@ async def _drain_bus(bus: AsyncIOEventEmitter, grace_seconds: float | int) -> No
         bus.cancel()
 
 
+async def _recover_interrupted_jobs(
+    jobs: JobsRepository, job_queue: JobQueueRepository
+) -> None:
+    """Retry, once, every job caught mid-flight when the process last died.
+
+    No failure fact was ever recorded for these, so FAILED (an observed,
+    never-auto-retried failure) would be the wrong status — INTERRUPTED is
+    assigned here, at startup, specifically so this recovery can safely
+    re-queue them from scratch under the same job_id.
+    """
+    stuck = await jobs.list_by_status((JobStatus.PRODUCING, JobStatus.UPLOADING))
+    for row in stuck:
+        row.status = JobStatus.INTERRUPTED
+        row.updated_at = datetime.now(UTC)
+        await jobs.update(row)
+        if row.staged:
+            queue_row = JobQueueRow(
+                job_id=row.id,
+                kind="staged",
+                artifact_id=row.artifact_id,
+                local_path=row.ready_local_path,
+                filename=row.filename,
+                media_type=row.ready_media_type,
+                size_bytes=row.size_bytes,
+                caption=row.ready_caption,
+            )
+        else:
+            queue_row = JobQueueRow(
+                job_id=row.id, kind="youtube", source_url=row.source, title=row.title
+            )
+        await job_queue.enqueue(queue_row)
+
+
 async def _shutdown(service: FastAPI) -> None:
     state = service.state
     state.readiness.close()
-    state.scheduler.stop()
+    await state.scheduler.stop()
     state.uploader.begin_shutdown()
     await _drain_bus(state.bus, state.settings.shutdown_grace_seconds)
     await state.uploader.stop(disconnect=False)
     state.storage.clear_orphans()
     await state.telegram.disconnect()
+    await state.db.close()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -101,11 +145,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         state.readiness = Readiness()
         state.storage = ArtifactStorage(resolved.artifact_root)
         state.storage.clear_orphans()
+        state.db = await open_database(resolved.db_path)
+        jobs_repo = JobsRepository(state.db)
+        batches_repo = BatchesRepository(state.db)
+        job_queue_repo = JobQueueRepository(state.db)
+        batch_queue_repo = BatchQueueRepository(state.db)
         state.bus = AsyncIOEventEmitter()
-        state.tracker = JobTracker()
+        state.tracker = JobTracker(jobs_repo, batches_repo)
         state.tracker.register(state.bus)
         state.progress = ProgressRegistry()
-        state.scheduler = JobScheduler(state.bus, state.storage)
+        state.scheduler = JobScheduler(
+            state.bus, state.storage, job_queue_repo, batch_queue_repo
+        )
+        await _recover_interrupted_jobs(jobs_repo, job_queue_repo)
         state.cleanup = ArtifactCleanup(state.storage)
         state.cleanup.register(state.bus)
         state.youtube = YouTubeArtifactProducer(
@@ -135,6 +187,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except BaseException:
             await _shutdown(service)
             raise
+        state.scheduler.start()
         state.readiness.open()
         try:
             yield

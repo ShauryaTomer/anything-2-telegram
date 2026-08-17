@@ -117,6 +117,7 @@ def settings_for(tmp_path: Path, **overrides: object) -> Settings:
         "bot_token": "unused",
         "channel_id": -1001,
         "session_path": tmp_path / "unused.session",
+        "db_path": tmp_path / "yt2tg.sqlite3",
         "cookies_path": None,
         "cookies_browser": None,
         "artifact_root": tmp_path / "artifacts",

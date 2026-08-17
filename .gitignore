@@ -23,6 +23,7 @@ __pycache__/
 .nox/
 .coverage
 htmlcov/
+*.sqlite3
 build/
 dist/
 *.egg-info/

@@ -62,14 +62,14 @@ def _ui_offset(raw: object) -> int | None:
     return value if value >= 1 else None
 
 
-def _queue_entries(request: Request) -> tuple[object, ...]:
+async def _queue_entries(request: Request) -> tuple[object, ...]:
     tracker = getattr(request.app.state, "tracker", None)
     if tracker is None:
         return ()
-    return tracker.list_queue()
+    return await tracker.list_queue()
 
 
-def _row_context(request: Request, open: str = "") -> dict[str, object]:
+async def _row_context(request: Request, open: str = "") -> dict[str, object]:
     """Live progress and completed-upload links, keyed by job id.
 
     The template has no app.state access, so every registry/settings read
@@ -78,7 +78,7 @@ def _row_context(request: Request, open: str = "") -> dict[str, object]:
     render queue.html so their notion of the open set never drifts apart.
     """
     open_ids, open_param = _parse_open(open)
-    entries = _queue_entries(request)
+    entries = await _queue_entries(request)
     registry = getattr(request.app.state, "progress", None)
     settings = getattr(request.app.state, "settings", None)
     topic_id = getattr(settings, "topic_id", None)
@@ -115,14 +115,14 @@ def _row_context(request: Request, open: str = "") -> dict[str, object]:
     }
 
 
-def _submit_response(
+async def _submit_response(
     request: Request, flash_code: str | None, flash_message: str | None, open: str = ""
 ) -> HTMLResponse:
+    context = await _row_context(request, open)
     return _TEMPLATES.TemplateResponse(
         request,
         "submit_response.html",
-        _row_context(request, open)
-        | {"flash_code": flash_code, "flash_message": flash_message},
+        context | {"flash_code": flash_code, "flash_message": flash_message},
     )
 
 
@@ -144,11 +144,13 @@ def register_web_routes(app: FastAPI) -> None:
 
     @app.get("/", response_class=HTMLResponse)
     async def page(request: Request, open: str = Query("")) -> HTMLResponse:
-        return _TEMPLATES.TemplateResponse(request, "page.html", _row_context(request, open))
+        context = await _row_context(request, open)
+        return _TEMPLATES.TemplateResponse(request, "page.html", context)
 
     @app.get("/web/queue", response_class=HTMLResponse)
     async def queue_fragment(request: Request, open: str = Query("")) -> HTMLResponse:
-        return _TEMPLATES.TemplateResponse(request, "queue.html", _row_context(request, open))
+        context = await _row_context(request, open)
+        return _TEMPLATES.TemplateResponse(request, "queue.html", context)
 
     @app.post("/web/youtube", response_class=HTMLResponse)
     async def submit_youtube(request: Request, open: str = Query("")) -> HTMLResponse:
@@ -159,46 +161,46 @@ def register_web_routes(app: FastAPI) -> None:
         form = await request.form()
         url = form.get("url")
         if not isinstance(url, str) or not url:
-            return _submit_response(request, "422", "Not a supported YouTube URL.", open)
+            return await _submit_response(request, "422", "Not a supported YouTube URL.", open)
 
         offset = _ui_offset(form.get("offset"))
         if offset is None:
-            return _submit_response(request, "422", "Request is invalid.", open)
+            return await _submit_response(request, "422", "Request is invalid.", open)
 
         try:
             kind = classify_youtube_url(url)
         except UnsupportedYouTubeUrl:
-            return _submit_response(request, "422", "Not a supported YouTube URL.", open)
+            return await _submit_response(request, "422", "Not a supported YouTube URL.", open)
 
         if not _is_ready(request):
-            return _submit_response(request, "503", _NOT_READY, open)
+            return await _submit_response(request, "503", _NOT_READY, open)
 
         scheduler = request.app.state.scheduler
         try:
             if kind is YouTubeUrlKind.VIDEO:
-                scheduler.submit_video(url)
+                await scheduler.submit_video(url)
             else:
-                scheduler.submit_playlist(url, offset - 1)
+                await scheduler.submit_playlist(url, offset - 1)
         except SchedulerError:
-            return _submit_response(request, "503", _NOT_READY, open)
+            return await _submit_response(request, "503", _NOT_READY, open)
 
-        return _submit_response(request, None, None, open)
+        return await _submit_response(request, None, None, open)
 
     @app.post("/web/upload", response_class=HTMLResponse)
     async def submit_upload(request: Request, open: str = Query("")) -> HTMLResponse:
         if not _is_ready(request):
-            return _submit_response(request, "503", _NOT_READY, open)
+            return await _submit_response(request, "503", _NOT_READY, open)
 
         state = request.app.state
         max_bytes = state.settings.max_artifact_bytes
         if _declared_size(request) > max_bytes:
-            return _submit_response(
+            return await _submit_response(
                 request, "413", "The file is larger than the staging limit.", open
             )
 
         try:
             await _stage_upload_and_enqueue(request, state, max_bytes)
         except _UploadSubmitError as error:
-            return _submit_response(request, str(error.status_code), error.message, open)
+            return await _submit_response(request, str(error.status_code), error.message, open)
 
-        return _submit_response(request, None, None, open)
+        return await _submit_response(request, None, None, open)

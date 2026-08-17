@@ -105,6 +105,19 @@ def test_an_unsafe_artifact_root_is_rejected(
         Settings.from_env(base_dir)
 
 
+def test_db_path_defaults_relative_to_base_dir(base_dir: Path) -> None:
+    settings = Settings.from_env(base_dir)
+    assert settings.db_path == base_dir / "yt2tg.sqlite3"
+
+
+def test_db_path_is_read_from_tg_db_path(
+    base_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TG_DB_PATH", "./state/jobs.sqlite3")
+    settings = Settings.from_env(base_dir)
+    assert settings.db_path == base_dir / "state" / "jobs.sqlite3"
+
+
 def test_the_session_suffix_is_added_once(
     base_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

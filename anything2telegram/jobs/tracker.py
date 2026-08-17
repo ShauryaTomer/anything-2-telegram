@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from uuid import UUID
 
@@ -6,11 +7,9 @@ from ..domain import (
     BatchEntry,
     BatchSnapshot,
     BatchStatus,
-    ErrorInfo,
     JobPhase,
     JobSnapshot,
     JobStatus,
-    SourceKind,
 )
 from ..events import (
     ARTIFACT_PRODUCTION_FAILED,
@@ -34,114 +33,84 @@ from ..events import (
     PlaylistExpanded,
     PlaylistExpansionFailed,
 )
+from .repositories import BatchesRepository, BatchRow, JobsRepository, JobRow
 
 
 class TrackingError(RuntimeError):
-    """Lifecycle fact cannot be applied to the in-memory projection."""
+    """Lifecycle fact cannot be applied to the persisted projection."""
 
 
 class InvalidJobTransition(TrackingError):
     """Job lifecycle fact conflicts with its current state."""
 
 
-@dataclass
-class _JobRecord:
-    id: UUID
-    batch_id: UUID | None
-    source_kind: SourceKind
-    source: str
-    title: str | None
-    status: JobStatus
-    artifact_id: UUID | None
-    filename: str | None
-    size_bytes: int | None
-    telegram_chat_id: int | None
-    telegram_message_id: int | None
-    error: ErrorInfo | None
-    created_at: datetime
-    updated_at: datetime
-    staged: bool
-    ready_event: ArtifactReady | None = None
-    terminal_event: object | None = None
-
-
-@dataclass
-class _BatchRecord:
-    id: UUID
-    source_url: str
-    job_ids: tuple[UUID, ...]
-    skipped_entries: int
-    error: ErrorInfo | None
-    created_at: datetime
-    updated_at: datetime
-    pending_job_ids: tuple[UUID, ...] = ()
-    terminal_event: object | None = None
-    title: str | None = None
-
-
 class JobTracker:
-    def __init__(self) -> None:
-        self._jobs: dict[UUID, _JobRecord] = {}
-        self._batches: dict[UUID, _BatchRecord] = {}
+    def __init__(self, jobs: JobsRepository, batches: BatchesRepository) -> None:
+        self._jobs = jobs
+        self._batches = batches
+        # Handlers are scheduled tasks now, not inline sync calls, so two
+        # causally-dependent facts for the same job/batch (e.g. JOB_STARTED
+        # then ARTIFACT_READY, emitted back-to-back) could otherwise have
+        # their read-mutate-write cycles interleave and race. The app is
+        # already single-process/one-job-at-a-time, so serializing every
+        # handler behind one lock just restores that same guarantee.
+        self._lock = asyncio.Lock()
 
     def register(self, bus) -> None:
-        bus.on(BATCH_CREATED, self._on_batch_created)
-        bus.on(BATCH_JOBS_CREATED, self._on_batch_jobs_created)
-        bus.on(JOB_QUEUED, self._on_job_queued)
-        bus.on(JOB_STARTED, self._on_job_started)
-        bus.on(ARTIFACT_READY, self._on_artifact_ready)
-        bus.on(ARTIFACT_PRODUCTION_FAILED, self._on_artifact_production_failed)
-        bus.on(ARTIFACT_UPLOADED, self._on_artifact_uploaded)
-        bus.on(ARTIFACT_UPLOAD_FAILED, self._on_artifact_upload_failed)
-        bus.on(YOUTUBE_PLAYLIST_EXPANDED, self._on_playlist_expanded)
+        bus.on(BATCH_CREATED, self._locked(self._on_batch_created))
+        bus.on(BATCH_JOBS_CREATED, self._locked(self._on_batch_jobs_created))
+        bus.on(JOB_QUEUED, self._locked(self._on_job_queued))
+        bus.on(JOB_STARTED, self._locked(self._on_job_started))
+        bus.on(ARTIFACT_READY, self._locked(self._on_artifact_ready))
+        bus.on(
+            ARTIFACT_PRODUCTION_FAILED,
+            self._locked(self._on_artifact_production_failed),
+        )
+        bus.on(ARTIFACT_UPLOADED, self._locked(self._on_artifact_uploaded))
+        bus.on(ARTIFACT_UPLOAD_FAILED, self._locked(self._on_artifact_upload_failed))
+        bus.on(YOUTUBE_PLAYLIST_EXPANDED, self._locked(self._on_playlist_expanded))
         bus.on(
             YOUTUBE_PLAYLIST_EXPANSION_FAILED,
-            self._on_playlist_expansion_failed,
+            self._locked(self._on_playlist_expansion_failed),
         )
 
-    def get_job(self, job_id: UUID) -> JobSnapshot | None:
-        record = self._jobs.get(job_id)
-        if record is None:
-            return None
-        return JobSnapshot(
-            id=record.id,
-            batch_id=record.batch_id,
-            source_kind=record.source_kind,
-            source=record.source,
-            title=record.title,
-            status=record.status,
-            artifact_id=record.artifact_id,
-            filename=record.filename,
-            size_bytes=record.size_bytes,
-            telegram_chat_id=record.telegram_chat_id,
-            telegram_message_id=record.telegram_message_id,
-            error=record.error,
-            created_at=record.created_at,
-            updated_at=record.updated_at,
-        )
+    def _locked(
+        self, handler: Callable[[object], Awaitable[None]]
+    ) -> Callable[[object], Awaitable[None]]:
+        async def wrapped(event: object) -> None:
+            async with self._lock:
+                await handler(event)
 
-    def get_batch(self, batch_id: UUID) -> BatchSnapshot | None:
-        record = self._batches.get(batch_id)
+        return wrapped
+
+    async def get_job(self, job_id: UUID) -> JobSnapshot | None:
+        row = await self._jobs.get(job_id)
+        return None if row is None else _snapshot_from_row(row)
+
+    async def get_batch(self, batch_id: UUID) -> BatchSnapshot | None:
+        record = await self._batches.get(batch_id)
         if record is None:
             return None
+        return await self._batch_snapshot(record)
+
+    async def _batch_snapshot(self, record: BatchRow) -> BatchSnapshot:
+        job_rows = await self._jobs.list_by_batch(record.id) if record.jobs_created else ()
         counts = {
-            status: sum(
-                self._jobs[job_id].status is status for job_id in record.job_ids
-            )
-            for status in JobStatus
+            status: sum(row.status is status for row in job_rows) for status in JobStatus
         }
-        status = self._derive_batch_status(record, counts)
+        job_ids = tuple(row.id for row in job_rows)
+        status = self._derive_batch_status(record, job_ids, counts)
         return BatchSnapshot(
             id=record.id,
             source_url=record.source_url,
             title=record.title,
             status=status,
-            job_ids=record.job_ids,
+            job_ids=job_ids,
             skipped_entries=record.skipped_entries,
             error=record.error,
             created_at=record.created_at,
             updated_at=record.updated_at,
-            total_jobs=len(record.job_ids),
+            total_jobs=len(job_ids),
             waiting=counts[JobStatus.WAITING],
             producing=counts[JobStatus.PRODUCING],
             uploading=counts[JobStatus.UPLOADING],
@@ -149,42 +118,45 @@ class JobTracker:
             failed=counts[JobStatus.FAILED],
         )
 
-    def list_queue(self) -> tuple[JobSnapshot | BatchEntry, ...]:
+    async def list_queue(self) -> tuple[JobSnapshot | BatchEntry, ...]:
         entries: list[tuple[datetime, JobSnapshot | BatchEntry]] = []
-        for job_id, job_record in self._jobs.items():
-            if job_record.batch_id is None:
-                snapshot = self.get_job(job_id)
-                entries.append((snapshot.created_at, snapshot))
-        for batch_id, batch_record in self._batches.items():
-            batch_snapshot = self.get_batch(batch_id)
-            children = tuple(self.get_job(job_id) for job_id in batch_record.job_ids)
+        for row in await self._jobs.list_standalone():
+            snapshot = _snapshot_from_row(row)
+            entries.append((snapshot.created_at, snapshot))
+        for record in await self._batches.list_all():
+            batch_snapshot = await self._batch_snapshot(record)
+            job_rows = await self._jobs.list_by_batch(record.id)
+            children = tuple(_snapshot_from_row(row) for row in job_rows)
             entries.append((batch_snapshot.created_at, BatchEntry(batch_snapshot, children)))
         entries.sort(key=lambda entry: entry[0], reverse=True)
         return tuple(entry for _, entry in entries)
 
-    def _on_batch_created(self, event: BatchCreated) -> None:
-        if event.batch_id in self._batches:
+    async def _on_batch_created(self, event: BatchCreated) -> None:
+        if await self._batches.get(event.batch_id) is not None:
             raise TrackingError("duplicate batch")
-        self._batches[event.batch_id] = _BatchRecord(
-            id=event.batch_id,
-            source_url=event.source_url,
-            job_ids=(),
-            skipped_entries=0,
-            error=None,
-            created_at=event.occurred_at,
-            updated_at=event.occurred_at,
+        await self._batches.insert(
+            BatchRow(
+                id=event.batch_id,
+                source_url=event.source_url,
+                title=None,
+                jobs_created=False,
+                skipped_entries=0,
+                error=None,
+                created_at=event.occurred_at,
+                updated_at=event.occurred_at,
+            )
         )
 
-    def _on_job_queued(self, event: JobQueued) -> None:
-        if event.job_id in self._jobs:
+    async def _on_job_queued(self, event: JobQueued) -> None:
+        if await self._jobs.get(event.job_id) is not None:
             raise TrackingError("duplicate job")
         batch = None
         if event.batch_id is not None:
-            batch = self._require_batch(event.batch_id)
-            if batch.job_ids or batch.terminal_event is not None:
+            batch = await self._require_batch(event.batch_id)
+            if batch.jobs_created or batch.error is not None:
                 raise TrackingError("invalid batch transition")
         staged = event.staged_artifact
-        self._jobs[event.job_id] = _JobRecord(
+        row = JobRow(
             id=event.job_id,
             batch_id=event.batch_id,
             source_kind=event.source_kind,
@@ -201,23 +173,26 @@ class JobTracker:
             updated_at=event.occurred_at,
             staged=staged is not None,
         )
+        await self._jobs.insert(row)
         if batch is not None:
-            batch.pending_job_ids += (event.job_id,)
-        self._touch_batch(self._jobs[event.job_id], event.occurred_at)
+            await self._touch_batch(batch, event.occurred_at)
 
-    def _on_job_started(self, event: JobStarted) -> None:
-        record = self._require_job(event.job_id)
-        self._require_status(record, JobStatus.WAITING)
+    async def _on_job_started(self, event: JobStarted) -> None:
+        record = await self._require_job(event.job_id)
+        if record.status not in (JobStatus.WAITING, JobStatus.INTERRUPTED):
+            raise InvalidJobTransition("invalid job transition")
         expected_phase = JobPhase.UPLOADING if record.staged else JobPhase.PRODUCING
         if event.phase is not expected_phase:
             raise InvalidJobTransition("invalid job phase")
         record.status = JobStatus(event.phase.value)
-        self._advance(record, event.occurred_at)
+        record.updated_at = event.occurred_at
+        await self._jobs.update(record)
+        await self._touch_batch_for_job(record, event.occurred_at)
 
-    def _on_artifact_ready(self, event: ArtifactReady) -> None:
-        record = self._require_job(event.job_id)
-        if record.ready_event is not None:
-            if record.ready_event == event:
+    async def _on_artifact_ready(self, event: ArtifactReady) -> None:
+        record = await self._require_job(event.job_id)
+        if record.ready_local_path is not None:
+            if _matches_ready_event(record, event):
                 return
             raise InvalidJobTransition("conflicting artifact ready event")
         if record.staged:
@@ -231,13 +206,17 @@ class JobTracker:
         record.artifact_id = event.artifact_id
         record.filename = event.filename
         record.size_bytes = event.size_bytes
-        record.ready_event = event
-        self._advance(record, event.occurred_at)
+        record.ready_local_path = event.local_path
+        record.ready_media_type = event.media_type
+        record.ready_caption = event.caption
+        record.updated_at = event.occurred_at
+        await self._jobs.update(record)
+        await self._touch_batch_for_job(record, event.occurred_at)
 
-    def _on_artifact_production_failed(
+    async def _on_artifact_production_failed(
         self, event: ArtifactProductionFailed
     ) -> None:
-        record = self._require_job(event.job_id)
+        record = await self._require_job(event.job_id)
         if self._terminal_duplicate(record, event):
             return
         self._require_status(record, JobStatus.PRODUCING)
@@ -247,11 +226,12 @@ class JobTracker:
             record.artifact_id = event.artifact_id
         record.status = JobStatus.FAILED
         record.error = event.error
-        record.terminal_event = event
-        self._advance(record, event.occurred_at)
+        record.updated_at = event.occurred_at
+        await self._jobs.update(record)
+        await self._touch_batch_for_job(record, event.occurred_at)
 
-    def _on_artifact_uploaded(self, event: ArtifactUploaded) -> None:
-        record = self._require_job(event.job_id)
+    async def _on_artifact_uploaded(self, event: ArtifactUploaded) -> None:
+        record = await self._require_job(event.job_id)
         if self._terminal_duplicate(record, event):
             return
         self._require_status(record, JobStatus.UPLOADING)
@@ -259,116 +239,168 @@ class JobTracker:
         record.status = JobStatus.COMPLETED
         record.telegram_chat_id = event.telegram_chat_id
         record.telegram_message_id = event.telegram_message_id
-        record.terminal_event = event
-        self._advance(record, event.occurred_at)
+        record.updated_at = event.occurred_at
+        await self._jobs.update(record)
+        await self._touch_batch_for_job(record, event.occurred_at)
 
-    def _on_artifact_upload_failed(self, event: ArtifactUploadFailed) -> None:
-        record = self._require_job(event.job_id)
+    async def _on_artifact_upload_failed(self, event: ArtifactUploadFailed) -> None:
+        record = await self._require_job(event.job_id)
         if self._terminal_duplicate(record, event):
             return
         self._require_status(record, JobStatus.UPLOADING)
         self._require_artifact(record, event.artifact_id)
         record.status = JobStatus.FAILED
         record.error = event.error
-        record.terminal_event = event
-        self._advance(record, event.occurred_at)
+        record.updated_at = event.occurred_at
+        await self._jobs.update(record)
+        await self._touch_batch_for_job(record, event.occurred_at)
 
-    def _on_batch_jobs_created(self, event: BatchJobsCreated) -> None:
-        record = self._require_batch(event.batch_id)
-        if record.job_ids or record.terminal_event is not None:
+    async def _on_batch_jobs_created(self, event: BatchJobsCreated) -> None:
+        record = await self._require_batch(event.batch_id)
+        if record.jobs_created or record.error is not None:
             raise TrackingError("invalid batch transition")
-        if not record.pending_job_ids or event.job_ids != record.pending_job_ids:
+        pending = tuple(row.id for row in await self._jobs.list_by_batch(event.batch_id))
+        if not pending or event.job_ids != pending:
             raise TrackingError("batch jobs do not match queued jobs")
-        for job_id in event.job_ids:
-            job = self._jobs.get(job_id)
-            if job is None:
-                raise TrackingError("unknown job")
-            if job.batch_id != event.batch_id:
-                raise TrackingError("job does not belong to batch")
-        record.job_ids = event.job_ids
-        record.pending_job_ids = ()
+        record.jobs_created = True
         record.skipped_entries = event.skipped_entries
         record.updated_at = event.occurred_at
+        await self._batches.update(record)
 
-    def _on_playlist_expanded(self, event: PlaylistExpanded) -> None:
-        record = self._require_batch(event.batch_id)
+    async def _on_playlist_expanded(self, event: PlaylistExpanded) -> None:
+        record = await self._require_batch(event.batch_id)
         record.title = event.playlist_title
+        await self._batches.update(record)
 
-    def _on_playlist_expansion_failed(
+    async def _on_playlist_expansion_failed(
         self, event: PlaylistExpansionFailed
     ) -> None:
-        record = self._require_batch(event.batch_id)
-        if record.terminal_event is not None:
-            if record.terminal_event == event:
+        record = await self._require_batch(event.batch_id)
+        if record.error is not None:
+            if record.error == event.error and record.updated_at == event.occurred_at:
                 return
             raise TrackingError("conflicting batch terminal event")
-        if record.job_ids or record.pending_job_ids:
+        pending = await self._jobs.list_by_batch(event.batch_id)
+        if record.jobs_created or pending:
             raise TrackingError("invalid batch transition")
         record.error = event.error
-        record.terminal_event = event
         record.updated_at = event.occurred_at
+        await self._batches.update(record)
 
-    def _require_job(self, job_id: UUID) -> _JobRecord:
-        try:
-            return self._jobs[job_id]
-        except KeyError:
-            raise TrackingError("unknown job") from None
+    async def _require_job(self, job_id: UUID) -> JobRow:
+        row = await self._jobs.get(job_id)
+        if row is None:
+            raise TrackingError("unknown job")
+        return row
 
-    def _require_batch(self, batch_id: UUID) -> _BatchRecord:
-        try:
-            return self._batches[batch_id]
-        except KeyError:
-            raise TrackingError("unknown batch") from None
+    async def _require_batch(self, batch_id: UUID) -> BatchRow:
+        row = await self._batches.get(batch_id)
+        if row is None:
+            raise TrackingError("unknown batch")
+        return row
+
+    async def _touch_batch(self, batch: BatchRow, occurred_at: datetime) -> None:
+        if occurred_at > batch.updated_at:
+            batch.updated_at = occurred_at
+            await self._batches.update(batch)
+
+    async def _touch_batch_for_job(self, job: JobRow, occurred_at: datetime) -> None:
+        if job.batch_id is None:
+            return
+        batch = await self._require_batch(job.batch_id)
+        await self._touch_batch(batch, occurred_at)
 
     @staticmethod
-    def _require_status(record: _JobRecord, expected: JobStatus) -> None:
+    def _require_status(record: JobRow, expected: JobStatus) -> None:
         if record.status is not expected:
             raise InvalidJobTransition("invalid job transition")
 
     @staticmethod
-    def _require_artifact(record: _JobRecord, artifact_id: UUID) -> None:
+    def _require_artifact(record: JobRow, artifact_id: UUID) -> None:
         if record.artifact_id != artifact_id:
             raise TrackingError("artifact does not match job")
 
     @staticmethod
-    def _terminal_duplicate(record: _JobRecord, event: object) -> bool:
-        if record.terminal_event is None:
+    def _terminal_duplicate(record: JobRow, event: object) -> bool:
+        if record.status not in (JobStatus.COMPLETED, JobStatus.FAILED):
             return False
-        if record.terminal_event == event:
+        if _matches_terminal_event(record, event):
             return True
         raise InvalidJobTransition("conflicting job terminal event")
 
-    def _advance(self, record: _JobRecord, occurred_at: datetime) -> None:
-        record.updated_at = occurred_at
-        self._touch_batch(record, occurred_at)
-
-    def _touch_batch(self, job: _JobRecord, occurred_at: datetime) -> None:
-        if job.batch_id is None:
-            return
-        batch = self._batches[job.batch_id]
-        batch.updated_at = max(batch.updated_at, occurred_at)
-
     @staticmethod
     def _derive_batch_status(
-        record: _BatchRecord, counts: dict[JobStatus, int]
+        record: BatchRow, job_ids: tuple[UUID, ...], counts: dict[JobStatus, int]
     ) -> BatchStatus:
-        if record.terminal_event is not None:
+        if record.error is not None:
             return BatchStatus.FAILED
-        if not record.job_ids:
+        if not job_ids:
             return BatchStatus.EXPANDING
         nonterminal = (
             counts[JobStatus.WAITING]
             + counts[JobStatus.PRODUCING]
             + counts[JobStatus.UPLOADING]
+            + counts[JobStatus.INTERRUPTED]
         )
         if nonterminal:
-            if counts[JobStatus.WAITING] == len(record.job_ids):
+            if counts[JobStatus.WAITING] == len(job_ids):
                 return BatchStatus.WAITING
             return BatchStatus.PROCESSING
-        if counts[JobStatus.FAILED] == len(record.job_ids):
+        if counts[JobStatus.FAILED] == len(job_ids):
             return BatchStatus.FAILED
-        if counts[JobStatus.COMPLETED] == len(record.job_ids):
+        if counts[JobStatus.COMPLETED] == len(job_ids):
             if record.skipped_entries:
                 return BatchStatus.PARTIALLY_COMPLETED
             return BatchStatus.COMPLETED
         return BatchStatus.PARTIALLY_COMPLETED
+
+
+def _snapshot_from_row(row: JobRow) -> JobSnapshot:
+    return JobSnapshot(
+        id=row.id,
+        batch_id=row.batch_id,
+        source_kind=row.source_kind,
+        source=row.source,
+        title=row.title,
+        status=row.status,
+        artifact_id=row.artifact_id,
+        filename=row.filename,
+        size_bytes=row.size_bytes,
+        telegram_chat_id=row.telegram_chat_id,
+        telegram_message_id=row.telegram_message_id,
+        error=row.error,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _matches_ready_event(record: JobRow, event: ArtifactReady) -> bool:
+    return (
+        record.artifact_id == event.artifact_id
+        and record.ready_local_path == event.local_path
+        and record.filename == event.filename
+        and record.ready_media_type == event.media_type
+        and record.size_bytes == event.size_bytes
+        and record.ready_caption == event.caption
+        and record.updated_at == event.occurred_at
+    )
+
+
+def _matches_terminal_event(
+    record: JobRow,
+    event: ArtifactProductionFailed | ArtifactUploaded | ArtifactUploadFailed,
+) -> bool:
+    if record.updated_at != event.occurred_at:
+        return False
+    if isinstance(event, ArtifactUploaded):
+        return (
+            record.status is JobStatus.COMPLETED
+            and record.artifact_id == event.artifact_id
+            and record.telegram_chat_id == event.telegram_chat_id
+            and record.telegram_message_id == event.telegram_message_id
+        )
+    if record.status is not JobStatus.FAILED or record.error != event.error:
+        return False
+    if isinstance(event, ArtifactProductionFailed):
+        return event.artifact_id is None or record.artifact_id == event.artifact_id
+    return record.artifact_id == event.artifact_id
