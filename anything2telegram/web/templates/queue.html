@@ -41,6 +41,7 @@
             {%- else -%}
             <span class="toggle"></span>
             {%- endif %}
+            {%- if entry.batch.thumbnail_url %}<img class="batch-thumb" src="{{ entry.batch.thumbnail_url }}" alt="" loading="lazy">{% endif %}
             {{ source_cell(entry.batch.title, entry.batch.source_url|playlist_id, entry.batch.source_url) }}
           </td>
           <td>{{ status_cell(entry.batch.status, entry.batch.error) }}</td>

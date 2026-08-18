@@ -58,7 +58,9 @@ async def test_an_upload_failure_pauses_the_queue_and_keeps_the_job_visible(
             job = None
             for _ in range(200):
                 job = (await client.get(f"/jobs/{job_id}")).json()
-                if job["status"] == "failed":
+                # JOB_QUEUED's tracker write is a scheduled task, not inline,
+                # so the job can briefly 404 right after submission.
+                if job.get("status") == "failed":
                     break
                 await asyncio.sleep(0.01)
 

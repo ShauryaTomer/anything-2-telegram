@@ -1,11 +1,20 @@
 import asyncio
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
 from anything2telegram import main
 from anything2telegram.config import Settings
+from anything2telegram.domain import JobStatus, SourceKind
+from anything2telegram.jobs.repositories import (
+    JobQueueRepository,
+    JobRow,
+    JobsRepository,
+    open_database,
+)
 from anything2telegram.jobs.scheduler import JobScheduler
 from anything2telegram.jobs.tracker import JobTracker
 from anything2telegram.telegram.client import TelegramUnavailableError
@@ -28,6 +37,50 @@ async def test_startup_builds_every_component_and_opens_admission(
         assert state.storage.root == settings.artifact_root
 
     assert telegram.connected is False
+
+
+async def test_a_job_stuck_producing_or_uploading_is_interrupted_and_requeued(
+    build_app, settings: Settings
+) -> None:
+    """A job caught mid-flight by a crash gets marked INTERRUPTED and retried.
+
+    Pre-seeds the DB with a job in PRODUCING directly via the repository
+    (simulating a crash), boots the real app through the lifespan, and
+    asserts recovery ran before readiness opened.
+    """
+    job_id = uuid4()
+    now = datetime.now(UTC)
+    seed_conn = await open_database(settings.db_path)
+    await JobsRepository(seed_conn).insert(
+        JobRow(
+            id=job_id,
+            batch_id=None,
+            source_kind=SourceKind.YOUTUBE,
+            source="https://example.test/watch?v=stuck",
+            title=None,
+            status=JobStatus.PRODUCING,
+            artifact_id=None,
+            filename=None,
+            size_bytes=None,
+            telegram_chat_id=None,
+            telegram_message_id=None,
+            error=None,
+            created_at=now,
+            updated_at=now,
+            staged=False,
+        )
+    )
+    await seed_conn.close()
+
+    service = build_app()
+    async with service.router.lifespan_context(service):
+        state = service.state
+        snapshot = await state.tracker.get_job(job_id)
+        assert snapshot is not None
+        assert snapshot.status is JobStatus.INTERRUPTED
+
+        queued = await JobQueueRepository(state.db).list_all()
+        assert [row.job_id for row in queued] == [job_id]
 
 
 async def test_settings_are_read_from_the_environment_when_not_supplied(

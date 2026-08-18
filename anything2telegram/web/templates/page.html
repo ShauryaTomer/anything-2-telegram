@@ -11,6 +11,10 @@
   .two-col { display: grid; gap: 1.5rem; grid-template-columns: 1fr 1fr; }
   @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
   .queue-child td:first-child { padding-left: 2rem; }
+  .batch-thumb {
+    width: 64px; height: 36px; object-fit: cover; border-radius: .2rem;
+    vertical-align: middle; margin-right: .4rem;
+  }
   .toggle { display: inline-block; width: 1em; text-align: center; }
   .failed { color: var(--pico-del-color); border-bottom: 1px dotted currentColor; cursor: help; }
   .copy {
@@ -23,7 +27,7 @@
 <body>
 <main>
   <article>
-    <header><strong>Queue work</strong></header>
+    <header><strong>Queue work</strong> — <a href="/channel">channel playlists</a></header>
     <div class="two-col">
       <form hx-post="/web/youtube{% if open_param %}?open={{ open_param }}{% endif %}" hx-target="#queue" hx-swap="outerHTML">
         <label>YouTube URL

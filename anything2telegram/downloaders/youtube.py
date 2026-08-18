@@ -5,6 +5,7 @@ import mimetypes
 import re
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -45,12 +46,14 @@ _PLAYLIST_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 _FINAL_MEDIA_SUFFIXES = frozenset({".mp4", ".mkv", ".webm"})
 _UNSAFE_NAME = re.compile(r"[/\x00-\x1f]+")
 _YTDLP_COMMAND = (sys.executable, "-m", "yt_dlp")
+_CHANNEL_PREFIXES = frozenset({"channel", "c", "user"})
 _QUOTA_POLL_SECONDS = 1.0
 
 
 class YouTubeUrlKind(str, Enum):
     VIDEO = "video"
     PLAYLIST = "playlist"
+    CHANNEL = "channel"
 
 
 class UnsupportedYouTubeUrl(ValueError):
@@ -58,6 +61,19 @@ class UnsupportedYouTubeUrl(ValueError):
 
     def __init__(self) -> None:
         super().__init__("YouTube URL is unsupported")
+
+
+class ChannelListingError(RuntimeError):
+    """A channel's playlists could not be listed."""
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelPlaylist:
+    playlist_id: str
+    title: str
+    url: str
+    video_count: int = 0
+    thumbnail_url: str | None = None
 
 
 def classify_youtube_url(url: str) -> YouTubeUrlKind:
@@ -115,11 +131,31 @@ def classify_youtube_url(url: str) -> YouTubeUrlKind:
         and bool(_PLAYLIST_ID.fullmatch(lists[0]))
     ):
         return YouTubeUrlKind.PLAYLIST
+    if _channel_base(parsed.path) is not None:
+        return YouTubeUrlKind.CHANNEL
     raise UnsupportedYouTubeUrl()
 
 
 def _valid_video_id(value: str) -> bool:
     return bool(_VIDEO_ID.fullmatch(value))
+
+
+def _channel_base(path: str) -> str | None:
+    """'@handle' or 'channel/UC…' — what a channel's tabs hang off, else None."""
+    parts = [part for part in path.split("/") if part]
+    if parts and parts[0].startswith("@") and len(parts[0]) > 1:
+        return parts[0]
+    if len(parts) >= 2 and parts[0] in _CHANNEL_PREFIXES:
+        return f"{parts[0]}/{parts[1]}"
+    return None
+
+
+def channel_playlists_url(url: str) -> str:
+    """The channel's /playlists tab, which is what yt-dlp must be pointed at."""
+    base = _channel_base(urlsplit(url).path)
+    if base is None:
+        raise UnsupportedYouTubeUrl()
+    return f"https://www.youtube.com/{base}/playlists"
 
 
 class YouTubeArtifactProducer:
@@ -177,6 +213,7 @@ class YouTubeArtifactProducer:
                     skipped,
                     _now(),
                     playlist_title,
+                    _video_thumbnail(targets[0].source_id),
                 ),
             )
         except ProcessTimeoutError:
@@ -266,6 +303,47 @@ class YouTubeArtifactProducer:
         except BaseException:
             self._storage.delete_job_directory(event.job_id)
             raise
+
+    async def list_channel_playlists(self, channel_url: str) -> list[ChannelPlaylist]:
+        """Every playlist on the channel, each with its own video count.
+
+        The counts are one extra yt-dlp call per playlist, all in flight at
+        once. ponytail: no concurrency cap — put a semaphore here if YouTube
+        starts throttling the burst.
+        """
+        try:
+            result = await self._runner.run(
+                self._playlist_args(channel_playlists_url(channel_url)),
+                self._timeout_seconds,
+            )
+        except ProcessTimeoutError:
+            raise ChannelListingError("YouTube operation timed out") from None
+        if result.exit_code != 0:
+            _LOGGER.warning(
+                "Channel listing failed: url=%s %s",
+                channel_url,
+                _process_detail(result),
+            )
+            raise ChannelListingError("YouTube process failed")
+        playlists = _parse_channel_playlists(result.stdout)
+        counts = await asyncio.gather(
+            *(self._playlist_video_count(playlist.url) for playlist in playlists)
+        )
+        return [
+            replace(playlist, video_count=count)
+            for playlist, count in zip(playlists, counts)
+        ]
+
+    async def _playlist_video_count(self, playlist_url: str) -> int:
+        """0 when the lookup fails: the count is a hint on a page, not a gate."""
+        try:
+            result = await self._runner.run(
+                self._playlist_args(playlist_url), self._timeout_seconds
+            )
+            targets, _skipped, _title = self._parse_playlist(result.stdout)
+        except (ProcessTimeoutError, _PlaylistParseError):
+            return 0
+        return len(targets)
 
     def _playlist_args(self, source_url: str, offset: int = 0) -> list[str]:
         # --playlist-start is 1-indexed; offset=N skips the first N videos.
@@ -459,6 +537,62 @@ class YouTubeArtifactProducer:
                 _now(),
             ),
         )
+
+def _parse_channel_playlists(stdout: str) -> list[ChannelPlaylist]:
+    """One playlist per flat-playlist line; unreadable lines are dropped.
+
+    One bad line costs one playlist on the page, not the whole listing — the
+    other playlists are still selectable. Counts are filled in separately.
+    """
+    playlists: list[ChannelPlaylist] = []
+    seen: set[str] = set()
+    for line in (line for line in stdout.splitlines() if line.strip()):
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        playlist_id = entry.get("id")
+        if (
+            not isinstance(playlist_id, str)
+            or not _PLAYLIST_ID.fullmatch(playlist_id)
+            or playlist_id in seen
+        ):
+            continue
+        seen.add(playlist_id)
+        title = entry.get("title")
+        playlists.append(
+            ChannelPlaylist(
+                playlist_id,
+                title.strip() if isinstance(title, str) and title.strip() else playlist_id,
+                f"https://www.youtube.com/playlist?list={playlist_id}",
+                thumbnail_url=_widest_thumbnail(entry),
+            )
+        )
+    return playlists
+
+
+def _video_thumbnail(video_id: str) -> str:
+    """A playlist wears its first video's thumbnail; this URL is derivable."""
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+
+def _widest_thumbnail(entry: dict) -> str | None:
+    """The largest thumbnail yt-dlp offered, which is still only ~480px wide."""
+    candidates = [
+        thumbnail
+        for thumbnail in entry.get("thumbnails") or ()
+        if isinstance(thumbnail, dict) and isinstance(thumbnail.get("url"), str)
+    ]
+    if not candidates:
+        return None
+    widest = max(
+        candidates,
+        key=lambda thumbnail: thumbnail.get("width") or 0,
+    )
+    return widest["url"]
+
 
 def _process_detail(result: ProcessResult) -> str:
     """yt-dlp's own explanation, for the operator log only."""

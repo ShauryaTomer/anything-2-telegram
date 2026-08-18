@@ -16,6 +16,7 @@ class JobStatus(str, Enum):
     UPLOADING = "uploading"
     COMPLETED = "completed"
     FAILED = "failed"
+    INTERRUPTED = "interrupted"
 
 
 class BatchStatus(str, Enum):
@@ -84,6 +85,7 @@ class BatchSnapshot:
     uploading: int
     completed: int
     failed: int
+    thumbnail_url: str | None = None
 
 
 def telegram_message_url(chat_id: int, message_id: int, topic_id: int | None) -> str:

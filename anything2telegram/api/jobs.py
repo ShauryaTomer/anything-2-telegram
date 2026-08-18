@@ -254,7 +254,7 @@ async def _stage_upload_and_enqueue(
             raise _UploadSubmitError("invalid_request", 422, "Request is invalid")
 
         try:
-            reservation = state.scheduler.reserve_local_upload(
+            reservation = await state.scheduler.reserve_local_upload(
                 file.filename, file.content_type, caption
             )
         except SchedulerError:
@@ -268,18 +268,18 @@ async def _stage_upload_and_enqueue(
             staged = await state.storage.stage(
                 _DisconnectAwareUpload(request, file), reservation, max_bytes
             )
-            return state.scheduler.enqueue_reserved_upload(
+            return await state.scheduler.enqueue_reserved_upload(
                 reservation, staged.size_bytes
             )
         except ArtifactStorageError as error:
             raise _storage_error_to_submit_error(error)
         except SchedulerError:
-            state.scheduler.cancel_reserved_upload(reservation.job_id)
+            await state.scheduler.cancel_reserved_upload(reservation.job_id)
             raise _UploadSubmitError(
                 "service_unavailable", 503, "Service is not ready"
             )
         except BaseException:
-            state.scheduler.cancel_reserved_upload(reservation.job_id)
+            await state.scheduler.cancel_reserved_upload(reservation.job_id)
             raise
     finally:
         await form.close()
@@ -332,14 +332,20 @@ def create_jobs_app() -> FastAPI:
             return _response(
                 422, "unsupported_youtube_url", "YouTube URL is unsupported"
             )
+        # Channels are a web-page-only flow: this API takes one video or one
+        # playlist, and a channel is neither.
+        if kind is YouTubeUrlKind.CHANNEL:
+            return _response(
+                422, "unsupported_youtube_url", "YouTube URL is unsupported"
+            )
         if not _is_ready(request):
             return _service_unavailable()
         scheduler = request.app.state.scheduler
         try:
             if kind is YouTubeUrlKind.VIDEO:
-                return _submission_body("job", scheduler.submit_video(body.url))
+                return _submission_body("job", await scheduler.submit_video(body.url))
             return _submission_body(
-                "batch", scheduler.submit_playlist(body.url, body.offset)
+                "batch", await scheduler.submit_playlist(body.url, body.offset)
             )
         except SchedulerError:
             return _service_unavailable()
@@ -365,7 +371,7 @@ def create_jobs_app() -> FastAPI:
         snapshot = (
             None
             if identifier is None
-            else request.app.state.tracker.get_job(identifier)
+            else await request.app.state.tracker.get_job(identifier)
         )
         if snapshot is None:
             return _response(404, "job_not_found", "Job not found")
@@ -379,7 +385,7 @@ def create_jobs_app() -> FastAPI:
         snapshot = (
             None
             if identifier is None
-            else request.app.state.tracker.get_batch(identifier)
+            else await request.app.state.tracker.get_batch(identifier)
         )
         if snapshot is None:
             return _response(404, "batch_not_found", "Batch not found")
@@ -387,7 +393,7 @@ def create_jobs_app() -> FastAPI:
 
     @app.get("/queue")
     async def get_queue(request: Request) -> object:
-        entries = request.app.state.tracker.list_queue()
+        entries = await request.app.state.tracker.list_queue()
         topic_id = request.app.state.settings.topic_id
         progress_lookup = request.app.state.progress.get
         return [_queue_row(entry, progress_lookup, topic_id) for entry in entries]

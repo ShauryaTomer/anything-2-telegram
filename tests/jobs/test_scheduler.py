@@ -4,7 +4,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from pyee import EventEmitter
+from pyee.asyncio import AsyncIOEventEmitter
 
 from anything2telegram.artifacts.storage import ArtifactStorage
 from anything2telegram.domain import ErrorInfo, JobPhase
@@ -32,6 +32,11 @@ from anything2telegram.events import (
     PlaylistExpansionFailed,
     TelegramUnavailable,
 )
+from anything2telegram.jobs.repositories import (
+    BatchQueueRepository,
+    JobQueueRepository,
+    open_database,
+)
 from anything2telegram.jobs.scheduler import JobScheduler, SchedulerError
 
 
@@ -58,7 +63,7 @@ _TOPICS = (
 class Recorder:
     """Captures every fact the scheduler publishes, in order."""
 
-    def __init__(self, bus: EventEmitter) -> None:
+    def __init__(self, bus: AsyncIOEventEmitter) -> None:
         self.facts: list[tuple[str, object]] = []
         for topic in _TOPICS:
             bus.on(topic, self._make_listener(topic))
@@ -77,12 +82,12 @@ class Recorder:
 
 
 @pytest.fixture
-def bus() -> EventEmitter:
-    return EventEmitter()
+def bus() -> AsyncIOEventEmitter:
+    return AsyncIOEventEmitter()
 
 
 @pytest.fixture
-def recorder(bus: EventEmitter) -> Recorder:
+def recorder(bus: AsyncIOEventEmitter) -> Recorder:
     return Recorder(bus)
 
 
@@ -92,20 +97,31 @@ def storage(tmp_path: Path) -> ArtifactStorage:
 
 
 @pytest.fixture
-def scheduler(bus: EventEmitter, storage: ArtifactStorage) -> JobScheduler:
-    return JobScheduler(bus, storage)
+async def scheduler(bus: AsyncIOEventEmitter, storage: ArtifactStorage, tmp_path: Path):
+    conn = await open_database(tmp_path / "yt2tg.sqlite3")
+    job_queue = JobQueueRepository(conn)
+    batch_queue = BatchQueueRepository(conn)
+    yield JobScheduler(bus, storage, job_queue, batch_queue)
+    await conn.close()
 
 
 async def settle() -> None:
-    """Let the pump's call_soon callbacks run."""
-    for _ in range(4):
+    """Let the pump's queue reads/writes and bus dispatch finish.
+
+    The pump runs as its own task, not one the bus tracks, and its DB calls
+    hop through aiosqlite's background thread — plain ``sleep(0)`` ticks can
+    race ahead of that thread, so give it real (if tiny) wall-clock time too.
+    """
+    for _ in range(10):
         await asyncio.sleep(0)
+    for _ in range(10):
+        await asyncio.sleep(0.001)
 
 
 async def stage_upload(
     scheduler: JobScheduler, storage: ArtifactStorage, payload: bytes = b"abc"
 ):
-    reservation = scheduler.reserve_local_upload("clip.mp4", "video/mp4", "caption")
+    reservation = await scheduler.reserve_local_upload("clip.mp4", "video/mp4", "caption")
     reservation.destination.write_bytes(payload)
     return reservation
 
@@ -113,7 +129,7 @@ async def stage_upload(
 async def test_a_submitted_video_is_queued_then_started_and_requested(
     scheduler: JobScheduler, recorder: Recorder
 ) -> None:
-    ref = scheduler.submit_video(VIDEO)
+    ref = await scheduler.submit_video(VIDEO)
     assert ref.status_url == f"/jobs/{ref.id}"
     assert recorder.topics() == [JOB_QUEUED]
 
@@ -128,10 +144,10 @@ async def test_a_submitted_video_is_queued_then_started_and_requested(
 
 
 async def test_only_one_job_runs_until_the_first_one_finishes(
-    scheduler: JobScheduler, bus: EventEmitter, recorder: Recorder
+    scheduler: JobScheduler, bus: AsyncIOEventEmitter, recorder: Recorder
 ) -> None:
-    first = scheduler.submit_video(VIDEO)
-    second = scheduler.submit_video(OTHER_VIDEO)
+    first = await scheduler.submit_video(VIDEO)
+    second = await scheduler.submit_video(OTHER_VIDEO)
     await settle()
 
     assert [event.source_url for event in recorder.only(YOUTUBE_DOWNLOAD_REQUESTED)] == [
@@ -158,10 +174,10 @@ async def test_only_one_job_runs_until_the_first_one_finishes(
 
 
 async def test_a_production_failure_also_releases_the_slot(
-    scheduler: JobScheduler, bus: EventEmitter, recorder: Recorder
+    scheduler: JobScheduler, bus: AsyncIOEventEmitter, recorder: Recorder
 ) -> None:
-    first = scheduler.submit_video(VIDEO)
-    scheduler.submit_video(OTHER_VIDEO)
+    first = await scheduler.submit_video(VIDEO)
+    await scheduler.submit_video(OTHER_VIDEO)
     await settle()
 
     bus.emit(
@@ -176,10 +192,10 @@ async def test_a_production_failure_also_releases_the_slot(
 
 
 async def test_a_terminal_event_for_another_job_is_ignored(
-    scheduler: JobScheduler, bus: EventEmitter, recorder: Recorder
+    scheduler: JobScheduler, bus: AsyncIOEventEmitter, recorder: Recorder
 ) -> None:
-    scheduler.submit_video(VIDEO)
-    scheduler.submit_video(OTHER_VIDEO)
+    await scheduler.submit_video(VIDEO)
+    await scheduler.submit_video(OTHER_VIDEO)
     await settle()
 
     bus.emit(
@@ -194,10 +210,10 @@ async def test_a_terminal_event_for_another_job_is_ignored(
 
 
 async def test_an_upload_outcome_for_a_stale_artifact_is_ignored(
-    scheduler: JobScheduler, bus: EventEmitter, recorder: Recorder
+    scheduler: JobScheduler, bus: AsyncIOEventEmitter, recorder: Recorder
 ) -> None:
-    first = scheduler.submit_video(VIDEO)
-    scheduler.submit_video(OTHER_VIDEO)
+    first = await scheduler.submit_video(VIDEO)
+    await scheduler.submit_video(OTHER_VIDEO)
     await settle()
     bus.emit(
         ARTIFACT_READY,
@@ -218,10 +234,10 @@ async def test_an_upload_outcome_for_a_stale_artifact_is_ignored(
 
 
 async def test_a_playlist_expands_into_children_that_run_before_later_work(
-    scheduler: JobScheduler, bus: EventEmitter, recorder: Recorder
+    scheduler: JobScheduler, bus: AsyncIOEventEmitter, recorder: Recorder
 ) -> None:
-    batch = scheduler.submit_playlist(PLAYLIST, 2)
-    later = scheduler.submit_video(OTHER_VIDEO)
+    batch = await scheduler.submit_playlist(PLAYLIST, 2)
+    later = await scheduler.submit_video(OTHER_VIDEO)
     await settle()
 
     requested = recorder.only(YOUTUBE_PLAYLIST_EXPANSION_REQUESTED)
@@ -253,9 +269,9 @@ async def test_a_playlist_expands_into_children_that_run_before_later_work(
 
 
 async def test_a_playlist_expansions_target_titles_reach_the_job_queued_event(
-    scheduler: JobScheduler, bus: EventEmitter, recorder: Recorder
+    scheduler: JobScheduler, bus: AsyncIOEventEmitter, recorder: Recorder
 ) -> None:
-    batch = scheduler.submit_playlist(PLAYLIST)
+    batch = await scheduler.submit_playlist(PLAYLIST)
     await settle()
 
     bus.emit(
@@ -276,10 +292,10 @@ async def test_a_playlist_expansions_target_titles_reach_the_job_queued_event(
 
 
 async def test_a_failed_expansion_releases_the_slot(
-    scheduler: JobScheduler, bus: EventEmitter, recorder: Recorder
+    scheduler: JobScheduler, bus: AsyncIOEventEmitter, recorder: Recorder
 ) -> None:
-    batch = scheduler.submit_playlist(PLAYLIST)
-    scheduler.submit_video(VIDEO)
+    batch = await scheduler.submit_playlist(PLAYLIST)
+    await scheduler.submit_video(VIDEO)
     await settle()
 
     bus.emit(
@@ -298,7 +314,7 @@ async def test_a_reserved_upload_becomes_a_ready_artifact(
 ) -> None:
     reservation = await stage_upload(scheduler, storage)
 
-    ref = scheduler.enqueue_reserved_upload(reservation, 3)
+    ref = await scheduler.enqueue_reserved_upload(reservation, 3)
     await settle()
 
     assert recorder.topics() == [JOB_QUEUED, JOB_STARTED, ARTIFACT_READY]
@@ -314,20 +330,20 @@ async def test_an_unknown_or_mismatched_reservation_is_refused(
     scheduler: JobScheduler, storage: ArtifactStorage
 ) -> None:
     reservation = await stage_upload(scheduler, storage)
-    scheduler.enqueue_reserved_upload(reservation, 3)
+    await scheduler.enqueue_reserved_upload(reservation, 3)
 
     with pytest.raises(SchedulerError) as error:
-        scheduler.enqueue_reserved_upload(reservation, 3)
+        await scheduler.enqueue_reserved_upload(reservation, 3)
     assert error.value.code == "invalid_reservation"
 
 
 async def test_a_reservation_whose_file_never_arrived_is_refused(
     scheduler: JobScheduler,
 ) -> None:
-    reservation = scheduler.reserve_local_upload("clip.mp4", None, None)
+    reservation = await scheduler.reserve_local_upload("clip.mp4", None, None)
 
     with pytest.raises(SchedulerError) as error:
-        scheduler.enqueue_reserved_upload(reservation, 3)
+        await scheduler.enqueue_reserved_upload(reservation, 3)
     assert error.value.code == "upload_not_staged"
 
 
@@ -335,7 +351,7 @@ async def test_an_artifact_that_vanished_before_upload_fails_the_job(
     scheduler: JobScheduler, storage: ArtifactStorage, recorder: Recorder
 ) -> None:
     reservation = await stage_upload(scheduler, storage)
-    ref = scheduler.enqueue_reserved_upload(reservation, 3)
+    ref = await scheduler.enqueue_reserved_upload(reservation, 3)
     reservation.destination.unlink()
 
     await settle()
@@ -351,14 +367,14 @@ async def test_cancelling_a_reservation_deletes_its_directory(
 ) -> None:
     reservation = await stage_upload(scheduler, storage)
 
-    assert scheduler.cancel_reserved_upload(reservation.job_id) is True
+    assert await scheduler.cancel_reserved_upload(reservation.job_id) is True
     assert not (storage.root / str(reservation.job_id)).exists()
-    assert scheduler.cancel_reserved_upload(reservation.job_id) is False
-    assert scheduler.cancel_reserved_upload(uuid4()) is False
+    assert await scheduler.cancel_reserved_upload(reservation.job_id) is False
+    assert await scheduler.cancel_reserved_upload(uuid4()) is False
 
 
 async def test_telegram_going_away_pauses_admission_and_the_pump(
-    scheduler: JobScheduler, bus: EventEmitter, recorder: Recorder
+    scheduler: JobScheduler, bus: AsyncIOEventEmitter, recorder: Recorder
 ) -> None:
     bus.emit(
         TELEGRAM_UNAVAILABLE,
@@ -367,7 +383,7 @@ async def test_telegram_going_away_pauses_admission_and_the_pump(
 
     assert scheduler.accepting is False
     with pytest.raises(SchedulerError) as error:
-        scheduler.submit_video(VIDEO)
+        await scheduler.submit_video(VIDEO)
     assert error.value.code == "scheduler_unavailable"
     await settle()
     assert recorder.facts == []
@@ -377,10 +393,10 @@ async def test_stopping_releases_reservations_and_queued_uploads(
     scheduler: JobScheduler, storage: ArtifactStorage
 ) -> None:
     queued = await stage_upload(scheduler, storage)
-    scheduler.enqueue_reserved_upload(queued, 3)
+    await scheduler.enqueue_reserved_upload(queued, 3)
     reserved = await stage_upload(scheduler, storage)
 
-    scheduler.stop()
+    await scheduler.stop()
 
     assert scheduler.accepting is False
     assert not (storage.root / str(queued.job_id)).exists()
@@ -388,7 +404,7 @@ async def test_stopping_releases_reservations_and_queued_uploads(
 
 
 async def test_a_handler_failure_makes_the_scheduler_stop_accepting(
-    scheduler: JobScheduler, bus: EventEmitter
+    scheduler: JobScheduler, bus: AsyncIOEventEmitter
 ) -> None:
     def explode(_event: object) -> None:
         raise RuntimeError("listener down")
@@ -396,7 +412,7 @@ async def test_a_handler_failure_makes_the_scheduler_stop_accepting(
     bus.on(JOB_QUEUED, explode)
 
     with pytest.raises(RuntimeError):
-        scheduler.submit_video(VIDEO)
+        await scheduler.submit_video(VIDEO)
     assert scheduler.accepting is False
 
 
@@ -404,20 +420,21 @@ async def test_failing_the_scheduler_drops_the_active_staged_upload(
     scheduler: JobScheduler, storage: ArtifactStorage
 ) -> None:
     reservation = await stage_upload(scheduler, storage)
-    scheduler.enqueue_reserved_upload(reservation, 3)
+    await scheduler.enqueue_reserved_upload(reservation, 3)
     await settle()
 
     scheduler.fail()
+    await settle()
 
     assert scheduler.accepting is False
     assert not (storage.root / str(reservation.job_id)).exists()
 
 
 async def test_the_error_topic_is_never_published_by_the_scheduler(
-    scheduler: JobScheduler, bus: EventEmitter
+    scheduler: JobScheduler, bus: AsyncIOEventEmitter
 ) -> None:
     seen: list[object] = []
     bus.on(ERROR, seen.append)
-    scheduler.submit_video(VIDEO)
+    await scheduler.submit_video(VIDEO)
     await settle()
     assert seen == []

@@ -40,19 +40,19 @@ class FakeScheduler:
         self.enqueue_error: BaseException | None = None
         self.submit_error: BaseException | None = None
 
-    def submit_video(self, url: str) -> JobRef:
+    async def submit_video(self, url: str) -> JobRef:
         self.calls.append(("video", url))
         if self.submit_error is not None:
             raise self.submit_error
         return JobRef(UUID(int=1), f"/jobs/{UUID(int=1)}")
 
-    def submit_playlist(self, url: str, offset: int = 0) -> BatchRef:
+    async def submit_playlist(self, url: str, offset: int = 0) -> BatchRef:
         self.calls.append(("playlist", (url, offset)))
         if self.submit_error is not None:
             raise self.submit_error
         return BatchRef(UUID(int=2), f"/batches/{UUID(int=2)}")
 
-    def reserve_local_upload(
+    async def reserve_local_upload(
         self, filename: str, media_type: str | None, caption: str | None
     ) -> UploadReservation:
         self.calls.append(("reserve", (filename, media_type, caption)))
@@ -67,7 +67,7 @@ class FakeScheduler:
             caption,
         )
 
-    def enqueue_reserved_upload(
+    async def enqueue_reserved_upload(
         self, reservation: UploadReservation, size_bytes: int
     ) -> JobRef:
         self.calls.append(("enqueue", size_bytes))
@@ -75,7 +75,7 @@ class FakeScheduler:
             raise self.enqueue_error
         return JobRef(reservation.job_id, f"/jobs/{reservation.job_id}")
 
-    def cancel_reserved_upload(self, job_id: UUID) -> bool:
+    async def cancel_reserved_upload(self, job_id: UUID) -> bool:
         self.cancelled.append(job_id)
         return True
 
@@ -114,13 +114,13 @@ class FakeTracker:
         self.batches: dict[UUID, BatchSnapshot] = {}
         self.queue: tuple[JobSnapshot | BatchEntry, ...] = ()
 
-    def get_job(self, job_id: UUID) -> JobSnapshot | None:
+    async def get_job(self, job_id: UUID) -> JobSnapshot | None:
         return self.jobs.get(job_id)
 
-    def get_batch(self, batch_id: UUID) -> BatchSnapshot | None:
+    async def get_batch(self, batch_id: UUID) -> BatchSnapshot | None:
         return self.batches.get(batch_id)
 
-    def list_queue(self) -> tuple[JobSnapshot | BatchEntry, ...]:
+    async def list_queue(self) -> tuple[JobSnapshot | BatchEntry, ...]:
         return self.queue
 
 
