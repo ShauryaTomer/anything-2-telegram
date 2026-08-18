@@ -6,12 +6,13 @@ from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from anything2telegram.domain import BatchEntry, JobSnapshot, JobStatus, telegram_message_url
 from anything2telegram.downloaders.youtube import (
+    ChannelListingError,
     UnsupportedYouTubeUrl,
     YouTubeUrlKind,
     classify_youtube_url,
@@ -25,6 +26,8 @@ _TEMPLATES.env.filters["format_bytes"] = format_bytes
 _TEMPLATES.env.filters["video_id"] = lambda url: _query_or_tail(url, "v")
 _TEMPLATES.env.filters["playlist_id"] = lambda url: _query_or_tail(url, "list")
 _NOT_READY = "Not ready — the Telegram client is still connecting. Try again in a moment."
+_WRONG_FORM = "That is a video or playlist URL — queue it from the main page."
+_NOT_A_CHANNEL = "Not a supported YouTube channel URL."
 
 
 def _query_or_tail(url: str, param: str) -> str:
@@ -126,6 +129,26 @@ async def _submit_response(
     )
 
 
+def _is_playlist_url(url: object) -> bool:
+    """Whether a selected checkbox value is safe to hand to the scheduler."""
+    if not isinstance(url, str):
+        return False
+    try:
+        return classify_youtube_url(url) is YouTubeUrlKind.PLAYLIST
+    except UnsupportedYouTubeUrl:
+        return False
+
+
+def _channel_page(
+    request: Request, flash_code: str | None = None, flash_message: str | None = None
+) -> HTMLResponse:
+    return _TEMPLATES.TemplateResponse(
+        request,
+        "channel.html",
+        {"flash_code": flash_code, "flash_message": flash_message},
+    )
+
+
 def register_web_routes(app: FastAPI) -> None:
     # Deferred import: anything2telegram.api.jobs imports register_web_routes
     # from this module, so importing it back at module scope would cycle.
@@ -171,6 +194,10 @@ def register_web_routes(app: FastAPI) -> None:
             kind = classify_youtube_url(url)
         except UnsupportedYouTubeUrl:
             return await _submit_response(request, "422", "Not a supported YouTube URL.", open)
+        if kind is YouTubeUrlKind.CHANNEL:
+            return await _submit_response(
+                request, "422", "That is a channel URL — use the channel page.", open
+            )
 
         if not _is_ready(request):
             return await _submit_response(request, "503", _NOT_READY, open)
@@ -185,6 +212,62 @@ def register_web_routes(app: FastAPI) -> None:
             return await _submit_response(request, "503", _NOT_READY, open)
 
         return await _submit_response(request, None, None, open)
+
+    @app.get("/channel", response_class=HTMLResponse)
+    async def channel_page(request: Request) -> HTMLResponse:
+        return _channel_page(request)
+
+    @app.post("/web/channel", response_class=HTMLResponse)
+    async def channel_playlists(request: Request) -> HTMLResponse:
+        """The channel's playlists as a checkbox list. Blocks on yt-dlp."""
+        form = await request.form()
+        url = form.get("url")
+        try:
+            kind = classify_youtube_url(url if isinstance(url, str) else "")
+        except UnsupportedYouTubeUrl:
+            kind = None
+
+        playlists: list[object] = []
+        if kind is None:
+            error = _NOT_A_CHANNEL
+        elif kind is not YouTubeUrlKind.CHANNEL:
+            error = _WRONG_FORM
+        else:
+            error = None
+            try:
+                playlists = await request.app.state.youtube.list_channel_playlists(url)
+            except ChannelListingError:
+                error = "Could not read that channel's playlists. Try again."
+
+        return _TEMPLATES.TemplateResponse(
+            request,
+            "channel_playlists.html",
+            {"playlists": playlists, "error": error},
+        )
+
+    @app.post("/web/channel/queue")
+    async def submit_channel_playlists(request: Request) -> object:
+        form = await request.form()
+        selected = [url for url in form.getlist("playlist") if _is_playlist_url(url)]
+        if len(selected) != len(form.getlist("playlist")):
+            return _channel_page(request, "422", "Request is invalid.")
+        if not selected:
+            return _channel_page(
+                request, None, "Nothing selected — tick at least one playlist."
+            )
+        if not _is_ready(request):
+            return _channel_page(request, "503", _NOT_READY)
+
+        scheduler = request.app.state.scheduler
+        try:
+            # Each playlist is its own Batch, exactly as a hand-pasted URL is.
+            # A refusal partway through leaves the earlier ones queued.
+            for playlist_url in selected:
+                await scheduler.submit_playlist(playlist_url, 0)
+        except SchedulerError:
+            return _channel_page(request, "503", _NOT_READY)
+
+        return RedirectResponse("/", status_code=303)
 
     @app.post("/web/upload", response_class=HTMLResponse)
     async def submit_upload(request: Request, open: str = Query("")) -> HTMLResponse:

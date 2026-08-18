@@ -14,10 +14,13 @@ from anything2telegram.config import Settings
 from anything2telegram.domain import ProcessResult
 from anything2telegram.downloaders.process import ProcessTimeoutError
 from anything2telegram.downloaders.youtube import (
+    ChannelListingError,
+    ChannelPlaylist,
     UnsupportedYouTubeUrl,
     YouTubeArtifactProducer,
     YouTubeUrlKind,
     _caption_filename,
+    channel_playlists_url,
     classify_youtube_url,
 )
 from anything2telegram.events import (
@@ -50,6 +53,11 @@ VIDEO_ID = "aaaaaaaaaaa"
         ),
         ("https://www.youtube.com/playlist?list=PL123", YouTubeUrlKind.PLAYLIST),
         ("https://www.youtube.com/?list=PL123", YouTubeUrlKind.PLAYLIST),
+        ("https://www.youtube.com/@Java.Brains", YouTubeUrlKind.CHANNEL),
+        ("https://www.youtube.com/@Java.Brains/playlists", YouTubeUrlKind.CHANNEL),
+        ("https://www.youtube.com/channel/UC123abc", YouTubeUrlKind.CHANNEL),
+        ("https://www.youtube.com/c/JavaBrains", YouTubeUrlKind.CHANNEL),
+        ("https://www.youtube.com/user/koushks", YouTubeUrlKind.CHANNEL),
     ],
 )
 def test_supported_urls_are_classified(url: str, kind: YouTubeUrlKind) -> None:
@@ -579,3 +587,191 @@ def test_a_caption_becomes_a_filesystem_safe_filename(
 
     assert name == expected
     assert len(name.encode()) <= 255
+
+
+@pytest.mark.parametrize(
+    "url,tab",
+    [
+        (
+            "https://www.youtube.com/@Java.Brains",
+            "https://www.youtube.com/@Java.Brains/playlists",
+        ),
+        (
+            "https://www.youtube.com/@Java.Brains/videos",
+            "https://www.youtube.com/@Java.Brains/playlists",
+        ),
+        (
+            "https://www.youtube.com/channel/UC123abc",
+            "https://www.youtube.com/channel/UC123abc/playlists",
+        ),
+        (
+            "https://www.youtube.com/user/koushks",
+            "https://www.youtube.com/user/koushks/playlists",
+        ),
+    ],
+)
+def test_a_channel_url_becomes_its_playlists_tab(url: str, tab: str) -> None:
+    assert channel_playlists_url(url) == tab
+
+
+def test_a_non_channel_url_has_no_playlists_tab() -> None:
+    with pytest.raises(UnsupportedYouTubeUrl):
+        channel_playlists_url("https://www.youtube.com/playlist?list=PL123")
+
+
+CHANNEL = "https://www.youtube.com/@Java.Brains"
+
+
+async def test_a_channels_playlists_are_listed_with_their_video_counts(
+    bus, storage, settings
+) -> None:
+    runner = ScriptedRunner(
+        ProcessResult(
+            0,
+            playlist_stdout(
+                {"id": "PLspring", "title": "Spring Boot"},
+                {"id": "PLdocker", "title": "Docker"},
+            ),
+            "",
+        ),
+        ProcessResult(0, playlist_stdout({"id": VIDEO_ID}, {"id": "bbbbbbbbbbb"}), ""),
+        ProcessResult(0, playlist_stdout({"id": VIDEO_ID}), ""),
+    )
+    producer = make_producer(bus, storage, runner, settings)
+
+    playlists = await producer.list_channel_playlists(CHANNEL)
+
+    assert playlists == [
+        ChannelPlaylist(
+            "PLspring",
+            "Spring Boot",
+            "https://www.youtube.com/playlist?list=PLspring",
+            2,
+        ),
+        ChannelPlaylist(
+            "PLdocker", "Docker", "https://www.youtube.com/playlist?list=PLdocker", 1
+        ),
+    ]
+    assert runner.calls[0][-1] == "https://www.youtube.com/@Java.Brains/playlists"
+    assert "--flat-playlist" in runner.calls[0]
+    assert [call[-1] for call in runner.calls[1:]] == [
+        "https://www.youtube.com/playlist?list=PLspring",
+        "https://www.youtube.com/playlist?list=PLdocker",
+    ]
+
+
+async def test_an_unreadable_line_costs_one_playlist_not_the_listing(
+    bus, storage, settings
+) -> None:
+    runner = ScriptedRunner(
+        ProcessResult(
+            0,
+            "not json\n"
+            + playlist_stdout({"id": "PLspring", "title": "Spring Boot"})
+            + "\n[]\n"
+            + playlist_stdout({"id": "PLspring", "title": "Duplicate"}),
+            "",
+        ),
+        ProcessResult(0, "", ""),
+    )
+    producer = make_producer(bus, storage, runner, settings)
+
+    playlists = await producer.list_channel_playlists(CHANNEL)
+
+    assert [playlist.playlist_id for playlist in playlists] == ["PLspring"]
+
+
+async def test_a_playlist_without_a_title_falls_back_to_its_id(
+    bus, storage, settings
+) -> None:
+    runner = ScriptedRunner(
+        ProcessResult(0, playlist_stdout({"id": "PLspring"}), ""),
+        ProcessResult(0, "", ""),
+    )
+    producer = make_producer(bus, storage, runner, settings)
+
+    playlists = await producer.list_channel_playlists(CHANNEL)
+
+    assert playlists[0].title == "PLspring"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [ProcessResult(1, "", "channel does not exist"), ProcessTimeoutError()],
+)
+async def test_a_failed_channel_lookup_raises_rather_than_reporting_no_playlists(
+    bus, storage, settings, failure: object
+) -> None:
+    producer = make_producer(bus, storage, ScriptedRunner(failure), settings)
+
+    with pytest.raises(ChannelListingError):
+        await producer.list_channel_playlists(CHANNEL)
+
+
+async def test_a_failed_count_lookup_leaves_the_playlist_listed_with_zero(
+    bus, storage, settings
+) -> None:
+    runner = ScriptedRunner(
+        ProcessResult(0, playlist_stdout({"id": "PLspring", "title": "Spring"}), ""),
+        ProcessTimeoutError(),
+    )
+    producer = make_producer(bus, storage, runner, settings)
+
+    playlists = await producer.list_channel_playlists(CHANNEL)
+
+    assert playlists[0].video_count == 0
+
+
+async def test_a_playlists_widest_thumbnail_is_kept(bus, storage, settings) -> None:
+    runner = ScriptedRunner(
+        ProcessResult(
+            0,
+            playlist_stdout(
+                {
+                    "id": "PLspring",
+                    "title": "Spring",
+                    "thumbnails": [
+                        {"url": "https://i.ytimg.com/vi/aaa/default.jpg", "width": 120},
+                        {"url": "https://i.ytimg.com/vi/aaa/hq.jpg", "width": 480},
+                        {"no_url": True},
+                    ],
+                }
+            ),
+            "",
+        ),
+        ProcessResult(0, "", ""),
+    )
+    producer = make_producer(bus, storage, runner, settings)
+
+    playlists = await producer.list_channel_playlists(CHANNEL)
+
+    assert playlists[0].thumbnail_url == "https://i.ytimg.com/vi/aaa/hq.jpg"
+
+
+async def test_a_playlist_without_thumbnails_has_none(bus, storage, settings) -> None:
+    runner = ScriptedRunner(
+        ProcessResult(0, playlist_stdout({"id": "PLspring", "title": "Spring"}), ""),
+        ProcessResult(0, "", ""),
+    )
+    producer = make_producer(bus, storage, runner, settings)
+
+    playlists = await producer.list_channel_playlists(CHANNEL)
+
+    assert playlists[0].thumbnail_url is None
+
+
+async def test_an_expanded_playlist_carries_its_first_videos_thumbnail(
+    bus, storage, settings, recorder
+) -> None:
+    runner = ScriptedRunner(
+        ProcessResult(0, playlist_stdout({"id": VIDEO_ID}, {"id": "bbbbbbbbbbb"}), "")
+    )
+    make_producer(bus, storage, runner, settings)
+
+    bus.emit("youtube.playlist.expansion.requested", expansion_request())
+    await settle(bus)
+
+    assert (
+        recorder.expanded[0].playlist_thumbnail
+        == f"https://i.ytimg.com/vi/{VIDEO_ID}/hqdefault.jpg"
+    )

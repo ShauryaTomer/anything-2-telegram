@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS batches (
     id TEXT PRIMARY KEY,
     source_url TEXT NOT NULL,
     title TEXT,
+    thumbnail_url TEXT,
     jobs_created INTEGER NOT NULL DEFAULT 0,
     skipped_entries INTEGER NOT NULL DEFAULT 0,
     error_code TEXT,
@@ -87,6 +88,12 @@ async def open_database(db_path: Path) -> aiosqlite.Connection:
     connection = await aiosqlite.connect(db_path)
     connection.row_factory = aiosqlite.Row
     await connection.executescript(_SCHEMA)
+    # CREATE TABLE IF NOT EXISTS leaves an older database's batches table as it
+    # was, so columns added after that database was created land here.
+    try:
+        await connection.execute("ALTER TABLE batches ADD COLUMN thumbnail_url TEXT")
+    except aiosqlite.OperationalError:
+        pass
     await connection.commit()
     return connection
 
@@ -150,6 +157,7 @@ class BatchRow:
     error: ErrorInfo | None
     created_at: datetime
     updated_at: datetime
+    thumbnail_url: str | None = None
 
 
 @dataclass
@@ -303,6 +311,7 @@ def _batch_from_row(row: aiosqlite.Row) -> BatchRow:
         id=UUID(row["id"]),
         source_url=row["source_url"],
         title=row["title"],
+        thumbnail_url=row["thumbnail_url"],
         jobs_created=bool(row["jobs_created"]),
         skipped_entries=row["skipped_entries"],
         error=error,
@@ -320,8 +329,8 @@ class BatchesRepository:
             """
             INSERT INTO batches (
                 id, source_url, title, jobs_created, skipped_entries,
-                error_code, error_message, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                error_code, error_message, created_at, updated_at, thumbnail_url
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             self._params(row),
         )
@@ -333,7 +342,8 @@ class BatchesRepository:
             """
             UPDATE batches SET
                 source_url = ?, title = ?, jobs_created = ?, skipped_entries = ?,
-                error_code = ?, error_message = ?, created_at = ?, updated_at = ?
+                error_code = ?, error_message = ?, created_at = ?, updated_at = ?,
+                thumbnail_url = ?
             WHERE id = ?
             """,
             (*params[1:], params[0]),
@@ -352,6 +362,7 @@ class BatchesRepository:
             row.error.message if row.error else None,
             _dt(row.created_at),
             _dt(row.updated_at),
+            row.thumbnail_url,
         )
 
     async def get(self, batch_id: UUID) -> BatchRow | None:

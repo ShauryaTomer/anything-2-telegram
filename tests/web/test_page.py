@@ -730,3 +730,24 @@ async def test_page_reload_with_open_query_param_renders_already_expanded(tmp_pa
     assert response.status_code == 200
     assert "https://youtu.be/x-child" in body
     assert "https://youtu.be/y-child" in body
+
+
+async def test_a_batch_row_shows_its_playlist_thumbnail_once_expanded(tmp_path: Path) -> None:
+    bus = AsyncIOEventEmitter()
+    tracker, _conn = await _build_tracker(tmp_path)
+    tracker.register(bus)
+    thumbnail = "https://i.ytimg.com/vi/aaaaaaaaaaa/hqdefault.jpg"
+
+    await _emit(bus, BATCH_CREATED, BatchCreated(BATCH, "https://youtu.be/playlist?list=x", AT))
+    async with await _client(tracker) as client:
+        before = await client.get("/web/queue")
+        await _emit(
+            bus,
+            YOUTUBE_PLAYLIST_EXPANDED,
+            PlaylistExpanded(BATCH, (), 0, AT, "Rust Fundamentals", thumbnail),
+        )
+        await _drain(bus)
+        after = await client.get("/web/queue")
+
+    assert "batch-thumb" not in before.text
+    assert f'<img class="batch-thumb" src="{thumbnail}"' in after.text

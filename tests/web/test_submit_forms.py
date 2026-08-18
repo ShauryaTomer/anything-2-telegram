@@ -1,14 +1,10 @@
 from datetime import UTC, datetime
-from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
-from httpx import ASGITransport, AsyncClient
-from pyee.asyncio import AsyncIOEventEmitter
 
-from anything2telegram.api.jobs import create_jobs_app
-from anything2telegram.artifacts.storage import ArtifactStorage, ArtifactStorageError
+from anything2telegram.artifacts.storage import ArtifactStorageError
 from anything2telegram.domain import (
     BatchRef,
     JobRef,
@@ -16,94 +12,13 @@ from anything2telegram.domain import (
     JobStatus,
     SourceKind,
     StagedArtifact,
-    UploadReservation,
 )
-from anything2telegram.jobs.repositories import (
-    BatchesRepository,
-    BatchQueueRepository,
-    JobQueueRepository,
-    JobsRepository,
-    open_database,
-)
-from anything2telegram.jobs.scheduler import JobScheduler, SchedulerError
-from anything2telegram.jobs.tracker import JobTracker
+from anything2telegram.jobs.scheduler import SchedulerError
+from tests.web.conftest import _client, _drain
 
 AT = datetime(2026, 7, 26, 12, 0, tzinfo=UTC)
 VIDEO = "https://youtu.be/abcdefghijk"
 PLAYLIST = "https://www.youtube.com/playlist?list=PL123"
-
-
-class _RecordingScheduler:
-    """Wraps a real JobScheduler to record what it was asked to submit."""
-
-    def __init__(self, inner: JobScheduler) -> None:
-        self._inner = inner
-        self.calls: list[tuple[str, object]] = []
-
-    @property
-    def accepting(self) -> bool:
-        return self._inner.accepting
-
-    async def submit_video(self, url: str) -> JobRef:
-        self.calls.append(("video", url))
-        return await self._inner.submit_video(url)
-
-    async def submit_playlist(self, url: str, offset: int = 0) -> BatchRef:
-        self.calls.append(("playlist", (url, offset)))
-        return await self._inner.submit_playlist(url, offset)
-
-    async def reserve_local_upload(
-        self, filename: str, media_type: str | None, caption: str | None
-    ) -> UploadReservation:
-        self.calls.append(("reserve", (filename, media_type, caption)))
-        return await self._inner.reserve_local_upload(filename, media_type, caption)
-
-    async def enqueue_reserved_upload(
-        self, reservation: UploadReservation, size_bytes: int
-    ) -> JobRef:
-        self.calls.append(("enqueue", size_bytes))
-        return await self._inner.enqueue_reserved_upload(reservation, size_bytes)
-
-    async def cancel_reserved_upload(self, job_id: UUID) -> bool:
-        return await self._inner.cancel_reserved_upload(job_id)
-
-
-def _ready(app) -> None:
-    app.state.readiness = SimpleNamespace(is_accepting=lambda: True)
-    app.state.telegram = SimpleNamespace(is_connected=True)
-
-
-@pytest.fixture
-async def wired_app(tmp_path: Path):
-    """A real bus + scheduler + tracker, so a submit produces a real queue row."""
-    app = create_jobs_app()
-    bus = AsyncIOEventEmitter()
-    storage = ArtifactStorage(tmp_path / "artifacts")
-    conn = await open_database(tmp_path / "yt2tg.sqlite3")
-    tracker = JobTracker(JobsRepository(conn), BatchesRepository(conn))
-    tracker.register(bus)
-    app.state.settings = SimpleNamespace(max_artifact_bytes=1024)
-    app.state.storage = storage
-    app.state.tracker = tracker
-    app.state.scheduler = _RecordingScheduler(
-        JobScheduler(bus, storage, JobQueueRepository(conn), BatchQueueRepository(conn))
-    )
-    app.state.bus = bus
-    _ready(app)
-    yield app
-    await _drain(bus)
-    await conn.close()
-
-
-async def _drain(bus: AsyncIOEventEmitter) -> None:
-    """Async handlers run as scheduled tasks, not inline; let them finish."""
-    while not bus.complete:
-        await bus.wait_for_complete()
-
-
-async def _client(app) -> AsyncClient:
-    transport = ASGITransport(app=app)
-    return AsyncClient(transport=transport, base_url="http://service")
 
 
 def _empty_flash(body: str) -> bool:

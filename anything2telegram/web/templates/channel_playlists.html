@@ -1,0 +1,17 @@
+{% if error %}
+<article>{{ error }}</article>
+{% elif not playlists %}
+<article>This channel has no playlists.</article>
+{% else %}
+<form method="post" action="/web/channel/queue">
+  <label class="pick pick-all"><input type="checkbox" onclick="this.closest('form').querySelectorAll('[name=playlist]').forEach(box => box.checked = this.checked)"> <strong>Select all</strong></label>
+  {% for playlist in playlists %}
+  <label class="pick">
+    <input type="checkbox" name="playlist" value="{{ playlist.url }}">
+    {% if playlist.thumbnail_url %}<img src="{{ playlist.thumbnail_url }}" alt="" loading="lazy">{% else %}<span class="thumb-missing"></span>{% endif %}
+    <span class="pick-text">{{ playlist.title }}<small>{{ playlist.video_count }} video{{ "" if playlist.video_count == 1 else "s" }}</small></span>
+  </label>
+  {% endfor %}
+  <button type="submit">Queue selected</button>
+</form>
+{% endif %}

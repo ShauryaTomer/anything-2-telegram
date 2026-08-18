@@ -78,6 +78,7 @@ class PlaylistExpanded:
     skipped_entries: int
     occurred_at: datetime
     playlist_title: str | None = None
+    playlist_thumbnail: str | None = None
 
 
 @dataclass(frozen=True)

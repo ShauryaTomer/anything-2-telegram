@@ -245,3 +245,51 @@ async def test_job_queue_and_batch_queue_share_a_single_sequence(
     await batches.enqueue(playlist)
 
     assert await jobs.peek_sequence() < await batches.peek_sequence()
+
+
+async def test_a_batchs_thumbnail_round_trips(conn: aiosqlite.Connection) -> None:
+    repo = BatchesRepository(conn)
+    row = make_batch_row(thumbnail_url="https://i.ytimg.com/vi/aaaaaaaaaaa/hq.jpg")
+
+    await repo.insert(row)
+    row.thumbnail_url = "https://i.ytimg.com/vi/bbbbbbbbbbb/hq.jpg"
+    await repo.update(row)
+
+    assert await repo.get(row.id) == row
+
+
+async def test_a_database_predating_the_thumbnail_column_gains_it(
+    tmp_path: Path,
+) -> None:
+    """The column is added by ALTER, so an existing install keeps its history."""
+    db_path = tmp_path / "old.sqlite3"
+    legacy = await aiosqlite.connect(db_path)
+    await legacy.execute(
+        """
+        CREATE TABLE batches (
+            id TEXT PRIMARY KEY, source_url TEXT NOT NULL, title TEXT,
+            jobs_created INTEGER NOT NULL DEFAULT 0,
+            skipped_entries INTEGER NOT NULL DEFAULT 0,
+            error_code TEXT, error_message TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )
+        """
+    )
+    old = make_batch_row()
+    await legacy.execute(
+        "INSERT INTO batches (id, source_url, title, jobs_created, skipped_entries,"
+        " created_at, updated_at) VALUES (?, ?, ?, 0, 0, ?, ?)",
+        (str(old.id), old.source_url, old.title, NOW.isoformat(), NOW.isoformat()),
+    )
+    await legacy.commit()
+    await legacy.close()
+
+    conn = await open_database(db_path)
+    repo = BatchesRepository(conn)
+    stored = await repo.get(old.id)
+    stored.thumbnail_url = "https://i.ytimg.com/vi/aaaaaaaaaaa/hq.jpg"
+    await repo.update(stored)
+    reread = await repo.get(old.id)
+    await conn.close()
+
+    assert stored.thumbnail_url == reread.thumbnail_url

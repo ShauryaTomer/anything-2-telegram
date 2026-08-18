@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>anything2telegram — channel</title>
+<link rel="stylesheet" href="/web/static/vendor/pico-2.1.1.classless.min.css">
+<script src="/web/static/vendor/htmx-2.0.9.min.js"></script>
+<style>
+  /* Pico stacks a label's children; these rows are checkbox | thumb | text. */
+  .pick { display: flex; align-items: center; gap: .75rem; margin-bottom: .75rem; }
+  .pick > input[type="checkbox"] { flex: none; margin: 0; }
+  .pick img, .thumb-missing {
+    flex: none; width: 120px; height: 68px; object-fit: cover;
+    border-radius: .25rem; background: var(--pico-code-background-color);
+  }
+  .pick-all { margin-bottom: 1rem; }
+  .pick-text { display: flex; flex-direction: column; gap: .1rem; }
+  .pick-text small { color: var(--pico-muted-color); }
+  /* htmx only fades its indicator; take the row out of flow until requested. */
+  #fetching { display: none; }
+  #fetching.htmx-request { display: block; }
+</style>
+</head>
+<body>
+<main>
+  <nav><a href="/">← Queue</a></nav>
+  <article>
+    <header><strong>Channel playlists</strong></header>
+    <form hx-post="/web/channel" hx-target="#channel-results" hx-swap="innerHTML" hx-indicator="#fetching" hx-disabled-elt="find button">
+      <label>YouTube channel URL
+        <input type="url" name="url" placeholder="https://www.youtube.com/@Handle" required>
+      </label>
+      <button type="submit">Fetch playlists</button>
+    </form>
+    <p id="fetching" class="htmx-indicator" aria-busy="true">Asking YouTube for the playlists…</p>
+  </article>
+  {% if flash_message %}<article id="flash">{% if flash_code %}<strong>{{ flash_code }}</strong> — {% endif %}{{ flash_message }}</article>{% endif %}
+  <div id="channel-results"></div>
+</main>
+</body>
+</html>

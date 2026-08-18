@@ -104,6 +104,7 @@ class JobTracker:
             uploading=counts[JobStatus.UPLOADING],
             completed=counts[JobStatus.COMPLETED],
             failed=counts[JobStatus.FAILED],
+            thumbnail_url=record.thumbnail_url,
         )
 
     async def list_queue(self) -> tuple[JobSnapshot | BatchEntry, ...]:
@@ -186,6 +187,7 @@ class JobTracker:
     async def _on_playlist_expanded(self, event: PlaylistExpanded) -> None:
         record = await self._require_batch(event.batch_id)
         record.title = event.playlist_title
+        record.thumbnail_url = event.playlist_thumbnail
         await self._batches.update(record)
 
     async def _on_playlist_expansion_failed(

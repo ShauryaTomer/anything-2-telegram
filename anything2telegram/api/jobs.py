@@ -332,6 +332,12 @@ def create_jobs_app() -> FastAPI:
             return _response(
                 422, "unsupported_youtube_url", "YouTube URL is unsupported"
             )
+        # Channels are a web-page-only flow: this API takes one video or one
+        # playlist, and a channel is neither.
+        if kind is YouTubeUrlKind.CHANNEL:
+            return _response(
+                422, "unsupported_youtube_url", "YouTube URL is unsupported"
+            )
         if not _is_ready(request):
             return _service_unavailable()
         scheduler = request.app.state.scheduler
