@@ -7,7 +7,6 @@ from ..domain import (
     BatchEntry,
     BatchSnapshot,
     BatchStatus,
-    JobPhase,
     JobSnapshot,
     JobStatus,
 )
@@ -22,26 +21,18 @@ from ..events import (
     JOB_STARTED,
     YOUTUBE_PLAYLIST_EXPANDED,
     YOUTUBE_PLAYLIST_EXPANSION_FAILED,
-    ArtifactProductionFailed,
-    ArtifactReady,
-    ArtifactUploadFailed,
-    ArtifactUploaded,
     BatchCreated,
     BatchJobsCreated,
     JobQueued,
-    JobStarted,
     PlaylistExpanded,
     PlaylistExpansionFailed,
 )
+from . import lifecycle
+from .lifecycle import (
+    InvalidJobTransition as InvalidJobTransition,
+    TrackingError as TrackingError,
+)
 from .repositories import BatchesRepository, BatchRow, JobsRepository, JobRow
-
-
-class TrackingError(RuntimeError):
-    """Lifecycle fact cannot be applied to the persisted projection."""
-
-
-class InvalidJobTransition(TrackingError):
-    """Job lifecycle fact conflicts with its current state."""
 
 
 class JobTracker:
@@ -60,14 +51,11 @@ class JobTracker:
         bus.on(BATCH_CREATED, self._locked(self._on_batch_created))
         bus.on(BATCH_JOBS_CREATED, self._locked(self._on_batch_jobs_created))
         bus.on(JOB_QUEUED, self._locked(self._on_job_queued))
-        bus.on(JOB_STARTED, self._locked(self._on_job_started))
-        bus.on(ARTIFACT_READY, self._locked(self._on_artifact_ready))
-        bus.on(
-            ARTIFACT_PRODUCTION_FAILED,
-            self._locked(self._on_artifact_production_failed),
-        )
-        bus.on(ARTIFACT_UPLOADED, self._locked(self._on_artifact_uploaded))
-        bus.on(ARTIFACT_UPLOAD_FAILED, self._locked(self._on_artifact_upload_failed))
+        bus.on(JOB_STARTED, self._locked(self._on_job_fact))
+        bus.on(ARTIFACT_READY, self._locked(self._on_job_fact))
+        bus.on(ARTIFACT_PRODUCTION_FAILED, self._locked(self._on_job_fact))
+        bus.on(ARTIFACT_UPLOADED, self._locked(self._on_job_fact))
+        bus.on(ARTIFACT_UPLOAD_FAILED, self._locked(self._on_job_fact))
         bus.on(YOUTUBE_PLAYLIST_EXPANDED, self._locked(self._on_playlist_expanded))
         bus.on(
             YOUTUBE_PLAYLIST_EXPANSION_FAILED,
@@ -177,83 +165,11 @@ class JobTracker:
         if batch is not None:
             await self._touch_batch(batch, event.occurred_at)
 
-    async def _on_job_started(self, event: JobStarted) -> None:
+    async def _on_job_fact(self, event: lifecycle.JobFact) -> None:
         record = await self._require_job(event.job_id)
-        if record.status not in (JobStatus.WAITING, JobStatus.INTERRUPTED):
-            raise InvalidJobTransition("invalid job transition")
-        expected_phase = JobPhase.UPLOADING if record.staged else JobPhase.PRODUCING
-        if event.phase is not expected_phase:
-            raise InvalidJobTransition("invalid job phase")
-        record.status = JobStatus(event.phase.value)
-        record.updated_at = event.occurred_at
-        await self._jobs.update(record)
-        await self._touch_batch_for_job(record, event.occurred_at)
-
-    async def _on_artifact_ready(self, event: ArtifactReady) -> None:
-        record = await self._require_job(event.job_id)
-        if record.ready_local_path is not None:
-            if _matches_ready_event(record, event):
-                return
-            raise InvalidJobTransition("conflicting artifact ready event")
-        if record.staged:
-            self._require_artifact(record, event.artifact_id)
-        if record.status is JobStatus.UPLOADING:
-            if not record.staged:
-                raise InvalidJobTransition("invalid job transition")
-        elif record.status is not JobStatus.PRODUCING:
-            raise InvalidJobTransition("invalid job transition")
-        record.status = JobStatus.UPLOADING
-        record.artifact_id = event.artifact_id
-        record.filename = event.filename
-        record.size_bytes = event.size_bytes
-        record.ready_local_path = event.local_path
-        record.ready_media_type = event.media_type
-        record.ready_caption = event.caption
-        record.updated_at = event.occurred_at
-        await self._jobs.update(record)
-        await self._touch_batch_for_job(record, event.occurred_at)
-
-    async def _on_artifact_production_failed(
-        self, event: ArtifactProductionFailed
-    ) -> None:
-        record = await self._require_job(event.job_id)
-        if self._terminal_duplicate(record, event):
-            return
-        self._require_status(record, JobStatus.PRODUCING)
-        if event.artifact_id is not None:
-            if record.artifact_id is not None:
-                self._require_artifact(record, event.artifact_id)
-            record.artifact_id = event.artifact_id
-        record.status = JobStatus.FAILED
-        record.error = event.error
-        record.updated_at = event.occurred_at
-        await self._jobs.update(record)
-        await self._touch_batch_for_job(record, event.occurred_at)
-
-    async def _on_artifact_uploaded(self, event: ArtifactUploaded) -> None:
-        record = await self._require_job(event.job_id)
-        if self._terminal_duplicate(record, event):
-            return
-        self._require_status(record, JobStatus.UPLOADING)
-        self._require_artifact(record, event.artifact_id)
-        record.status = JobStatus.COMPLETED
-        record.telegram_chat_id = event.telegram_chat_id
-        record.telegram_message_id = event.telegram_message_id
-        record.updated_at = event.occurred_at
-        await self._jobs.update(record)
-        await self._touch_batch_for_job(record, event.occurred_at)
-
-    async def _on_artifact_upload_failed(self, event: ArtifactUploadFailed) -> None:
-        record = await self._require_job(event.job_id)
-        if self._terminal_duplicate(record, event):
-            return
-        self._require_status(record, JobStatus.UPLOADING)
-        self._require_artifact(record, event.artifact_id)
-        record.status = JobStatus.FAILED
-        record.error = event.error
-        record.updated_at = event.occurred_at
-        await self._jobs.update(record)
-        await self._touch_batch_for_job(record, event.occurred_at)
+        if lifecycle.apply(record, event):
+            await self._jobs.update(record)
+            await self._touch_batch_for_job(record, event.occurred_at)
 
     async def _on_batch_jobs_created(self, event: BatchJobsCreated) -> None:
         record = await self._require_batch(event.batch_id)
@@ -311,24 +227,6 @@ class JobTracker:
         await self._touch_batch(batch, occurred_at)
 
     @staticmethod
-    def _require_status(record: JobRow, expected: JobStatus) -> None:
-        if record.status is not expected:
-            raise InvalidJobTransition("invalid job transition")
-
-    @staticmethod
-    def _require_artifact(record: JobRow, artifact_id: UUID) -> None:
-        if record.artifact_id != artifact_id:
-            raise TrackingError("artifact does not match job")
-
-    @staticmethod
-    def _terminal_duplicate(record: JobRow, event: object) -> bool:
-        if record.status not in (JobStatus.COMPLETED, JobStatus.FAILED):
-            return False
-        if _matches_terminal_event(record, event):
-            return True
-        raise InvalidJobTransition("conflicting job terminal event")
-
-    @staticmethod
     def _derive_batch_status(
         record: BatchRow, job_ids: tuple[UUID, ...], counts: dict[JobStatus, int]
     ) -> BatchStatus:
@@ -372,35 +270,3 @@ def _snapshot_from_row(row: JobRow) -> JobSnapshot:
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
-
-
-def _matches_ready_event(record: JobRow, event: ArtifactReady) -> bool:
-    return (
-        record.artifact_id == event.artifact_id
-        and record.ready_local_path == event.local_path
-        and record.filename == event.filename
-        and record.ready_media_type == event.media_type
-        and record.size_bytes == event.size_bytes
-        and record.ready_caption == event.caption
-        and record.updated_at == event.occurred_at
-    )
-
-
-def _matches_terminal_event(
-    record: JobRow,
-    event: ArtifactProductionFailed | ArtifactUploaded | ArtifactUploadFailed,
-) -> bool:
-    if record.updated_at != event.occurred_at:
-        return False
-    if isinstance(event, ArtifactUploaded):
-        return (
-            record.status is JobStatus.COMPLETED
-            and record.artifact_id == event.artifact_id
-            and record.telegram_chat_id == event.telegram_chat_id
-            and record.telegram_message_id == event.telegram_message_id
-        )
-    if record.status is not JobStatus.FAILED or record.error != event.error:
-        return False
-    if isinstance(event, ArtifactProductionFailed):
-        return event.artifact_id is None or record.artifact_id == event.artifact_id
-    return record.artifact_id == event.artifact_id
