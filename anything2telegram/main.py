@@ -155,7 +155,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         state.tracker.register(state.bus)
         state.progress = ProgressRegistry()
         state.scheduler = JobScheduler(
-            state.bus, state.storage, job_queue_repo, batch_queue_repo
+            state.bus,
+            state.storage,
+            job_queue_repo,
+            batch_queue_repo,
+            state.tracker,
         )
         await _recover_interrupted_jobs(jobs_repo, job_queue_repo)
         state.cleanup = ArtifactCleanup(state.storage)

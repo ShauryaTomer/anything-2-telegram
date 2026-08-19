@@ -1231,6 +1231,119 @@ async def test_batch_freshness_never_regresses_across_children(tracked_bus) -> N
     assert (await tracker.get_batch(BATCH)).updated_at == time(6)  # type: ignore[union-attr]
 
 
+async def test_reset_failed_batch_jobs_only_resets_failed_rows(tracked_bus) -> None:
+    tracker, bus, errors = tracked_bus
+    await create_batch_and_jobs(bus, errors)
+
+    await emit_valid(
+        bus,
+        errors,
+        JOB_STARTED,
+        JobStarted(JOB_1, JobPhase.PRODUCING, time(4)),
+    )
+    await emit_valid(
+        bus,
+        errors,
+        ARTIFACT_READY,
+        ready(job_id=JOB_1, artifact_id=ARTIFACT_1, occurred_at=time(5)),
+    )
+    await emit_valid(
+        bus,
+        errors,
+        ARTIFACT_UPLOAD_FAILED,
+        ArtifactUploadFailed(JOB_1, ARTIFACT_1, UPLOAD_ERROR, time(6)),
+    )
+    await emit_valid(
+        bus,
+        errors,
+        JOB_STARTED,
+        JobStarted(JOB_2, JobPhase.PRODUCING, time(7)),
+    )
+    await emit_valid(
+        bus,
+        errors,
+        ARTIFACT_READY,
+        ready(job_id=JOB_2, artifact_id=ARTIFACT_2, occurred_at=time(8)),
+    )
+    await emit_valid(
+        bus,
+        errors,
+        ARTIFACT_UPLOADED,
+        uploaded(job_id=JOB_2, artifact_id=ARTIFACT_2, occurred_at=time(9)),
+    )
+
+    retried = await tracker.reset_failed_batch_jobs(BATCH)
+    assert len(retried) == 1
+    assert retried[0].id == JOB_1
+    assert retried[0].status is JobStatus.WAITING
+
+    failed = await tracker.get_job(JOB_1)
+    assert failed is not None
+    assert failed.status is JobStatus.WAITING
+    assert failed.error is None
+    assert failed.telegram_chat_id is None
+    assert failed.telegram_message_id is None
+    assert failed.artifact_id is None
+    assert failed.filename is None
+    assert failed.size_bytes is None
+
+    completed = await tracker.get_job(JOB_2)
+    assert completed is not None
+    assert completed.status is JobStatus.COMPLETED
+
+
+async def test_reset_failed_batch_jobs_raises_unknown_batch(tracked_bus) -> None:
+    tracker, _, _ = tracked_bus
+
+    with pytest.raises(TrackingError):
+        await tracker.reset_failed_batch_jobs(UUID("30000000-0000-0000-0000-000000000001"))
+
+
+async def test_reset_failed_batch_jobs_with_no_failed_jobs_is_noop(tracked_bus) -> None:
+    tracker, bus, errors = tracked_bus
+    await create_batch_and_jobs(bus, errors)
+
+    await emit_valid(
+        bus,
+        errors,
+        JOB_STARTED,
+        JobStarted(JOB_1, JobPhase.PRODUCING, time(4)),
+    )
+    await emit_valid(
+        bus,
+        errors,
+        ARTIFACT_READY,
+        ready(job_id=JOB_1, artifact_id=ARTIFACT_1, occurred_at=time(5)),
+    )
+    await emit_valid(
+        bus,
+        errors,
+        ARTIFACT_UPLOADED,
+        uploaded(job_id=JOB_1, artifact_id=ARTIFACT_1, occurred_at=time(6)),
+    )
+    await emit_valid(
+        bus,
+        errors,
+        JOB_STARTED,
+        JobStarted(JOB_2, JobPhase.PRODUCING, time(7)),
+    )
+    await emit_valid(
+        bus,
+        errors,
+        ARTIFACT_READY,
+        ready(job_id=JOB_2, artifact_id=ARTIFACT_2, occurred_at=time(8)),
+    )
+    await emit_valid(
+        bus,
+        errors,
+        ARTIFACT_UPLOADED,
+        uploaded(job_id=JOB_2, artifact_id=ARTIFACT_2, occurred_at=time(9)),
+    )
+
+    retried = await tracker.reset_failed_batch_jobs(BATCH)
+    assert retried == ()
+
+
 async def test_returned_snapshots_are_frozen_and_do_not_expose_internal_mutation(tracked_bus) -> None:
     tracker, bus, errors = tracked_bus
     await create_batch_and_jobs(bus, errors)

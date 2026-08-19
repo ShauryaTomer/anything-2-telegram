@@ -1,17 +1,36 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
 from anything2telegram.artifacts.storage import ArtifactStorageError
 from anything2telegram.domain import (
+    ErrorInfo,
     BatchRef,
+    JobPhase,
     JobRef,
     JobSnapshot,
     JobStatus,
     SourceKind,
     StagedArtifact,
+)
+from anything2telegram.events import (
+    ARTIFACT_UPLOAD_FAILED,
+    ARTIFACT_UPLOADED,
+    ARTIFACT_READY,
+    BATCH_CREATED,
+    BATCH_JOBS_CREATED,
+    JOB_QUEUED,
+    JOB_STARTED,
+    ArtifactReady,
+    ArtifactUploadFailed,
+    ArtifactUploaded,
+    BatchCreated,
+    BatchJobsCreated,
+    JobQueued,
+    JobStarted,
 )
 from anything2telegram.jobs.scheduler import SchedulerError
 from tests.web.conftest import _client, _drain
@@ -19,6 +38,18 @@ from tests.web.conftest import _client, _drain
 AT = datetime(2026, 7, 26, 12, 0, tzinfo=UTC)
 VIDEO = "https://youtu.be/abcdefghijk"
 PLAYLIST = "https://www.youtube.com/playlist?list=PL123"
+UPLOAD_ERROR = ErrorInfo("upload_failed", "Upload failed")
+ARTIFACT_1 = UUID("30000000-0000-0000-0000-000000000001")
+ARTIFACT_2 = UUID("30000000-0000-0000-0000-000000000002")
+
+
+def _time(step: int) -> datetime:
+    return AT + timedelta(seconds=step)
+
+
+async def _emit(bus, topic: str, event: object) -> None:
+    bus.emit(topic, event)
+    await _drain(bus)
 
 
 def _empty_flash(body: str) -> bool:
@@ -286,3 +317,285 @@ async def test_existing_json_upload_route_is_unaffected(wired_app) -> None:
         )
 
     assert response.status_code == 202
+
+
+async def test_retry_failed_batch_posts_only_failed_jobs_and_resets_ui_state(
+    wired_app,
+) -> None:
+    batch_id = uuid4()
+    failed = uuid4()
+    completed = uuid4()
+
+    bus = wired_app.state.bus
+    await _emit(bus, BATCH_CREATED, BatchCreated(batch_id, "https://youtu.be/playlist?list=retry", AT))
+    await _emit(
+        bus,
+        JOB_QUEUED,
+        JobQueued(
+            failed,
+            batch_id,
+            SourceKind.YOUTUBE,
+            "https://youtu.be/fail",
+            None,
+            _time(1),
+        ),
+    )
+    await _emit(
+        bus,
+        JOB_QUEUED,
+        JobQueued(
+            completed,
+            batch_id,
+            SourceKind.YOUTUBE,
+            "https://youtu.be/done",
+            None,
+            _time(2),
+        ),
+    )
+    await _emit(
+        bus,
+        BATCH_JOBS_CREATED,
+        BatchJobsCreated(batch_id, (failed, completed), 0, _time(3)),
+    )
+    await _emit(bus, JOB_STARTED, JobStarted(failed, JobPhase.PRODUCING, _time(4)))
+    await _emit(
+        bus,
+        ARTIFACT_READY,
+        ArtifactReady(
+            failed,
+            ARTIFACT_1,
+            Path("/tmp/fail.mp4"),
+            "fail.mp4",
+            "video/mp4",
+            111,
+            None,
+            _time(5),
+        ),
+    )
+    await _emit(
+        bus,
+        ARTIFACT_UPLOAD_FAILED,
+        ArtifactUploadFailed(
+            failed,
+            ARTIFACT_1,
+            UPLOAD_ERROR,
+            _time(6),
+        ),
+    )
+    await _emit(bus, JOB_STARTED, JobStarted(completed, JobPhase.PRODUCING, _time(7)))
+    await _emit(
+        bus,
+        ARTIFACT_READY,
+        ArtifactReady(
+            completed,
+            ARTIFACT_2,
+            Path("/tmp/done.mp4"),
+            "done.mp4",
+            "video/mp4",
+            222,
+            None,
+            _time(8),
+        ),
+    )
+    await _emit(
+        bus,
+        ARTIFACT_UPLOADED,
+        ArtifactUploaded(completed, ARTIFACT_2, -100, 99, _time(9)),
+    )
+
+    async with await _client(wired_app) as client:
+        queue = await client.get(f"/web/queue?open={batch_id}")
+        assert "partially_completed" in queue.text
+        assert "↻" in queue.text
+
+        response = await client.post(
+            f"/web/batches/{batch_id}/retry-failed?open={batch_id}"
+        )
+
+    assert response.status_code == 200
+    assert "↻" not in response.text
+    assert "partially_completed" not in response.text
+    assert "No failed jobs to retry." not in response.text
+
+    calls = wired_app.state.scheduler.calls[-1]
+    assert calls[0] == "retry_batch"
+    assert calls[1] == batch_id
+
+    failed_job = await wired_app.state.tracker.get_job(failed)
+    completed_job = await wired_app.state.tracker.get_job(completed)
+    assert failed_job is not None and failed_job.status is not JobStatus.FAILED
+    assert completed_job is not None and completed_job.status is JobStatus.COMPLETED
+
+
+async def test_retry_failed_batch_requires_failed_children(wired_app) -> None:
+    batch_id = uuid4()
+    child = uuid4()
+
+    bus = wired_app.state.bus
+    await _emit(bus, BATCH_CREATED, BatchCreated(batch_id, "https://youtu.be/playlist?list=none", AT))
+    await _emit(
+        bus,
+        JOB_QUEUED,
+        JobQueued(
+            child,
+            batch_id,
+            SourceKind.YOUTUBE,
+            "https://youtu.be/good",
+            None,
+            _time(1),
+        ),
+    )
+    await _emit(bus, BATCH_JOBS_CREATED, BatchJobsCreated(batch_id, (child,), 0, _time(3)))
+    await _emit(bus, JOB_STARTED, JobStarted(child, JobPhase.PRODUCING, _time(4)))
+    await _emit(
+        bus,
+        ARTIFACT_READY,
+        ArtifactReady(
+            child,
+            ARTIFACT_1,
+            Path("/tmp/good.mp4"),
+            "good.mp4",
+            "video/mp4",
+            111,
+            None,
+            _time(5),
+        ),
+    )
+    await _emit(
+        bus,
+        ARTIFACT_UPLOADED,
+        ArtifactUploaded(child, ARTIFACT_1, -101, 123, _time(6)),
+    )
+
+    async with await _client(wired_app) as client:
+        response = await client.post(f"/web/batches/{batch_id}/retry-failed")
+
+    assert response.status_code == 200
+    assert "<strong>422</strong>" in response.text
+    assert "No failed jobs to retry." in response.text
+
+
+async def test_retry_failed_batch_icon_exists_for_fully_failed_playlist(
+    wired_app,
+) -> None:
+    batch_id = uuid4()
+    first = uuid4()
+    second = uuid4()
+
+    bus = wired_app.state.bus
+    await _emit(
+        bus,
+        BATCH_CREATED,
+        BatchCreated(batch_id, "https://youtu.be/playlist?list=failed", AT),
+    )
+    await _emit(
+        bus,
+        JOB_QUEUED,
+        JobQueued(
+            first,
+            batch_id,
+            SourceKind.YOUTUBE,
+            "https://youtu.be/first",
+            None,
+            _time(1),
+        ),
+    )
+    await _emit(
+        bus,
+        JOB_QUEUED,
+        JobQueued(
+            second,
+            batch_id,
+            SourceKind.YOUTUBE,
+            "https://youtu.be/second",
+            None,
+            _time(2),
+        ),
+    )
+    await _emit(
+        bus,
+        BATCH_JOBS_CREATED,
+        BatchJobsCreated(batch_id, (first, second), 0, _time(3)),
+    )
+    await _emit(bus, JOB_STARTED, JobStarted(first, JobPhase.PRODUCING, _time(4)))
+    await _emit(
+        bus,
+        ARTIFACT_READY,
+        ArtifactReady(
+            first,
+            ARTIFACT_1,
+            Path("/tmp/first.mp4"),
+            "first.mp4",
+            "video/mp4",
+            111,
+            None,
+            _time(5),
+        ),
+    )
+    await _emit(
+        bus,
+        ARTIFACT_UPLOAD_FAILED,
+        ArtifactUploadFailed(
+            first,
+            ARTIFACT_1,
+            UPLOAD_ERROR,
+            _time(6),
+        ),
+    )
+    await _emit(bus, JOB_STARTED, JobStarted(second, JobPhase.PRODUCING, _time(7)))
+    await _emit(
+        bus,
+        ARTIFACT_READY,
+        ArtifactReady(
+            second,
+            ARTIFACT_2,
+            Path("/tmp/second.mp4"),
+            "second.mp4",
+            "video/mp4",
+            222,
+            None,
+            _time(8),
+        ),
+    )
+    await _emit(
+        bus,
+        ARTIFACT_UPLOAD_FAILED,
+        ArtifactUploadFailed(
+            second,
+            ARTIFACT_2,
+            UPLOAD_ERROR,
+            _time(9),
+        ),
+    )
+
+    async with await _client(wired_app) as client:
+        queue = await client.get(f"/web/queue?open={batch_id}")
+        assert "failed" in queue.text
+        assert "↻" in queue.text
+
+        response = await client.post(
+            f"/web/batches/{batch_id}/retry-failed?open={batch_id}"
+        )
+
+    assert response.status_code == 200
+    assert "↻" not in response.text
+    assert "No failed jobs to retry." not in response.text
+
+    calls = wired_app.state.scheduler.calls[-1]
+    assert calls[0] == "retry_batch"
+    assert calls[1] == batch_id
+
+    first_job = await wired_app.state.tracker.get_job(first)
+    second_job = await wired_app.state.tracker.get_job(second)
+    assert first_job is not None and first_job.status is not JobStatus.FAILED
+    assert second_job is not None and second_job.status is not JobStatus.FAILED
+
+
+async def test_retry_failed_batch_unknown_batch_reports_422(wired_app) -> None:
+    unknown = uuid4()
+    async with await _client(wired_app) as client:
+        response = await client.post(f"/web/batches/{unknown}/retry-failed")
+
+    assert response.status_code == 200
+    assert "<strong>422</strong>" in response.text
+    assert "Batch not found." in response.text

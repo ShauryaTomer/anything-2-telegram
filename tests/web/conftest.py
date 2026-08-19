@@ -12,7 +12,13 @@ from pyee.asyncio import AsyncIOEventEmitter
 
 from anything2telegram.api.jobs import create_jobs_app
 from anything2telegram.artifacts.storage import ArtifactStorage
-from anything2telegram.domain import BatchRef, JobRef, ProcessResult, UploadReservation
+from anything2telegram.domain import (
+    BatchRef,
+    JobRef,
+    JobSnapshot,
+    ProcessResult,
+    UploadReservation,
+)
 from anything2telegram.downloaders.youtube import YouTubeArtifactProducer
 from anything2telegram.jobs.progress import ProgressRegistry
 from anything2telegram.jobs.repositories import (
@@ -57,6 +63,14 @@ class _RecordingScheduler:
     ) -> JobRef:
         self.calls.append(("enqueue", size_bytes))
         return await self._inner.enqueue_reserved_upload(reservation, size_bytes)
+
+    async def enqueue_batch_retries(self, jobs: tuple[JobSnapshot, ...]) -> None:
+        self.calls.append(("retry", tuple(job.id for job in jobs)))
+        await self._inner.enqueue_batch_retries(jobs)
+
+    async def retry_failed_batch(self, batch_id: UUID) -> tuple[JobSnapshot, ...]:
+        self.calls.append(("retry_batch", batch_id))
+        return await self._inner.retry_failed_batch(batch_id)
 
     async def cancel_reserved_upload(self, job_id: UUID) -> bool:
         return await self._inner.cancel_reserved_upload(job_id)
@@ -108,7 +122,13 @@ async def wired_app(tmp_path: Path):
     app.state.storage = storage
     app.state.tracker = tracker
     app.state.scheduler = _RecordingScheduler(
-        JobScheduler(bus, storage, JobQueueRepository(conn), BatchQueueRepository(conn))
+        JobScheduler(
+            bus,
+            storage,
+            JobQueueRepository(conn),
+            BatchQueueRepository(conn),
+            tracker,
+        )
     )
     app.state.bus = bus
     app.state.channel_runner = FakeChannelRunner()

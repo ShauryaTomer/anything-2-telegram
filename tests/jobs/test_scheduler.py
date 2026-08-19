@@ -1,13 +1,13 @@
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from pyee.asyncio import AsyncIOEventEmitter
 
 from anything2telegram.artifacts.storage import ArtifactStorage
-from anything2telegram.domain import ErrorInfo, JobPhase
+from anything2telegram.domain import ErrorInfo, JobPhase, JobStatus, JobSnapshot, SourceKind
 from anything2telegram.events import (
     ARTIFACT_PRODUCTION_FAILED,
     ARTIFACT_READY,
@@ -27,21 +27,97 @@ from anything2telegram.events import (
     ArtifactReady,
     ArtifactUploaded,
     ArtifactUploadFailed,
+    BatchCreated,
+    BatchJobsCreated,
     DownloadTarget,
+    JobQueued,
+    JobStarted,
     PlaylistExpanded,
     PlaylistExpansionFailed,
     TelegramUnavailable,
 )
 from anything2telegram.jobs.repositories import (
     BatchQueueRepository,
+    BatchesRepository,
     JobQueueRepository,
+    JobQueueRow,
+    PlaylistQueueRow,
+    JobsRepository,
     open_database,
 )
+from anything2telegram.jobs.tracker import JobTracker
 from anything2telegram.jobs.scheduler import JobScheduler, SchedulerError
 
 
 def _stamp() -> datetime:
     return datetime.now(UTC)
+
+
+async def _emit(
+    bus: AsyncIOEventEmitter,
+    topic: str,
+    event: object,
+) -> None:
+    bus.emit(topic, event)
+    await settle()
+
+
+async def _seed_failed_job(
+    bus: AsyncIOEventEmitter,
+    batch_id: UUID,
+    job_id: UUID,
+) -> None:
+    artifact_id = uuid4()
+
+    await _emit(
+        bus,
+        BATCH_CREATED,
+        BatchCreated(
+            batch_id, "https://www.youtube.com/playlist?list=retries", _stamp()
+        ),
+    )
+    await _emit(
+        bus,
+        JOB_QUEUED,
+        JobQueued(
+            job_id,
+            batch_id,
+            SourceKind.YOUTUBE,
+            "https://www.youtube.com/watch?v=retry",
+            None,
+            _stamp(),
+        ),
+    )
+    await _emit(
+        bus,
+        BATCH_JOBS_CREATED,
+        BatchJobsCreated(batch_id, (job_id,), 0, _stamp()),
+    )
+    await _emit(bus, JOB_STARTED, JobStarted(job_id, JobPhase.PRODUCING, _stamp()))
+    await _emit(
+        bus,
+        ARTIFACT_READY,
+        ArtifactReady(
+            job_id,
+            artifact_id,
+            Path("/tmp/retry.mp4"),
+            "retry.mp4",
+            "video/mp4",
+            11,
+            None,
+            _stamp(),
+        ),
+    )
+    await _emit(
+        bus,
+        ARTIFACT_UPLOAD_FAILED,
+        ArtifactUploadFailed(
+            job_id,
+            artifact_id,
+            ErrorInfo("upload_failed", "Upload failed"),
+            _stamp(),
+        ),
+    )
 
 
 VIDEO = "https://www.youtube.com/watch?v=aaaaaaaaaaa"
@@ -102,6 +178,21 @@ async def scheduler(bus: AsyncIOEventEmitter, storage: ArtifactStorage, tmp_path
     job_queue = JobQueueRepository(conn)
     batch_queue = BatchQueueRepository(conn)
     yield JobScheduler(bus, storage, job_queue, batch_queue)
+    await conn.close()
+
+
+@pytest.fixture
+async def scheduler_with_tracker(
+    bus: AsyncIOEventEmitter,
+    storage: ArtifactStorage,
+    tmp_path: Path,
+):
+    conn = await open_database(tmp_path / "yt2tg.sqlite3")
+    job_queue = JobQueueRepository(conn)
+    batch_queue = BatchQueueRepository(conn)
+    tracker = JobTracker(JobsRepository(conn), BatchesRepository(conn))
+    tracker.register(bus)
+    yield JobScheduler(bus, storage, job_queue, batch_queue, tracker), tracker
     await conn.close()
 
 
@@ -335,6 +426,122 @@ async def test_an_unknown_or_mismatched_reservation_is_refused(
     with pytest.raises(SchedulerError) as error:
         await scheduler.enqueue_reserved_upload(reservation, 3)
     assert error.value.code == "invalid_reservation"
+
+
+async def test_only_youtube_jobs_are_queued_for_batch_retry(
+    scheduler: JobScheduler
+) -> None:
+    job_queue = scheduler._job_queue
+    batch_queue = scheduler._batch_queue
+    queued_id = uuid4()
+    playlist_id = uuid4()
+    retry_id = uuid4()
+
+    await job_queue.enqueue(
+        JobQueueRow(
+            queued_id,
+            kind="youtube",
+            source_url="https://www.youtube.com/watch?v=existing",
+            title="existing",
+        )
+    )
+    await batch_queue.enqueue(
+        PlaylistQueueRow(
+            playlist_id,
+            source_url="https://www.youtube.com/playlist?list=PLexisting",
+            offset=0,
+        )
+    )
+    failed_jobs = (
+        JobSnapshot(
+            id=retry_id,
+            batch_id=None,
+            source_kind=SourceKind.YOUTUBE,
+            source="https://www.youtube.com/watch?v=retry",
+            title="Episode One",
+            status=JobStatus.FAILED,
+            artifact_id=None,
+            filename=None,
+            size_bytes=123,
+            telegram_chat_id=1,
+            telegram_message_id=2,
+            error=None,
+            created_at=_stamp(),
+            updated_at=_stamp(),
+        ),
+        JobSnapshot(
+            id=uuid4(),
+            batch_id=None,
+            source_kind=SourceKind.LOCAL_UPLOAD,
+            source="https://example.test/local.mp4",
+            title=None,
+            status=JobStatus.FAILED,
+            artifact_id=None,
+            filename="local.mp4",
+            size_bytes=456,
+            telegram_chat_id=3,
+            telegram_message_id=4,
+            error=None,
+            created_at=_stamp(),
+            updated_at=_stamp(),
+        ),
+    )
+    await scheduler.enqueue_batch_retries(failed_jobs)
+
+    queued = await job_queue.list_all()
+    assert queued[0].job_id == retry_id
+    assert queued[0].title == failed_jobs[0].title
+    assert queued[0].source_url == failed_jobs[0].source
+    assert queued[1].job_id == queued_id
+    assert queued[1].title == "existing"
+    assert len(queued) == 2
+    batch_sequence = await batch_queue.peek_sequence()
+    assert batch_sequence is not None
+    queued_sequence = await job_queue.peek_sequence()
+    assert queued_sequence is not None
+    assert queued_sequence < batch_sequence
+
+
+async def test_retry_failed_batch_requeues_only_retryable_failed_jobs(
+    bus: AsyncIOEventEmitter,
+    scheduler_with_tracker: tuple[JobScheduler, JobTracker],
+) -> None:
+    scheduler, tracker = scheduler_with_tracker
+    batch_id = uuid4()
+    failed_job = uuid4()
+    await _seed_failed_job(bus, batch_id, failed_job)
+
+    jobs = await scheduler.retry_failed_batch(batch_id)
+
+    assert len(jobs) == 1
+    assert jobs[0].id == failed_job
+    tracked = await tracker.get_job(failed_job)
+    assert tracked is not None
+    assert tracked.status is JobStatus.WAITING
+    assert tracked.artifact_id is None
+
+
+async def test_retry_failed_batch_reverts_claim_if_queueing_fails(
+    bus: AsyncIOEventEmitter,
+    scheduler_with_tracker: tuple[JobScheduler, JobTracker],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduler, tracker = scheduler_with_tracker
+    batch_id = uuid4()
+    failed_job = uuid4()
+    await _seed_failed_job(bus, batch_id, failed_job)
+
+    async def _reject(_: tuple[JobSnapshot, ...]) -> None:
+        raise SchedulerError("scheduler_unavailable", "Busy")
+
+    monkeypatch.setattr(scheduler, "enqueue_batch_retries", _reject)
+
+    with pytest.raises(SchedulerError):
+        await scheduler.retry_failed_batch(batch_id)
+
+    tracked = await tracker.get_job(failed_job)
+    assert tracked is not None
+    assert tracked.status is JobStatus.FAILED
 
 
 async def test_a_reservation_whose_file_never_arrived_is_refused(

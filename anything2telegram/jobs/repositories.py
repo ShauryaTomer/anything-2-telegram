@@ -428,20 +428,34 @@ class JobQueueRepository:
         )
 
     async def prepend(self, rows: list[JobQueueRow]) -> None:
-        """Insert ``rows`` ahead of everything already queued.
+        """Insert ``rows`` ahead of anything already queued.
 
-        Playlist children must run before work submitted after the playlist
-        but before it finished expanding. Sequence numbers only increase, so
-        this re-sequences the whole table: delete everything, insert the new
-        rows first, then reinsert the survivors in their original order.
+        Sequence numbers only increase across job- and batch-queue reads when new
+        items are appended, but retry jobs and playlist children should run
+        *before* ordinary queued work. Re-sequence everything: delete
+        ``job_queue`` entries, insert the new rows ahead of its current min
+        sequence, then reinsert the survivors in their original order.
         """
+        if not rows:
+            return
         existing = await self.list_all()
+        cursor = await self._conn.execute(
+            "SELECT MIN(sequence) AS minimum_sequence FROM ("
+            "SELECT sequence FROM job_queue UNION ALL SELECT sequence FROM batch_queue"
+            ")"
+        )
+        min_row = await cursor.fetchone()
+        await cursor.close()
+        min_sequence = min_row["minimum_sequence"] if min_row is not None else None
+        start_sequence = (min_sequence or 0) - len(rows)
         await self._conn.execute("DELETE FROM job_queue")
         for row in rows:
-            sequence = await _next_sequence(self._conn)
+            sequence = start_sequence
+            start_sequence += 1
             await self._insert(row, sequence)
         for row in existing:
-            sequence = await _next_sequence(self._conn)
+            sequence = start_sequence
+            start_sequence += 1
             await self._insert(row, sequence)
         await self._conn.commit()
 

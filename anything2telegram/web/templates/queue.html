@@ -22,6 +22,18 @@
     {{ status.value }}
   {%- endif -%}
 {%- endmacro %}
+{% macro retry_form(batch) -%}
+  {%- if batch.failed > 0 -%}
+    <form
+      class="retry-form"
+      hx-post="/web/batches/{{ batch.id }}/retry-failed{% if open_param %}?open={{ open_param }}{% endif %}"
+      hx-target="#queue"
+      hx-swap="outerHTML"
+    >
+      <button type="submit" class="retry" title="Retry failed videos">↻</button>
+    </form>
+  {%- endif -%}
+{%- endmacro %}
 <div id="queue" hx-get="/web/queue{% if open_param %}?open={{ open_param }}{% endif %}" hx-trigger="every 2s" hx-swap="outerHTML">
   <table>
     <thead>
@@ -44,7 +56,10 @@
             {%- if entry.batch.thumbnail_url %}<img class="batch-thumb" src="{{ entry.batch.thumbnail_url }}" alt="" loading="lazy">{% endif %}
             {{ source_cell(entry.batch.title, entry.batch.source_url|playlist_id, entry.batch.source_url) }}
           </td>
-          <td>{{ status_cell(entry.batch.status, entry.batch.error) }}</td>
+          <td>
+            {{ status_cell(entry.batch.status, entry.batch.error) }}
+            {{ retry_form(entry.batch) }}
+          </td>
           <td>{% if entry.batch.status.value == "expanding" %}waiting{% else %}{{ entry.batch.completed }}/{{ entry.batch.total_jobs }} done{% endif %}</td>
           <td></td>
         </tr>

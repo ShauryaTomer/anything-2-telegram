@@ -18,6 +18,7 @@ from anything2telegram.downloaders.youtube import (
     classify_youtube_url,
 )
 from anything2telegram.jobs.scheduler import SchedulerError
+from anything2telegram.jobs.tracker import TrackingError
 from anything2telegram.tui import format_bytes
 
 _WEB_ROOT = Path(__file__).parent
@@ -285,5 +286,26 @@ def register_web_routes(app: FastAPI) -> None:
             await _stage_upload_and_enqueue(request, state, max_bytes)
         except _UploadSubmitError as error:
             return await _submit_response(request, str(error.status_code), error.message, open)
+
+        return await _submit_response(request, None, None, open)
+
+    @app.post("/web/batches/{batch_id}/retry-failed", response_class=HTMLResponse)
+    async def retry_failed_batch(
+        request: Request,
+        batch_id: UUID,
+        open: str = Query(""),
+    ) -> HTMLResponse:
+        if not request.app.state.scheduler.accepting:
+            return await _submit_response(request, "503", _NOT_READY, open)
+
+        try:
+            jobs = await request.app.state.scheduler.retry_failed_batch(batch_id)
+        except TrackingError:
+            return await _submit_response(request, "422", "Batch not found.", open)
+        except SchedulerError:
+            return await _submit_response(request, "503", _NOT_READY, open)
+
+        if not jobs:
+            return await _submit_response(request, "422", "No failed jobs to retry.", open)
 
         return await _submit_response(request, None, None, open)
