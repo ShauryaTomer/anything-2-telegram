@@ -132,6 +132,17 @@ class FakeProgressRegistry:
         return self.values.get(job_id)
 
 
+class FakeDatabase:
+    async def execute(self, _query: str):
+        return self
+
+    async def fetchone(self):
+        return (1,)
+
+    async def close(self) -> None:
+        pass
+
+
 @pytest.fixture
 def api():
     app = create_jobs_app()
@@ -140,6 +151,7 @@ def api():
     state.readiness = SimpleNamespace(is_accepting=lambda: True)
     state.telegram = SimpleNamespace(is_connected=True)
     state.scheduler = FakeScheduler()
+    state.db = FakeDatabase()
     state.storage = FakeStorage()
     state.tracker = FakeTracker()
     state.progress = FakeProgressRegistry()
@@ -668,12 +680,38 @@ async def test_queue_json_reads_progress_per_child_job_independently(client, api
 async def test_health_reports_readiness_and_telegram_separately(client, api) -> None:
     ready = await client.get("/health")
     assert ready.status_code == 200
-    assert ready.json() == {"ready": True, "telegram_connected": True}
+    assert ready.json() == {
+        "ready": True,
+        "database_connected": True,
+        "telegram_connected": True,
+        "scheduler_accepting": True,
+    }
 
     api.state.telegram = SimpleNamespace(is_connected=False)
     degraded = await client.get("/health")
     assert degraded.status_code == 503
-    assert degraded.json() == {"ready": False, "telegram_connected": False}
+    assert degraded.json() == {
+        "ready": False,
+        "database_connected": True,
+        "telegram_connected": False,
+        "scheduler_accepting": True,
+    }
+
+
+async def test_health_reports_database_failure(client, api) -> None:
+    async def fail(_query: str):
+        raise RuntimeError("database closed")
+
+    api.state.db.execute = fail
+    response = await client.get("/health")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "ready": False,
+        "database_connected": False,
+        "telegram_connected": True,
+        "scheduler_accepting": True,
+    }
 
 
 async def test_health_is_503_before_the_lifespan_has_built_anything() -> None:
@@ -683,7 +721,12 @@ async def test_health_is_503_before_the_lifespan_has_built_anything() -> None:
         response = await client.get("/health")
 
     assert response.status_code == 503
-    assert response.json() == {"ready": False, "telegram_connected": False}
+    assert response.json() == {
+        "ready": False,
+        "database_connected": False,
+        "telegram_connected": False,
+        "scheduler_accepting": False,
+    }
 
 
 @pytest.mark.parametrize(

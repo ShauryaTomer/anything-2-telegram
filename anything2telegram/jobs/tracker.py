@@ -120,36 +120,6 @@ class JobTracker:
         entries.sort(key=lambda entry: entry[0], reverse=True)
         return tuple(entry for _, entry in entries)
 
-    async def reset_failed_batch_jobs(self, batch_id: UUID) -> tuple[JobSnapshot, ...]:
-        """Move a batch's failed jobs back to WAITING for retry."""
-        async with self._lock:
-            await self._require_batch(batch_id)
-            rows = await self._jobs.list_by_batch(batch_id)
-            now = datetime.now(UTC)
-            failed_jobs: list[JobSnapshot] = []
-            for row in rows:
-                if row.status is not JobStatus.FAILED:
-                    continue
-                row.status = JobStatus.WAITING
-                row.error = None
-                row.telegram_chat_id = None
-                row.telegram_message_id = None
-                row.artifact_id = None
-                row.filename = None
-                row.size_bytes = None
-                row.ready_local_path = None
-                row.ready_media_type = None
-                row.ready_caption = None
-                row.updated_at = now
-                await self._jobs.update(row)
-                failed_jobs.append(_snapshot_from_row(row))
-
-            if failed_jobs:
-                batch = await self._batches.get(batch_id)
-                if batch is not None:
-                    await self._touch_batch(batch, now)
-            return tuple(failed_jobs)
-
     async def claim_failed_batch_jobs_for_retry(
         self, batch_id: UUID
     ) -> tuple[JobSnapshot, ...]:
@@ -172,6 +142,19 @@ class JobTracker:
                 if batch is not None:
                     await self._touch_batch(batch, now)
             return tuple(claimed_jobs)
+
+    async def claim_failed_job_for_retry(self, job_id: UUID) -> JobSnapshot | None:
+        """Mark one failed job WAITING so it can be retried."""
+        async with self._lock:
+            row = await self._require_job(job_id)
+            if row.status is not JobStatus.FAILED:
+                return None
+            now = datetime.now(UTC)
+            row.status = JobStatus.WAITING
+            row.updated_at = now
+            await self._jobs.update(row)
+            await self._touch_batch_for_job(row, now)
+            return _snapshot_from_row(row)
 
     async def revert_batch_jobs_to_failed(
         self, jobs: tuple[JobSnapshot, ...], occurred_at: datetime | None = None

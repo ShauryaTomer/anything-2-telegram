@@ -16,7 +16,7 @@ from .config import Settings
 from .domain import JobStatus
 from .downloaders.process import YouTubeProcessRunner
 from .downloaders.youtube import YouTubeArtifactProducer
-from .events import ERROR, TELEGRAM_UNAVAILABLE
+from .events import ERROR, TELEGRAM_AVAILABLE, TELEGRAM_UNAVAILABLE
 from .jobs.progress import ProgressRegistry
 from .jobs.repositories import (
     BatchesRepository,
@@ -185,6 +185,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         state.bus.on(ERROR, on_event_error)
         state.bus.on(TELEGRAM_UNAVAILABLE, lambda _event: state.readiness.close())
+        state.bus.on(
+            TELEGRAM_AVAILABLE,
+            lambda _event: state.readiness.open()
+            if state.scheduler.accepting
+            else None,
+        )
 
         try:
             await state.uploader.start()

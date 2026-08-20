@@ -397,6 +397,11 @@ async def test_the_download_command_bounds_size_and_uses_the_running_interpreter
 
     args = runner.calls[0]
     assert args[:3] == [sys.executable, "-m", "yt_dlp"]
+    video_budget = settings.max_artifact_bytes * 4 // 5
+    audio_budget = settings.max_artifact_bytes - video_budget
+    selected_format = args[args.index("-f") + 1]
+    assert f"[filesize<={video_budget}]" in selected_format
+    assert f"[filesize<={audio_budget}]" in selected_format
     assert args[args.index("--max-filesize") + 1] == str(settings.max_artifact_bytes)
     assert "--no-playlist" in args
     assert runner.timeout_seconds == settings.ytdlp_timeout_seconds
@@ -491,6 +496,25 @@ async def test_a_download_that_outgrows_the_limit_is_stopped(
 
     assert recorder.failure_codes() == ["artifact_oversize"]
     assert not (storage.root / str(event.job_id)).exists()
+
+
+async def test_temporary_merge_files_do_not_count_as_an_oversize_artifact(
+    bus, storage, recorder, tmp_path
+) -> None:
+    def merged_download(args: Sequence[str]) -> ProcessResult:
+        directory = Path(args[args.index("-o") + 1]).parent
+        directory.joinpath("clip.f140.m4a").write_bytes(b"x" * 6)
+        directory.joinpath("clip.mp4").write_bytes(b"x" * 7)
+        return ProcessResult(0, "", "")
+
+    small = settings_for(tmp_path, max_artifact_bytes=8)
+    make_producer(bus, storage, ScriptedRunner(merged_download), small)
+
+    bus.emit("youtube.download.requested", download_request())
+    await settle(bus)
+
+    assert recorder.failure_codes() == []
+    assert recorder.ready[0].size_bytes == 7
 
 
 async def test_cancellation_cleans_up_and_propagates(

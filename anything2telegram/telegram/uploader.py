@@ -16,12 +16,14 @@ from ..events import (
     ARTIFACT_UPLOAD_FAILED,
     ARTIFACT_UPLOADED,
     ERROR,
+    TELEGRAM_AVAILABLE,
     TELEGRAM_UNAVAILABLE,
     YOUTUBE_PLAYLIST_EXPANDED,
     ArtifactReady,
     ArtifactUploaded,
     ArtifactUploadFailed,
     PlaylistExpanded,
+    TelegramAvailable,
     TelegramUnavailable,
 )
 from ..jobs.progress import ProgressRegistry
@@ -34,6 +36,7 @@ from .client import (
 
 
 _LOGGER = logging.getLogger(__name__)
+_RECONNECT_DELAY_SECONDS = 1
 
 _ERRORS = {
     "artifact_missing": "Artifact is unavailable",
@@ -67,6 +70,7 @@ class TelegramArtifactUploader:
         self._emitted: set[tuple[UUID, UUID]] = set()
         self._inflight: set[asyncio.Task[object]] = set()
         self._monitor_task: asyncio.Task[None] | None = None
+        self._recovery_task: asyncio.Task[None] | None = None
         self._unavailable_emitted = False
         self._unavailable_pending = False
         self._accepting = True
@@ -112,6 +116,11 @@ class TelegramArtifactUploader:
         if monitor is not None:
             monitor.cancel()
             pending.append(monitor)
+        recovery = self._recovery_task
+        self._recovery_task = None
+        if recovery is not None and recovery is not current:
+            recovery.cancel()
+            pending.append(recovery)
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         if disconnect:
@@ -200,7 +209,7 @@ class TelegramArtifactUploader:
             self._emit_failure(event, "telegram_unavailable")
             self._request_unavailable()
             return
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             self._emit_failure(event, "telegram_timeout")
             return
         except TelegramUploadError:
@@ -271,6 +280,28 @@ class TelegramArtifactUploader:
         if error is not None:
             self._bus.emit(ERROR, error)
 
+    async def _recover_connection(self) -> None:
+        while not self._shutting_down:
+            await asyncio.sleep(_RECONNECT_DELAY_SECONDS)
+            if not self._client.is_connected:
+                try:
+                    await self._client.connect()
+                except TelegramClientError:
+                    continue
+
+            self._unavailable_emitted = False
+            _LOGGER.info("Telegram reconnected, resuming the queue")
+            self._bus.emit(TELEGRAM_AVAILABLE, TelegramAvailable(_now()))
+            monitor = self._monitor_task
+            if monitor is None or monitor.done():
+                self._monitor_task = asyncio.create_task(self._monitor_disconnect())
+                self._monitor_task.add_done_callback(self._monitor_done)
+            return
+
+    def _recovery_done(self, task: asyncio.Task[None]) -> None:
+        self._recovery_task = None
+        self._monitor_done(task)
+
     def _emit_failure(self, event: ArtifactReady, code: str) -> None:
         key = (event.job_id, event.artifact_id)
         if key in self._emitted:
@@ -316,7 +347,7 @@ class TelegramArtifactUploader:
             return
         self._unavailable_emitted = True
         _LOGGER.error(
-            "Telegram is unavailable, pausing the queue; restart to resume"
+            "Telegram is unavailable, pausing the queue while reconnecting"
         )
         self._bus.emit(
             TELEGRAM_UNAVAILABLE,
@@ -325,6 +356,9 @@ class TelegramArtifactUploader:
                 _now(),
             ),
         )
+        if self._recovery_task is None:
+            self._recovery_task = asyncio.create_task(self._recover_connection())
+            self._recovery_task.add_done_callback(self._recovery_done)
 
 
 def _supports_streaming(event: ArtifactReady) -> bool:

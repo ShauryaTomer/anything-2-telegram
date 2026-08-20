@@ -1,9 +1,8 @@
-import asyncio
 from collections.abc import Callable
 from pathlib import Path
 
 from telethon import TelegramClient
-from telethon.errors import RpcCallFailError, ServerError, TimedOutError
+from telethon.errors import ServerError, TimedOutError
 
 from ..config import Settings
 from ..domain import TelegramUploadResult
@@ -28,10 +27,7 @@ class TelegramUploadError(TelegramClientError):
 # Telethon's send_file can't forward part_size_kb, so pre-upload the handle.
 _PART_SIZE_KB = 512
 _CONNECTION_ERRORS = (
-    ConnectionError,
     OSError,
-    asyncio.TimeoutError,
-    RpcCallFailError,
     ServerError,
     TimedOutError,
 )

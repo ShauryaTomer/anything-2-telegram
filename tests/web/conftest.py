@@ -72,6 +72,10 @@ class _RecordingScheduler:
         self.calls.append(("retry_batch", batch_id))
         return await self._inner.retry_failed_batch(batch_id)
 
+    async def retry_failed_job(self, job_id: UUID) -> JobSnapshot | None:
+        self.calls.append(("retry_job", job_id))
+        return await self._inner.retry_failed_job(job_id)
+
     async def cancel_reserved_upload(self, job_id: UUID) -> bool:
         return await self._inner.cancel_reserved_upload(job_id)
 

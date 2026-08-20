@@ -195,8 +195,8 @@ Shutdown order:
 - Listener/programming failures call `scheduler.fail()` and close readiness.
 - Telegram disconnection fails the current upload, emits `telegram.unavailable`, pauses scheduling, and rejects new submissions.
 - yt-dlp runs in its own process group; timeout/cancellation sends terminate, then kill if still alive.
-- Known and unknown YouTube sizes are bounded using `--max-filesize` plus one-second polling of the
-  download directory's size while yt-dlp runs.
+- YouTube video/audio selections split the final size budget 80/20; `--max-filesize` bounds each
+  transfer and one-second polling caps temporary merge space at three times the artifact limit.
 - Terminal upload events trigger idempotent artifact cleanup.
 - All queues, projections, dedupe registries, and events are process-local and non-durable.
 

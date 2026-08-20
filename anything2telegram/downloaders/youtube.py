@@ -37,10 +37,6 @@ from .process import ProcessResult, ProcessTimeoutError
 
 _LOGGER = logging.getLogger(__name__)
 
-YTDLP_FORMAT = (
-    "bv*[ext=mp4][vcodec^=avc1][height<=1080]+ba[ext=m4a]/"
-    "b[ext=mp4][height<=1080]/b[height<=1080]"
-)
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _PLAYLIST_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 _FINAL_MEDIA_SUFFIXES = frozenset({".mp4", ".mkv", ".webm"})
@@ -360,10 +356,18 @@ class YouTubeArtifactProducer:
         ]
 
     def _download_args(self, source_url: str, directory: Path) -> list[str]:
+        video_budget = self._max_artifact_bytes * 4 // 5
+        audio_budget = self._max_artifact_bytes - video_budget
+        format_selector = (
+            f"bv*[ext=mp4][vcodec^=avc1][height<=1080][filesize<={video_budget}]"
+            f"+ba[ext=m4a][filesize<={audio_budget}]/"
+            f"b[ext=mp4][height<=1080][filesize<={self._max_artifact_bytes}]/"
+            f"b[height<=1080][filesize<={self._max_artifact_bytes}]"
+        )
         return [
             *_YTDLP_COMMAND,
             "-f",
-            YTDLP_FORMAT,
+            format_selector,
             "--merge-output-format",
             "mp4",
             "--max-filesize",
@@ -383,7 +387,7 @@ class YouTubeArtifactProducer:
     async def _run_download(
         self, args: Sequence[str], job_id: UUID, artifact_id: UUID, label: str
     ) -> ProcessResult:
-        """Waits for yt-dlp, stopping it if the partial download outgrows its quota."""
+        """Waits for yt-dlp, stopping it if its temporary files outgrow their quota."""
         runner_task = asyncio.create_task(
             self._runner.run(args, self._timeout_seconds)
         )
@@ -400,7 +404,8 @@ class YouTubeArtifactProducer:
                     )
                     size = self._storage.download_directory_size(job_id, artifact_id)
                     report(size, 0)
-                    if size > self._max_artifact_bytes:
+                    # A merge briefly holds video, audio, and the output file.
+                    if size > self._max_artifact_bytes * 3:
                         raise _ArtifactOversize()
                     if done:
                         return await runner_task

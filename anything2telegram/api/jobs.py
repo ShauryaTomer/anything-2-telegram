@@ -186,6 +186,20 @@ def _is_ready(request: Request) -> bool:
     )
 
 
+async def _database_connected(state: object) -> bool:
+    database = getattr(state, "db", None)
+    if database is None:
+        return False
+    try:
+        cursor = await database.execute("SELECT 1")
+        try:
+            return await cursor.fetchone() is not None
+        finally:
+            await cursor.close()
+    except Exception:
+        return False
+
+
 def _declared_size(request: Request) -> int:
     declared = request.headers.get("content-length", "")
     return int(declared) if declared.isdigit() else 0
@@ -400,12 +414,21 @@ def create_jobs_app() -> FastAPI:
 
     @app.get("/health")
     async def health(request: Request) -> JSONResponse:
-        telegram = getattr(request.app.state, "telegram", None)
+        state = request.app.state
+        telegram = getattr(state, "telegram", None)
         connected = telegram is not None and telegram.is_connected
-        ready = _is_ready(request)
+        scheduler = getattr(state, "scheduler", None)
+        scheduler_accepting = scheduler is not None and scheduler.accepting
+        database_connected = await _database_connected(state)
+        ready = _is_ready(request) and database_connected
         return JSONResponse(
             status_code=200 if ready else 503,
-            content={"ready": ready, "telegram_connected": connected},
+            content={
+                "ready": ready,
+                "database_connected": database_connected,
+                "telegram_connected": connected,
+                "scheduler_accepting": scheduler_accepting,
+            },
         )
 
     register_web_routes(app)

@@ -138,6 +138,33 @@ def test_started_sets_status_for_phase(staged, phase, expected) -> None:
     assert row.status is expected
 
 
+def test_production_start_clears_artifact_state_from_an_earlier_attempt() -> None:
+    row = make_row(
+        JobStatus.WAITING,
+        artifact_id=ARTIFACT_1,
+        filename="old.mp4",
+        size_bytes=42,
+        telegram_chat_id=100,
+        telegram_message_id=200,
+        error=ERROR,
+        ready_local_path=Path("/artifacts/old.mp4"),
+        ready_media_type="video/mp4",
+        ready_caption="old",
+    )
+
+    lifecycle.apply(row, started())
+
+    assert row.artifact_id is None
+    assert row.filename is None
+    assert row.size_bytes is None
+    assert row.telegram_chat_id is None
+    assert row.telegram_message_id is None
+    assert row.error is None
+    assert row.ready_local_path is None
+    assert row.ready_media_type is None
+    assert row.ready_caption is None
+
+
 @pytest.mark.parametrize("prior", [JobStatus.WAITING, JobStatus.INTERRUPTED])
 def test_started_rejects_wrong_phase(prior: JobStatus) -> None:
     row = make_row(prior)

@@ -115,10 +115,7 @@ class YouTubeProcessRunner:
             os.killpg(pid, sig)
             return True
         except OSError as error:
-            if (
-                isinstance(error, ProcessLookupError)
-                or error.errno == errno.ESRCH
-            ):
+            if isinstance(error, ProcessLookupError) or error.errno == errno.ESRCH:
                 return False
             raise
 
@@ -140,10 +137,7 @@ class YouTubeProcessRunner:
             os.killpg(process_group_id, 0)
             return True
         except OSError as error:
-            if (
-                isinstance(error, ProcessLookupError)
-                or error.errno == errno.ESRCH
-            ):
+            if isinstance(error, ProcessLookupError) or error.errno == errno.ESRCH:
                 return False
             if error.errno == errno.EPERM:
                 return True

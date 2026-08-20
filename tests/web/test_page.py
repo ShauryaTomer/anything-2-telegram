@@ -106,7 +106,7 @@ async def test_page_renders_headers_empty_state_and_flash_placeholder() -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
     body = response.text
-    assert '<div id="flash"></div>' in body
+    assert '<div id="flash"' in body
     assert 'id="queue"' in body
     assert 'hx-get="/web/queue"' in body
     assert 'hx-trigger="every 2s"' in body
@@ -117,6 +117,19 @@ async def test_page_renders_headers_empty_state_and_flash_placeholder() -> None:
     assert "<th>Link</th>" in body
     assert "Nothing queued. Paste a YouTube URL or pick a file above." in body
     assert '<meta name="color-scheme" content="light dark">' in body
+    assert 'href="/web/static/tokens.css"' in body
+    assert 'id="queue-state-filter"' in body
+    assert 'id="queue-sort"' in body
+    assert 'id="playlist-dialog"' in body
+    assert 'data-icon="arrow-right"' in body
+    assert 'data-icon="arrow-up"' in body
+    assert 'data-icon="copy"' not in body
+    assert 'href="/web/static/app.css"' in body
+    assert 'class="queue-workbench"' in body
+    assert 'id="system-health"' in body
+    assert 'data-health="database"' in body
+    assert 'data-health="telegram"' in body
+    assert 'data-health="scheduler"' in body
 
 
 async def test_page_has_two_forms_with_expected_fields() -> None:
@@ -154,7 +167,12 @@ async def test_existing_json_routes_still_resolve() -> None:
         missing_job = await client.get("/jobs/not-a-uuid")
 
     assert health.status_code == 503
-    assert health.json() == {"ready": False, "telegram_connected": False}
+    assert health.json() == {
+        "ready": False,
+        "database_connected": False,
+        "telegram_connected": False,
+        "scheduler_accepting": False,
+    }
     assert openapi.status_code == 200
     assert docs.status_code == 200
     assert missing_job.status_code == 404
@@ -176,11 +194,10 @@ async def test_web_queue_fragment_always_answers_200_with_its_own_poll_attrs() -
 
 async def test_page_indents_batch_children_with_css() -> None:
     async with await _client() as client:
-        response = await client.get("/")
+        stylesheet = await client.get("/web/static/app.css")
 
-    body = response.text
-    assert ".queue-child" in body
-    assert "padding-left" in body
+    assert ".queue-child" in stylesheet.text
+    assert "border-inline-start" in stylesheet.text
 
 
 async def test_web_queue_orders_interleaved_jobs_and_batches_newest_first(tmp_path: Path) -> None:
@@ -639,12 +656,17 @@ async def test_aggregate_count_on_partially_completed_batch_carries_no_title(tmp
     # The failed child should have its own title attribute in its status cell
     assert '<span class="failed" title="child_failed — Child job failed">failed</span>' in body
     # Batch is now in partially_completed state (one completed, one failed)
-    assert '<td>partially_completed</td>' in body
+    assert ">partially_completed</span>" in body
     # The aggregate counts cell should not have a title attribute—it shows "1/2 done" with no title
     assert '1/2 done' in body
     # Verify no title attribute exists on the aggregate count cell itself (should be plain text, not a span with title)
     import re
-    batch_row = re.search(r'<tr>\s+<td>.*?PLtest.*?</td>\s+<td>partially_completed</td>\s+<td>(.*?)</td>\s+<td></td>\s+</tr>', body, re.DOTALL)
+    batch_row = re.search(
+        r'<tr[^>]*class="queue-row queue-row--batch"[^>]*>.*?PLtest.*?'
+        r'<td data-label="Progress">(.*?)</td>',
+        body,
+        re.DOTALL,
+    )
     assert batch_row is not None, "Batch row found"
     counts_cell = batch_row.group(1)
     assert 'title=' not in counts_cell, "Aggregate counts cell should not have a title attribute"
@@ -687,6 +709,26 @@ async def test_open_query_param_expands_exactly_the_named_batch(tmp_path: Path) 
     assert response.status_code == 200
     assert "https://youtu.be/x-child" in body
     assert "https://youtu.be/y-child" not in body
+
+
+async def test_playlist_expand_opens_live_video_detail_fragment(tmp_path: Path) -> None:
+    tracker = await _tracker_with_a_standalone_job_and_a_batch(tmp_path)
+
+    async with await _client(tracker) as client:
+        queue = await client.get("/web/queue")
+        detail = await client.get(f"/web/queue?open={BATCH}")
+
+    assert queue.status_code == detail.status_code == 200
+    assert f'hx-get="/web/queue?open={BATCH}"' in queue.text
+    assert f'hx-select="#playlist-detail-{BATCH}"' in queue.text
+    assert 'aria-haspopup="dialog"' in queue.text
+    assert f'id="playlist-detail-{BATCH}"' in detail.text
+    assert f'hx-get="/web/queue?open={BATCH}"' in detail.text
+    assert 'hx-trigger="every 2s"' in detail.text
+    assert "<h3>" not in detail.text
+    assert '<p class="eyebrow">Playlist</p>' not in detail.text
+    assert f'1/2 <span class="muted">{CHILD_1}</span>' in detail.text
+    assert f'2/2 <span class="muted">{CHILD_2}</span>' in detail.text
 
 
 async def test_unknown_batch_ids_in_open_are_ignored_not_rejected(tmp_path: Path) -> None:

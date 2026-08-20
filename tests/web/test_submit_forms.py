@@ -52,6 +52,29 @@ async def _emit(bus, topic: str, event: object) -> None:
     await _drain(bus)
 
 
+async def _fail_job(bus, job_id: UUID, artifact_id: UUID, step: int) -> None:
+    await _emit(bus, JOB_STARTED, JobStarted(job_id, JobPhase.PRODUCING, _time(step)))
+    await _emit(
+        bus,
+        ARTIFACT_READY,
+        ArtifactReady(
+            job_id,
+            artifact_id,
+            Path(f"/tmp/{job_id}.mp4"),
+            f"{job_id}.mp4",
+            "video/mp4",
+            111,
+            None,
+            _time(step + 1),
+        ),
+    )
+    await _emit(
+        bus,
+        ARTIFACT_UPLOAD_FAILED,
+        ArtifactUploadFailed(job_id, artifact_id, UPLOAD_ERROR, _time(step + 2)),
+    )
+
+
 def _empty_flash(body: str) -> bool:
     return '<div id="flash" hx-swap-oob="true"></div>' in body
 
@@ -406,14 +429,14 @@ async def test_retry_failed_batch_posts_only_failed_jobs_and_resets_ui_state(
     async with await _client(wired_app) as client:
         queue = await client.get(f"/web/queue?open={batch_id}")
         assert "partially_completed" in queue.text
-        assert "↻" in queue.text
+        assert 'data-icon="arrow-clockwise"' in queue.text
 
         response = await client.post(
             f"/web/batches/{batch_id}/retry-failed?open={batch_id}"
         )
 
     assert response.status_code == 200
-    assert "↻" not in response.text
+    assert 'data-icon="arrow-clockwise"' not in response.text
     assert "partially_completed" not in response.text
     assert "No failed jobs to retry." not in response.text
 
@@ -425,6 +448,57 @@ async def test_retry_failed_batch_posts_only_failed_jobs_and_resets_ui_state(
     completed_job = await wired_app.state.tracker.get_job(completed)
     assert failed_job is not None and failed_job.status is not JobStatus.FAILED
     assert completed_job is not None and completed_job.status is JobStatus.COMPLETED
+
+
+async def test_retry_failed_child_posts_only_that_job(wired_app) -> None:
+    batch_id = uuid4()
+    first = uuid4()
+    second = uuid4()
+    bus = wired_app.state.bus
+
+    await _emit(
+        bus,
+        BATCH_CREATED,
+        BatchCreated(batch_id, "https://youtu.be/playlist?list=child-retry", AT),
+    )
+    for step, job_id in enumerate((first, second), start=1):
+        await _emit(
+            bus,
+            JOB_QUEUED,
+            JobQueued(
+                job_id,
+                batch_id,
+                SourceKind.YOUTUBE,
+                f"https://youtu.be/{job_id}",
+                None,
+                _time(step),
+            ),
+        )
+    await _emit(
+        bus,
+        BATCH_JOBS_CREATED,
+        BatchJobsCreated(batch_id, (first, second), 0, _time(3)),
+    )
+    await _fail_job(bus, first, ARTIFACT_1, 4)
+    await _fail_job(bus, second, ARTIFACT_2, 7)
+
+    async with await _client(wired_app) as client:
+        queue = await client.get(f"/web/queue?open={batch_id}")
+        assert f'hx-post="/web/jobs/{first}/retry-failed?open={batch_id}"' in queue.text
+        assert 'hx-swap="outerHTML show:none focus-scroll:false"' in queue.text
+
+        response = await client.post(
+            f"/web/jobs/{first}/retry-failed?open={batch_id}"
+        )
+
+    assert response.status_code == 200
+    assert "No failed job to retry." not in response.text
+    assert wired_app.state.scheduler.calls[-1] == ("retry_job", first)
+
+    first_job = await wired_app.state.tracker.get_job(first)
+    second_job = await wired_app.state.tracker.get_job(second)
+    assert first_job is not None and first_job.status is not JobStatus.FAILED
+    assert second_job is not None and second_job.status is JobStatus.FAILED
 
 
 async def test_retry_failed_batch_requires_failed_children(wired_app) -> None:
@@ -571,14 +645,14 @@ async def test_retry_failed_batch_icon_exists_for_fully_failed_playlist(
     async with await _client(wired_app) as client:
         queue = await client.get(f"/web/queue?open={batch_id}")
         assert "failed" in queue.text
-        assert "↻" in queue.text
+        assert 'data-icon="arrow-clockwise"' in queue.text
 
         response = await client.post(
             f"/web/batches/{batch_id}/retry-failed?open={batch_id}"
         )
 
     assert response.status_code == 200
-    assert "↻" not in response.text
+    assert 'data-icon="arrow-clockwise"' not in response.text
     assert "No failed jobs to retry." not in response.text
 
     calls = wired_app.state.scheduler.calls[-1]

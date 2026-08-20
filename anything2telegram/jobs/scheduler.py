@@ -26,6 +26,7 @@ from ..events import (
     BATCH_JOBS_CREATED,
     JOB_QUEUED,
     JOB_STARTED,
+    TELEGRAM_AVAILABLE,
     TELEGRAM_UNAVAILABLE,
     YOUTUBE_DOWNLOAD_REQUESTED,
     YOUTUBE_PLAYLIST_EXPANDED,
@@ -154,6 +155,7 @@ class JobScheduler:
         bus.on(ARTIFACT_UPLOAD_FAILED, self._on_job_terminal)
         bus.on(YOUTUBE_PLAYLIST_EXPANDED, self._on_playlist_expanded)
         bus.on(YOUTUBE_PLAYLIST_EXPANSION_FAILED, self._on_playlist_settled)
+        bus.on(TELEGRAM_AVAILABLE, self._on_telegram_available)
         bus.on(TELEGRAM_UNAVAILABLE, self._on_telegram_unavailable)
 
     @property
@@ -268,10 +270,17 @@ class JobScheduler:
 
         self._require_accepting()
         jobs = await self._tracker.claim_failed_batch_jobs_for_retry(batch_id)
+        return await self._retry_claimed_jobs(jobs)
+
+    async def _retry_claimed_jobs(
+        self, jobs: tuple[JobSnapshot, ...]
+    ) -> tuple[JobSnapshot, ...]:
         if not jobs:
             return ()
 
-        retryable_jobs = tuple(job for job in jobs if job.source_kind is SourceKind.YOUTUBE)
+        retryable_jobs = tuple(
+            job for job in jobs if job.source_kind is SourceKind.YOUTUBE
+        )
         if not retryable_jobs:
             await self._tracker.revert_batch_jobs_to_failed(jobs)
             return ()
@@ -291,6 +300,17 @@ class JobScheduler:
         await self._tracker.clear_retried_batch_job_state(retryable_jobs)
         return retryable_jobs
 
+    async def retry_failed_job(self, job_id: UUID) -> JobSnapshot | None:
+        if self._tracker is None:
+            raise SchedulerError("retry_unavailable", "Retry is not configured")
+
+        self._require_accepting()
+        job = await self._tracker.claim_failed_job_for_retry(job_id)
+        if job is None:
+            return None
+        retried = await self._retry_claimed_jobs((job,))
+        return retried[0] if retried else None
+
     async def cancel_reserved_upload(self, job_id: UUID) -> bool:
         if job_id not in self._reservations:
             return False
@@ -301,6 +321,14 @@ class JobScheduler:
         if not self._paused:
             _LOGGER.warning("Scheduler paused")
         self._paused = True
+
+    def resume(self) -> None:
+        if self._stopped:
+            return
+        if self._paused:
+            _LOGGER.info("Scheduler resumed")
+        self._paused = False
+        self._request_pump()
 
     def _mark_stopped(self) -> None:
         self._stopped = True
@@ -435,6 +463,9 @@ class JobScheduler:
 
     def _on_telegram_unavailable(self, event: object) -> None:
         self.pause()
+
+    def _on_telegram_available(self, event: object) -> None:
+        self.resume()
 
     def _request_pump(self) -> None:
         if self._paused or self._stopped or self._pump_scheduled:

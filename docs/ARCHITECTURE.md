@@ -256,9 +256,10 @@ characters of stderr travel back as `ProcessResult.stderr_tail` so the producer 
 gave up. That text is for the operator log only — it can contain cookie paths and signed URLs, so it
 never enters an event payload or an HTTP response.
 
-Above that, `YouTubeArtifactProducer` polls the download directory once a second while yt-dlp runs
-and aborts if the partial download outgrows `max_artifact_bytes`. `--max-filesize` alone is not
-enough, because yt-dlp only knows a size it was told in advance.
+Above that, `YouTubeArtifactProducer` gives video and audio 80% and 20% of the final size budget,
+then polls the download directory once a second while yt-dlp runs. The scratch ceiling is three
+times `max_artifact_bytes` because ffmpeg briefly holds both inputs and the merged output.
+`--max-filesize` still bounds each individual transfer.
 
 Cookies are yt-dlp's problem too. `browsers.py` resolves `YTDLP_COOKIES_PROFILE` to a
 `browser:directory` pair at startup by reading Chromium's `Local State`, and everything after that —
