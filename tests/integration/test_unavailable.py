@@ -28,7 +28,12 @@ async def test_a_runtime_disconnect_makes_the_service_refuse_new_work(
 
             health = await client.get("/health")
             assert health.status_code == 503
-            assert health.json() == {"ready": False, "telegram_connected": False}
+            assert health.json() == {
+                "ready": False,
+                "database_connected": True,
+                "telegram_connected": False,
+                "scheduler_accepting": False,
+            }
 
             refused = await client.post("/jobs/youtube", json={"url": VIDEO})
             assert refused.status_code == 503

@@ -18,6 +18,7 @@ from anything2telegram.downloaders.youtube import (
     classify_youtube_url,
 )
 from anything2telegram.jobs.scheduler import SchedulerError
+from anything2telegram.jobs.tracker import TrackingError
 from anything2telegram.tui import format_bytes
 
 _WEB_ROOT = Path(__file__).parent
@@ -25,7 +26,10 @@ _TEMPLATES = Jinja2Templates(directory=_WEB_ROOT / "templates")
 _TEMPLATES.env.filters["format_bytes"] = format_bytes
 _TEMPLATES.env.filters["video_id"] = lambda url: _query_or_tail(url, "v")
 _TEMPLATES.env.filters["playlist_id"] = lambda url: _query_or_tail(url, "list")
-_NOT_READY = "Not ready — the Telegram client is still connecting. Try again in a moment."
+_NOT_READY = "Not ready — check system health above, then try again."
+_TELEGRAM_NOT_READY = (
+    "Not ready — the Telegram client is still connecting. Try again in a moment."
+)
 _WRONG_FORM = "That is a video or playlist URL — queue it from the main page."
 _NOT_A_CHANNEL = "Not a supported YouTube channel URL."
 
@@ -42,16 +46,6 @@ def _parse_open(raw: str) -> tuple[frozenset[str], str]:
     return ids, ",".join(sorted(ids))
 
 
-def _toggle_open(open_ids: frozenset[str], batch_id: object) -> str:
-    """The open set with batch_id's membership flipped, as a query value."""
-    next_ids = set(open_ids)
-    next_ids.symmetric_difference_update({str(batch_id)})
-    return ",".join(sorted(next_ids))
-
-
-_TEMPLATES.env.globals["toggle_open"] = _toggle_open
-
-
 def _ui_offset(raw: object) -> int | None:
     """Parse the 1-indexed offset form field; None means invalid, not absent."""
     if raw is None:
@@ -63,6 +57,15 @@ def _ui_offset(raw: object) -> int | None:
     except ValueError:
         return None
     return value if value >= 1 else None
+
+
+def _not_ready(request: Request) -> str:
+    telegram = getattr(request.app.state, "telegram", None)
+    return (
+        _TELEGRAM_NOT_READY
+        if telegram is None or not telegram.is_connected
+        else _NOT_READY
+    )
 
 
 async def _queue_entries(request: Request) -> tuple[object, ...]:
@@ -200,7 +203,7 @@ def register_web_routes(app: FastAPI) -> None:
             )
 
         if not _is_ready(request):
-            return await _submit_response(request, "503", _NOT_READY, open)
+            return await _submit_response(request, "503", _not_ready(request), open)
 
         scheduler = request.app.state.scheduler
         try:
@@ -209,7 +212,7 @@ def register_web_routes(app: FastAPI) -> None:
             else:
                 await scheduler.submit_playlist(url, offset - 1)
         except SchedulerError:
-            return await _submit_response(request, "503", _NOT_READY, open)
+            return await _submit_response(request, "503", _not_ready(request), open)
 
         return await _submit_response(request, None, None, open)
 
@@ -256,7 +259,7 @@ def register_web_routes(app: FastAPI) -> None:
                 request, None, "Nothing selected — tick at least one playlist."
             )
         if not _is_ready(request):
-            return _channel_page(request, "503", _NOT_READY)
+            return _channel_page(request, "503", _not_ready(request))
 
         scheduler = request.app.state.scheduler
         try:
@@ -265,14 +268,14 @@ def register_web_routes(app: FastAPI) -> None:
             for playlist_url in selected:
                 await scheduler.submit_playlist(playlist_url, 0)
         except SchedulerError:
-            return _channel_page(request, "503", _NOT_READY)
+            return _channel_page(request, "503", _not_ready(request))
 
         return RedirectResponse("/", status_code=303)
 
     @app.post("/web/upload", response_class=HTMLResponse)
     async def submit_upload(request: Request, open: str = Query("")) -> HTMLResponse:
         if not _is_ready(request):
-            return await _submit_response(request, "503", _NOT_READY, open)
+            return await _submit_response(request, "503", _not_ready(request), open)
 
         state = request.app.state
         max_bytes = state.settings.max_artifact_bytes
@@ -285,5 +288,47 @@ def register_web_routes(app: FastAPI) -> None:
             await _stage_upload_and_enqueue(request, state, max_bytes)
         except _UploadSubmitError as error:
             return await _submit_response(request, str(error.status_code), error.message, open)
+
+        return await _submit_response(request, None, None, open)
+
+    @app.post("/web/batches/{batch_id}/retry-failed", response_class=HTMLResponse)
+    async def retry_failed_batch(
+        request: Request,
+        batch_id: UUID,
+        open: str = Query(""),
+    ) -> HTMLResponse:
+        if not request.app.state.scheduler.accepting:
+            return await _submit_response(request, "503", _not_ready(request), open)
+
+        try:
+            jobs = await request.app.state.scheduler.retry_failed_batch(batch_id)
+        except TrackingError:
+            return await _submit_response(request, "422", "Batch not found.", open)
+        except SchedulerError:
+            return await _submit_response(request, "503", _not_ready(request), open)
+
+        if not jobs:
+            return await _submit_response(request, "422", "No failed jobs to retry.", open)
+
+        return await _submit_response(request, None, None, open)
+
+    @app.post("/web/jobs/{job_id}/retry-failed", response_class=HTMLResponse)
+    async def retry_failed_job(
+        request: Request,
+        job_id: UUID,
+        open: str = Query(""),
+    ) -> HTMLResponse:
+        if not request.app.state.scheduler.accepting:
+            return await _submit_response(request, "503", _not_ready(request), open)
+
+        try:
+            job = await request.app.state.scheduler.retry_failed_job(job_id)
+        except TrackingError:
+            return await _submit_response(request, "422", "Job not found.", open)
+        except SchedulerError:
+            return await _submit_response(request, "503", _not_ready(request), open)
+
+        if job is None:
+            return await _submit_response(request, "422", "No failed job to retry.", open)
 
         return await _submit_response(request, None, None, open)

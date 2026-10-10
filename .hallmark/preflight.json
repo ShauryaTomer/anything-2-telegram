@@ -1,0 +1,9 @@
+{
+  "date": "2026-08-20",
+  "framework": "Jinja templates with HTMX and vendored Pico CSS",
+  "font_stack": "Pico defaults",
+  "palette": "Pico defaults",
+  "motion": "motion-cut",
+  "spacing": "Pico defaults",
+  "preserve": ["HTMX interactions", "Pico base stylesheet", "light and dark color schemes"]
+}

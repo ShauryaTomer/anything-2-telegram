@@ -10,9 +10,10 @@ from ..artifacts.storage import ArtifactStorage, ArtifactStorageError
 from ..domain import (
     BatchRef,
     ErrorInfo,
+    JobSnapshot,
     JobPhase,
-    JobRef,
     SourceKind,
+    JobRef,
     StagedArtifact,
     UploadReservation,
 )
@@ -25,6 +26,7 @@ from ..events import (
     BATCH_JOBS_CREATED,
     JOB_QUEUED,
     JOB_STARTED,
+    TELEGRAM_AVAILABLE,
     TELEGRAM_UNAVAILABLE,
     YOUTUBE_DOWNLOAD_REQUESTED,
     YOUTUBE_PLAYLIST_EXPANDED,
@@ -44,6 +46,7 @@ from ..events import (
     YouTubeDownloadRequested,
 )
 from .repositories import BatchQueueRepository, JobQueueRepository, JobQueueRow, PlaylistQueueRow
+from .tracker import JobTracker
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -131,11 +134,13 @@ class JobScheduler:
         storage: ArtifactStorage,
         job_queue: JobQueueRepository,
         batch_queue: BatchQueueRepository,
+        tracker: JobTracker | None = None,
     ) -> None:
         self._bus = bus
         self._storage = storage
         self._job_queue = job_queue
         self._batch_queue = batch_queue
+        self._tracker = tracker
         self._active: _Work | None = None
         self._active_phase: JobPhase | None = None
         self._active_artifact_id: UUID | None = None
@@ -150,6 +155,7 @@ class JobScheduler:
         bus.on(ARTIFACT_UPLOAD_FAILED, self._on_job_terminal)
         bus.on(YOUTUBE_PLAYLIST_EXPANDED, self._on_playlist_expanded)
         bus.on(YOUTUBE_PLAYLIST_EXPANSION_FAILED, self._on_playlist_settled)
+        bus.on(TELEGRAM_AVAILABLE, self._on_telegram_available)
         bus.on(TELEGRAM_UNAVAILABLE, self._on_telegram_unavailable)
 
     @property
@@ -239,6 +245,72 @@ class JobScheduler:
         self._request_pump()
         return JobRef(staged.job_id, f"/jobs/{staged.job_id}")
 
+    async def enqueue_batch_retries(self, jobs: tuple[JobSnapshot, ...]) -> None:
+        self._require_accepting()
+        rows = [
+            JobQueueRow(
+                job_id=job.id,
+                kind="youtube",
+                source_url=job.source,
+                title=job.title,
+            )
+            for job in jobs
+            if job.source_kind is SourceKind.YOUTUBE
+        ]
+        if not rows:
+            return
+        for row in rows:
+            await self._job_queue.remove(row.job_id)
+        await self._job_queue.prepend(rows)
+        self._request_pump()
+
+    async def retry_failed_batch(self, batch_id: UUID) -> tuple[JobSnapshot, ...]:
+        if self._tracker is None:
+            raise SchedulerError("retry_unavailable", "Retry is not configured")
+
+        self._require_accepting()
+        jobs = await self._tracker.claim_failed_batch_jobs_for_retry(batch_id)
+        return await self._retry_claimed_jobs(jobs)
+
+    async def _retry_claimed_jobs(
+        self, jobs: tuple[JobSnapshot, ...]
+    ) -> tuple[JobSnapshot, ...]:
+        if not jobs:
+            return ()
+
+        retryable_jobs = tuple(
+            job for job in jobs if job.source_kind is SourceKind.YOUTUBE
+        )
+        if not retryable_jobs:
+            await self._tracker.revert_batch_jobs_to_failed(jobs)
+            return ()
+
+        try:
+            await self.enqueue_batch_retries(retryable_jobs)
+        except Exception:
+            await self._tracker.revert_batch_jobs_to_failed(jobs)
+            raise
+
+        non_retryable_jobs = tuple(
+            job for job in jobs if job.source_kind is not SourceKind.YOUTUBE
+        )
+        if non_retryable_jobs:
+            await self._tracker.revert_batch_jobs_to_failed(non_retryable_jobs)
+
+        await self._tracker.clear_retried_batch_job_state(retryable_jobs)
+        return retryable_jobs
+
+    async def retry_failed_job(self, job_id: UUID) -> JobSnapshot | None:
+        if self._tracker is None:
+            raise SchedulerError("retry_unavailable", "Retry is not configured")
+
+        self._require_accepting()
+        job = await self._tracker.claim_failed_job_for_retry(job_id)
+        if job is None:
+            return None
+        retried = await self._retry_claimed_jobs((job,))
+        return retried[0] if retried else None
+
     async def cancel_reserved_upload(self, job_id: UUID) -> bool:
         if job_id not in self._reservations:
             return False
@@ -249,6 +321,14 @@ class JobScheduler:
         if not self._paused:
             _LOGGER.warning("Scheduler paused")
         self._paused = True
+
+    def resume(self) -> None:
+        if self._stopped:
+            return
+        if self._paused:
+            _LOGGER.info("Scheduler resumed")
+        self._paused = False
+        self._request_pump()
 
     def _mark_stopped(self) -> None:
         self._stopped = True
@@ -383,6 +463,9 @@ class JobScheduler:
 
     def _on_telegram_unavailable(self, event: object) -> None:
         self.pause()
+
+    def _on_telegram_available(self, event: object) -> None:
+        self.resume()
 
     def _request_pump(self) -> None:
         if self._paused or self._stopped or self._pump_scheduled:

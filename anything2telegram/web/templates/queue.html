@@ -1,14 +1,15 @@
+{% from "icons.html" import icon %}
 {% macro source_cell(name, fallback_id, url) -%}
-  {%- if name -%}{{ name }}{%- else -%}<span class="muted">{{ fallback_id }}</span>{%- endif -%}
-  <button type="button" class="copy" data-url="{{ url }}" aria-label="copy link">⧉</button>
+  {%- if name -%}<span class="source-name">{{ name }}</span>{%- else -%}<span class="muted">{{ fallback_id }}</span>{%- endif -%}
+  <button type="button" class="copy" data-url="{{ url }}" aria-label="Copy link">{{ icon("copy") }}</button>
 {%- endmacro %}
 {% macro progress_cell(job) -%}
   {%- set p = progress.get(job.id) -%}
   {%- if p -%}
     {%- if p.total == 0 -%}
-      <progress></progress> <span>{{ p.sent|format_bytes }}</span>
+      <span class="progress-cell"><progress></progress><span>{{ p.sent|format_bytes }}</span></span>
     {%- else -%}
-      <progress value="{{ p.sent }}" max="{{ p.total }}"></progress> <span>{{ p.sent * 100 // p.total }}%</span>
+      <span class="progress-cell"><progress value="{{ p.sent }}" max="{{ p.total }}"></progress><span>{{ p.sent * 100 // p.total }}%</span></span>
     {%- endif -%}
   {%- endif -%}
 {%- endmacro %}
@@ -19,61 +20,141 @@
   {%- if status.value == "failed" and error -%}
     <span class="failed" title="{{ error.code }} — {{ error.message }}">failed</span>
   {%- else -%}
-    {{ status.value }}
+    <span class="status status--{{ status.value }}">{{ status.value }}</span>
+  {%- endif -%}
+{%- endmacro %}
+{% macro retry_form(batch) -%}
+  {%- if batch.failed > 0 -%}
+    <form
+      class="retry-form"
+      hx-post="/web/batches/{{ batch.id }}/retry-failed{% if open_param %}?open={{ open_param }}{% endif %}"
+      hx-target="#queue"
+      hx-swap="outerHTML show:none focus-scroll:false"
+    >
+      <button type="submit" class="retry" title="Retry failed videos" aria-label="Retry failed videos">{{ icon("arrow-clockwise") }}</button>
+    </form>
+  {%- endif -%}
+{%- endmacro %}
+{% macro retry_job_form(job) -%}
+  {%- if job.status.value == "failed" and job.source_kind.value == "youtube" -%}
+    <form
+      class="retry-form"
+      hx-post="/web/jobs/{{ job.id }}/retry-failed{% if open_param %}?open={{ open_param }}{% endif %}"
+      hx-target="#queue"
+      hx-swap="outerHTML show:none focus-scroll:false"
+    >
+      <button type="submit" class="retry" title="Retry this video" aria-label="Retry this video">{{ icon("arrow-clockwise") }}</button>
+    </form>
   {%- endif -%}
 {%- endmacro %}
 <div id="queue" hx-get="/web/queue{% if open_param %}?open={{ open_param }}{% endif %}" hx-trigger="every 2s" hx-swap="outerHTML">
-  <table>
+  <table class="queue-table">
     <thead>
       <tr><th>Source</th><th>Status</th><th>Progress</th><th>Link</th></tr>
     </thead>
     <tbody>
       {% if not entries %}
-      <tr><td colspan="4">Nothing queued. Paste a YouTube URL or pick a file above.</td></tr>
+      <tr><td class="empty-state" colspan="4">Nothing queued. Paste a YouTube URL or pick a file above.</td></tr>
       {% endif %}
       {% for entry in entries %}
         {% if entry.jobs is defined %}
         {% set expanded = entry.batch.id|string in open %}
-        <tr>
-          <td>
-            {%- if entry.jobs -%}
-            <a class="toggle" hx-get="/web/queue?open={{ toggle_open(open, entry.batch.id) }}" hx-target="#queue" hx-swap="outerHTML">{{ "▾" if expanded else "▸" }}</a>
-            {%- else -%}
-            <span class="toggle"></span>
-            {%- endif %}
+        <tr
+          class="queue-row queue-row--batch"
+          data-state="{{ entry.batch.status.value }}"
+          data-title="{{ (entry.batch.title or entry.batch.source_url)|lower }}"
+          data-order="{{ loop.index0 }}"
+          data-progress="{{ entry.batch.completed / entry.batch.total_jobs if entry.batch.total_jobs else 0 }}"
+        >
+          <td data-label="Source"><div class="source-line">
+            <button
+              type="button"
+              class="toggle playlist-expand"
+              hx-get="/web/queue?open={{ entry.batch.id }}"
+              hx-select="#playlist-detail-{{ entry.batch.id }}"
+              hx-target="#playlist-dialog-content"
+              hx-swap="innerHTML"
+              aria-haspopup="dialog"
+              aria-controls="playlist-dialog"
+              aria-label="Expand {{ entry.batch.title or 'playlist' }}"
+              data-playlist-title="{{ entry.batch.title or 'Playlist videos' }}"
+            >{{ icon("arrows-out-simple") }}</button>
             {%- if entry.batch.thumbnail_url %}<img class="batch-thumb" src="{{ entry.batch.thumbnail_url }}" alt="" loading="lazy">{% endif %}
             {{ source_cell(entry.batch.title, entry.batch.source_url|playlist_id, entry.batch.source_url) }}
-          </td>
-          <td>{{ status_cell(entry.batch.status, entry.batch.error) }}</td>
-          <td>{% if entry.batch.status.value == "expanding" %}waiting{% else %}{{ entry.batch.completed }}/{{ entry.batch.total_jobs }} done{% endif %}</td>
-          <td></td>
+          </div></td>
+          <td data-label="Status"><div class="status-wrap">
+            {{ status_cell(entry.batch.status, entry.batch.error) }}
+            {{ retry_form(entry.batch) }}
+          </div></td>
+          <td data-label="Progress"><span class="progress-count">{% if entry.batch.status.value == "expanding" %}waiting{% else %}{{ entry.batch.completed }}/{{ entry.batch.total_jobs }} done{% endif %}</span></td>
+          <td data-label="Link"></td>
         </tr>
         {% if expanded %}
         {% set width = entry.jobs|length|string|length %}
         {% for job in entry.jobs %}
         <tr class="queue-child">
-          <td>{{ ("%0" ~ width ~ "d")|format(loop.index) }}/{{ entry.jobs|length }} {{ source_cell(job.title, job.source|video_id, job.source) }}</td>
-          <td>{{ status_cell(job.status, job.error) }}</td>
-          <td>{{ progress_cell(job) }}</td>
-          <td>{{ link_cell(job) }}</td>
+          <td data-label="Source"><div class="source-line">{{ ("%0" ~ width ~ "d")|format(loop.index) }}/{{ entry.jobs|length }} {{ source_cell(job.title, job.source|video_id, job.source) }}</div></td>
+          <td data-label="Status"><div class="status-wrap">{{ status_cell(job.status, job.error) }} {{ retry_job_form(job) }}</div></td>
+          <td data-label="Progress">{{ progress_cell(job) }}</td>
+          <td data-label="Link">{{ link_cell(job) }}</td>
         </tr>
         {% endfor %}
         {% endif %}
         {% else %}
-        <tr>
-          <td>
+        <tr
+          class="queue-row queue-row--job"
+          data-state="{{ entry.status.value }}"
+          data-title="{{ (entry.filename or entry.title or entry.source)|lower }}"
+          data-order="{{ loop.index0 }}"
+          data-progress="{{ 1 if entry.status.value == 'completed' else 0 }}"
+        >
+          <td data-label="Source"><div class="source-line">
             {%- if entry.source_kind.value == "local_upload" -%}
               {{ entry.filename }}
             {%- else -%}
               {{ source_cell(entry.filename, entry.source|video_id, entry.source) }}
             {%- endif -%}
-          </td>
-          <td>{{ status_cell(entry.status, entry.error) }}</td>
-          <td>{{ progress_cell(entry) }}</td>
-          <td>{{ link_cell(entry) }}</td>
+          </div></td>
+          <td data-label="Status">{{ status_cell(entry.status, entry.error) }}</td>
+          <td data-label="Progress">{{ progress_cell(entry) }}</td>
+          <td data-label="Link">{{ link_cell(entry) }}</td>
         </tr>
         {% endif %}
       {% endfor %}
     </tbody>
   </table>
+  {% for entry in entries %}
+    {% if entry.jobs is defined and entry.batch.id|string in open %}
+    <section
+      id="playlist-detail-{{ entry.batch.id }}"
+      class="playlist-detail"
+      hx-get="/web/queue?open={{ entry.batch.id }}"
+      hx-select="#playlist-detail-{{ entry.batch.id }}"
+      hx-trigger="every 2s"
+      hx-target="this"
+      hx-swap="outerHTML"
+    >
+      <p class="section-meta playlist-detail__meta">{{ entry.batch.completed }}/{{ entry.batch.total_jobs }} completed</p>
+      <table class="queue-table playlist-table">
+        <thead>
+          <tr><th>Video</th><th>Status</th><th>Progress</th><th>Link</th></tr>
+        </thead>
+        <tbody>
+          {% if not entry.jobs %}
+          <tr><td class="empty-state" colspan="4">Videos are still being discovered.</td></tr>
+          {% endif %}
+          {% set width = entry.jobs|length|string|length %}
+          {% for job in entry.jobs %}
+          <tr class="playlist-video">
+            <td data-label="Video"><div class="source-line">{{ ("%0" ~ width ~ "d")|format(loop.index) }}/{{ entry.jobs|length }} {{ source_cell(job.title, job.source|video_id, job.source) }}</div></td>
+            <td data-label="Status"><div class="status-wrap">{{ status_cell(job.status, job.error) }} {{ retry_job_form(job) }}</div></td>
+            <td data-label="Progress">{{ progress_cell(job) }}</td>
+            <td data-label="Link">{{ link_cell(job) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+    {% endif %}
+  {% endfor %}
 </div>

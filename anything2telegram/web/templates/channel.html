@@ -1,3 +1,4 @@
+{% from "icons.html" import icon %}
 <!doctype html>
 <html lang="en">
 <head>
@@ -21,11 +22,13 @@
   /* htmx only fades its indicator; take the row out of flow until requested. */
   #fetching { display: none; }
   #fetching.htmx-request { display: block; }
+  .ui-icon { display: block; width: 1.125rem; height: 1.125rem; flex: none; }
+  nav a { display: inline-flex; align-items: center; gap: .35rem; }
 </style>
 </head>
 <body>
 <main>
-  <nav><a href="/">← Queue</a></nav>
+  <nav><a href="/">{{ icon("arrow-left") }} Queue</a></nav>
   <article>
     <header><strong>Channel playlists</strong></header>
     <form hx-post="/web/channel" hx-target="#channel-results" hx-swap="innerHTML" hx-indicator="#fetching" hx-disabled-elt="find button">

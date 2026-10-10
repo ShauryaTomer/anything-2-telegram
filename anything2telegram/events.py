@@ -19,6 +19,7 @@ ARTIFACT_PRODUCTION_FAILED = "artifact.production.failed"
 ARTIFACT_UPLOADED = "artifact.uploaded"
 ARTIFACT_UPLOAD_FAILED = "artifact.upload.failed"
 TELEGRAM_UNAVAILABLE = "telegram.unavailable"
+TELEGRAM_AVAILABLE = "telegram.available"
 ERROR = "error"
 
 
@@ -136,4 +137,9 @@ class ArtifactUploadFailed:
 @dataclass(frozen=True)
 class TelegramUnavailable:
     error: ErrorInfo
+    occurred_at: datetime
+
+
+@dataclass(frozen=True)
+class TelegramAvailable:
     occurred_at: datetime

@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import UUID
 
 from ..domain import (
@@ -119,6 +119,88 @@ class JobTracker:
             entries.append((batch_snapshot.created_at, BatchEntry(batch_snapshot, children)))
         entries.sort(key=lambda entry: entry[0], reverse=True)
         return tuple(entry for _, entry in entries)
+
+    async def claim_failed_batch_jobs_for_retry(
+        self, batch_id: UUID
+    ) -> tuple[JobSnapshot, ...]:
+        """Mark failed jobs WAITING so they can be retried, then return snapshots."""
+        async with self._lock:
+            await self._require_batch(batch_id)
+            rows = await self._jobs.list_by_batch(batch_id)
+            now = datetime.now(UTC)
+            claimed_jobs: list[JobSnapshot] = []
+            for row in rows:
+                if row.status is not JobStatus.FAILED:
+                    continue
+                row.status = JobStatus.WAITING
+                row.updated_at = now
+                await self._jobs.update(row)
+                claimed_jobs.append(_snapshot_from_row(row))
+
+            if claimed_jobs:
+                batch = await self._batches.get(batch_id)
+                if batch is not None:
+                    await self._touch_batch(batch, now)
+            return tuple(claimed_jobs)
+
+    async def claim_failed_job_for_retry(self, job_id: UUID) -> JobSnapshot | None:
+        """Mark one failed job WAITING so it can be retried."""
+        async with self._lock:
+            row = await self._require_job(job_id)
+            if row.status is not JobStatus.FAILED:
+                return None
+            now = datetime.now(UTC)
+            row.status = JobStatus.WAITING
+            row.updated_at = now
+            await self._jobs.update(row)
+            await self._touch_batch_for_job(row, now)
+            return _snapshot_from_row(row)
+
+    async def revert_batch_jobs_to_failed(
+        self, jobs: tuple[JobSnapshot, ...], occurred_at: datetime | None = None
+    ) -> None:
+        """Undo a failed-batch retry claim by restoring WAITING jobs to FAILED."""
+        if not jobs:
+            return
+        now = occurred_at if occurred_at is not None else datetime.now(UTC)
+        async with self._lock:
+            for snapshot in jobs:
+                row = await self._jobs.get(snapshot.id)
+                if row is None:
+                    continue
+                if row.status is not JobStatus.WAITING:
+                    continue
+                row.status = JobStatus.FAILED
+                row.error = snapshot.error
+                row.updated_at = now
+                await self._jobs.update(row)
+                batch = await self._batches.get(snapshot.batch_id) if snapshot.batch_id else None
+                if batch is not None:
+                    await self._touch_batch(batch, now)
+
+    async def clear_retried_batch_job_state(
+        self, jobs: tuple[JobSnapshot, ...], occurred_at: datetime | None = None
+    ) -> None:
+        """Clear stale artifact/chat state for jobs now requeued for retry."""
+        if not jobs:
+            return
+        now = occurred_at if occurred_at is not None else datetime.now(UTC)
+        async with self._lock:
+            for snapshot in jobs:
+                row = await self._jobs.get(snapshot.id)
+                if row is None:
+                    continue
+                row.error = None
+                row.telegram_chat_id = None
+                row.telegram_message_id = None
+                row.artifact_id = None
+                row.filename = None
+                row.size_bytes = None
+                row.ready_local_path = None
+                row.ready_media_type = None
+                row.ready_caption = None
+                row.updated_at = now
+                await self._jobs.update(row)
 
     async def _on_batch_created(self, event: BatchCreated) -> None:
         if await self._batches.get(event.batch_id) is not None:

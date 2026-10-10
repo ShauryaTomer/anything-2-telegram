@@ -8,7 +8,9 @@ import pytest
 
 from anything2telegram import main
 from anything2telegram.config import Settings
-from anything2telegram.domain import JobStatus, SourceKind
+from anything2telegram.domain import JobPhase, JobStatus, SourceKind
+from anything2telegram.events import JobStarted
+from anything2telegram.jobs import lifecycle
 from anything2telegram.jobs.repositories import (
     JobQueueRepository,
     JobRow,
@@ -81,6 +83,53 @@ async def test_a_job_stuck_producing_or_uploading_is_interrupted_and_requeued(
 
         queued = await JobQueueRepository(state.db).list_all()
         assert [row.job_id for row in queued] == [job_id]
+
+
+async def test_recovered_youtube_job_clears_stale_artifact_when_restarted(
+    settings: Settings,
+) -> None:
+    job_id = uuid4()
+    artifact_id = uuid4()
+    now = datetime.now(UTC)
+    conn = await open_database(settings.db_path)
+    jobs = JobsRepository(conn)
+    queue = JobQueueRepository(conn)
+    await jobs.insert(
+        JobRow(
+            id=job_id,
+            batch_id=None,
+            source_kind=SourceKind.YOUTUBE,
+            source="https://example.test/watch?v=stuck",
+            title="Interrupted upload",
+            status=JobStatus.UPLOADING,
+            artifact_id=artifact_id,
+            filename="old.mp4",
+            size_bytes=123,
+            telegram_chat_id=None,
+            telegram_message_id=None,
+            error=None,
+            created_at=now,
+            updated_at=now,
+            staged=False,
+            ready_local_path=Path("/tmp/old.mp4"),
+            ready_media_type="video/mp4",
+            ready_caption="old",
+        )
+    )
+
+    await main._recover_interrupted_jobs(jobs, queue)
+
+    recovered = await jobs.get(job_id)
+    assert recovered is not None
+    assert recovered.status is JobStatus.INTERRUPTED
+    lifecycle.apply(recovered, JobStarted(job_id, JobPhase.PRODUCING, now))
+    assert recovered.artifact_id is None
+    assert recovered.filename is None
+    assert recovered.size_bytes is None
+    assert recovered.ready_local_path is None
+    assert recovered.ready_media_type is None
+    assert recovered.ready_caption is None
+    await conn.close()
 
 
 async def test_settings_are_read_from_the_environment_when_not_supplied(
@@ -169,6 +218,25 @@ async def test_losing_telegram_at_runtime_closes_admission(build_app) -> None:
             await asyncio.sleep(0)
 
         assert state.readiness.is_accepting() is False
+
+
+async def test_telegram_reconnection_reopens_admission(build_app) -> None:
+    telegram = FakeTelegram()
+    service = build_app(telegram=telegram)
+
+    async with service.router.lifespan_context(service):
+        state = service.state
+        telegram.drop()
+        for _ in range(4):
+            await asyncio.sleep(0)
+        assert state.readiness.is_accepting() is False
+
+        telegram.disconnected = asyncio.Event()
+        telegram.connected = True
+        await asyncio.sleep(1.1)
+
+        assert state.readiness.is_accepting() is True
+        assert state.scheduler.accepting is True
 
 
 async def test_a_drain_that_overruns_its_grace_period_is_cancelled(

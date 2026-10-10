@@ -95,6 +95,16 @@ def _apply_started(record: JobRow, fact: JobStarted) -> None:
     expected_phase = JobPhase.UPLOADING if record.staged else JobPhase.PRODUCING
     if fact.phase is not expected_phase:
         raise InvalidJobTransition("invalid job phase")
+    if fact.phase is JobPhase.PRODUCING:
+        record.artifact_id = None
+        record.filename = None
+        record.size_bytes = None
+        record.telegram_chat_id = None
+        record.telegram_message_id = None
+        record.error = None
+        record.ready_local_path = None
+        record.ready_media_type = None
+        record.ready_caption = None
     record.status = _STATUS_FOR_PHASE[fact.phase]
 
 

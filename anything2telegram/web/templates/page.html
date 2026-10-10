@@ -1,54 +1,181 @@
+{% from "icons.html" import icon %}
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
-<title>anything2telegram</title>
+<title>Queue · anything2telegram</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap">
 <link rel="stylesheet" href="/web/static/vendor/pico-2.1.1.classless.min.css">
+<link rel="stylesheet" href="/web/static/tokens.css">
+<link rel="stylesheet" href="/web/static/app.css">
 <script src="/web/static/vendor/htmx-2.0.9.min.js"></script>
-<style>
-  .two-col { display: grid; gap: 1.5rem; grid-template-columns: 1fr 1fr; }
-  @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
-  .queue-child td:first-child { padding-left: 2rem; }
-  .batch-thumb {
-    width: 64px; height: 36px; object-fit: cover; border-radius: .2rem;
-    vertical-align: middle; margin-right: .4rem;
-  }
-  .toggle { display: inline-block; width: 1em; text-align: center; }
-  .failed { color: var(--pico-del-color); border-bottom: 1px dotted currentColor; cursor: help; }
-  .copy {
-    all: unset; cursor: pointer; color: var(--pico-muted-color);
-    padding: 0 .35rem; border-radius: .25rem; font-size: .9em;
-  }
-  .copy:hover { color: var(--pico-primary); background: var(--pico-code-background-color); }
-</style>
 </head>
 <body>
-<main>
-  <article>
-    <header><strong>Queue work</strong> — <a href="/channel">channel playlists</a></header>
-    <div class="two-col">
-      <form hx-post="/web/youtube{% if open_param %}?open={{ open_param }}{% endif %}" hx-target="#queue" hx-swap="outerHTML">
-        <label>YouTube URL
-          <input type="url" name="url" placeholder="https://youtu.be/… or /playlist?list=…" required>
+<header class="app-bar">
+  <a class="wordmark" href="/" aria-label="anything2telegram queue">anything<span class="wordmark__arrow">{{ icon("arrow-right") }}</span>telegram</a>
+  <a href="/channel"><span class="nav-action"><span class="nav-action__label">Channel playlists</span>{{ icon("arrow-right") }}</span></a>
+</header>
+<section id="system-health" class="system-health" aria-label="System health" aria-live="polite">
+  <div class="health-summary" data-health-state="checking">
+    <span class="health-dot" aria-hidden="true"></span>
+    <span>System <strong data-health="overall">Checking</strong></span>
+  </div>
+  <ul class="health-components">
+    <li data-health-state="checking"><span class="health-dot" aria-hidden="true"></span>Database <strong data-health="database">Checking</strong></li>
+    <li data-health-state="checking"><span class="health-dot" aria-hidden="true"></span>Telegram <strong data-health="telegram">Checking</strong></li>
+    <li data-health-state="checking"><span class="health-dot" aria-hidden="true"></span>Queue <strong data-health="scheduler">Checking</strong></li>
+  </ul>
+</section>
+<main class="app-main">
+  <section class="intake" aria-labelledby="queue-work-title">
+    <header class="intake__heading">
+      <h1 id="queue-work-title">Queue work</h1>
+      <p>Paste a YouTube link or choose a local file. New work appears in the transfer queue below.</p>
+    </header>
+    <div class="intake__grid">
+      <form class="queue-form" hx-post="/web/youtube{% if open_param %}?open={{ open_param }}{% endif %}" hx-target="#queue" hx-swap="outerHTML">
+        <header class="queue-form__title"><h2>YouTube</h2><span class="queue-form__kind">video or playlist</span></header>
+        <label class="field">YouTube URL
+          <input type="url" name="url" placeholder="https://youtu.be/… or /playlist?list=…" required aria-required="true">
         </label>
-        <label>Playlist start at #
-          <input type="number" name="offset" min="1" value="1">
+        <label class="field">Playlist starts at
+          <input type="number" name="offset" min="1" value="1" inputmode="numeric">
         </label>
-        <button type="submit">Queue</button>
+        <button class="form-action" type="submit"><span>Queue YouTube</span><span class="form-action__arrow">{{ icon("arrow-right") }}</span></button>
       </form>
-      <form hx-post="/web/upload{% if open_param %}?open={{ open_param }}{% endif %}" hx-encoding="multipart/form-data" hx-target="#queue" hx-swap="outerHTML" enctype="multipart/form-data">
-        <label>Local file <input type="file" name="file" required></label>
+      <form class="queue-form" hx-post="/web/upload{% if open_param %}?open={{ open_param }}{% endif %}" hx-encoding="multipart/form-data" hx-target="#queue" hx-swap="outerHTML" enctype="multipart/form-data">
+        <header class="queue-form__title"><h2>Local file</h2><span class="queue-form__kind">upload</span></header>
+        <label class="field">Choose a file
+          <input type="file" name="file" required aria-required="true">
+        </label>
         <progress class="up-progress" value="0" max="100" hidden></progress>
-        <button type="submit">Upload</button>
+        <button class="form-action form-action--secondary" type="submit"><span>Upload file</span><span class="form-action__arrow">{{ icon("arrow-up") }}</span></button>
       </form>
     </div>
-  </article>
-  <div id="flash"></div>
-  {% include "queue.html" %}
+  </section>
+  <div id="flash" class="flash" aria-live="polite"></div>
+  <section class="queue-workbench" aria-labelledby="transfer-queue-title">
+    <header class="section-head">
+      <h2 id="transfer-queue-title">Transfer queue</h2>
+      <p class="section-meta">Live updates · every 2 seconds</p>
+    </header>
+    <div class="queue-toolbar" aria-label="Queue controls">
+      <label>State
+        <select id="queue-state-filter">
+          <option value="all">All states</option>
+          <option value="active">Active</option>
+          <option value="completed">Completed</option>
+          <option value="attention">Needs attention</option>
+        </select>
+      </label>
+      <label>Sort
+        <select id="queue-sort">
+          <option value="queue">Queue order</option>
+          <option value="progress">Progress: high to low</option>
+          <option value="name">Name: A to Z</option>
+        </select>
+      </label>
+    </div>
+    {% include "queue.html" %}
+    <p id="queue-filter-empty" class="filter-empty" hidden>No transfers match this state.</p>
+  </section>
 </main>
+<dialog id="playlist-dialog" class="playlist-dialog" aria-labelledby="playlist-dialog-title">
+  <article>
+    <header class="playlist-dialog__header">
+      <div>
+        <p class="eyebrow">Transfer details</p>
+        <h2 id="playlist-dialog-title">Playlist videos</h2>
+      </div>
+      <button type="button" class="playlist-dialog__close">Close</button>
+    </header>
+    <div id="playlist-dialog-content"><p class="dialog-loading">Loading playlist…</p></div>
+  </article>
+</dialog>
+<footer class="app-footer"><p>anything2telegram · local operator console</p></footer>
 <script>
+  const playlistDialog = document.querySelector('#playlist-dialog');
+  const playlistDialogContent = document.querySelector('#playlist-dialog-content');
+  const stateFilter = document.querySelector('#queue-state-filter');
+  const queueSort = document.querySelector('#queue-sort');
+  const filterEmpty = document.querySelector('#queue-filter-empty');
+  const activeStates = new Set(['expanding', 'waiting', 'processing', 'producing', 'uploading']);
+  const attentionStates = new Set(['failed', 'partially_completed', 'interrupted']);
+  const healthLabels = {
+    overall: ['Ready', 'Unavailable'],
+    database: ['Connected', 'Unavailable'],
+    telegram: ['Connected', 'Disconnected'],
+    scheduler: ['Accepting', 'Stopped'],
+  };
+
+  function setHealth(name, ok) {
+    const value = document.querySelector(`[data-health="${name}"]`);
+    value.textContent = healthLabels[name][ok ? 0 : 1];
+    value.closest('[data-health-state]').dataset.healthState = ok ? 'ok' : 'error';
+  }
+
+  async function refreshHealth() {
+    try {
+      const response = await fetch('/health', { cache: 'no-store' });
+      const health = await response.json();
+      setHealth('overall', health.ready);
+      setHealth('database', health.database_connected);
+      setHealth('telegram', health.telegram_connected);
+      setHealth('scheduler', health.scheduler_accepting);
+    } catch {
+      for (const name of Object.keys(healthLabels)) setHealth(name, false);
+    }
+  }
+
+  refreshHealth();
+  window.setInterval(refreshHealth, 5000);
+
+  function applyQueueView(event) {
+    const body = document.querySelector('#queue .queue-table tbody');
+    if (!body) return;
+
+    const groups = [...body.querySelectorAll(':scope > .queue-row')].map((row) => {
+      const children = [];
+      let sibling = row.nextElementSibling;
+      while (sibling?.classList.contains('queue-child')) {
+        children.push(sibling);
+        sibling = sibling.nextElementSibling;
+      }
+      return { row, children };
+    });
+    const state = stateFilter.value;
+    const matches = (row) => state === 'all'
+      || (state === 'active' && activeStates.has(row.dataset.state))
+      || (state === 'attention' && attentionStates.has(row.dataset.state))
+      || row.dataset.state === state;
+
+    const shouldReorder = queueSort.value !== 'queue' || event?.target === queueSort;
+    if (shouldReorder) {
+      groups.sort((a, b) => {
+        if (queueSort.value === 'progress') return Number(b.row.dataset.progress) - Number(a.row.dataset.progress);
+        if (queueSort.value === 'name') return a.row.dataset.title.localeCompare(b.row.dataset.title);
+        return Number(a.row.dataset.order) - Number(b.row.dataset.order);
+      });
+    }
+    let visible = 0;
+    for (const group of groups) {
+      const hidden = !matches(group.row);
+      group.row.hidden = hidden;
+      group.children.forEach((row) => { row.hidden = hidden; });
+      if (shouldReorder) body.append(group.row, ...group.children);
+      if (!hidden) visible += 1;
+    }
+    filterEmpty.hidden = groups.length === 0 || visible > 0;
+  }
+
+  stateFilter.addEventListener('change', applyQueueView);
+  queueSort.addEventListener('change', applyQueueView);
+  applyQueueView();
+
   document.body.addEventListener('htmx:xhr:progress', (e) => {
     const bar = e.target.querySelector('.up-progress');
     if (bar && e.detail.lengthComputable) {
@@ -57,11 +184,51 @@
     }
   });
   // Delegated so it keeps working after htmx swaps #queue's rows back in.
-  document.body.addEventListener('click', (e) => {
+  document.body.addEventListener('htmx:beforeRequest', (e) => {
+    const button = e.target.matches?.('[type="submit"]')
+      ? e.target
+      : e.target.querySelector?.('[type="submit"]');
+    if (button) {
+      button.dataset.state = 'loading';
+      button.setAttribute('aria-busy', 'true');
+    }
+  });
+  document.body.addEventListener('htmx:afterRequest', (e) => {
+    const button = e.target.matches?.('[type="submit"]')
+      ? e.target
+      : e.target.querySelector?.('[type="submit"]');
+    if (button) {
+      delete button.dataset.state;
+      button.removeAttribute('aria-busy');
+    }
+  });
+  document.body.addEventListener('htmx:afterSwap', applyQueueView);
+  document.body.addEventListener('click', async (e) => {
+    const expand = e.target.closest('.playlist-expand');
+    if (expand) {
+      document.querySelector('#playlist-dialog-title').textContent = expand.dataset.playlistTitle;
+      playlistDialogContent.innerHTML = '<p class="dialog-loading">Loading playlist…</p>';
+      if (!playlistDialog.open) playlistDialog.showModal();
+    }
     const button = e.target.closest('.copy');
     if (button) {
-      navigator.clipboard.writeText(button.dataset.url);
+      try {
+        await navigator.clipboard.writeText(button.dataset.url);
+        button.dataset.state = 'success';
+        button.setAttribute('aria-label', 'Link copied');
+      } catch {
+        button.dataset.state = 'error';
+        button.setAttribute('aria-label', 'Copy failed');
+      }
+      window.setTimeout(() => {
+        delete button.dataset.state;
+        button.setAttribute('aria-label', 'Copy link');
+      }, 1500);
     }
+  });
+  document.querySelector('.playlist-dialog__close').addEventListener('click', () => playlistDialog.close());
+  playlistDialog.addEventListener('click', (e) => {
+    if (e.target === playlistDialog) playlistDialog.close();
   });
 </script>
 </body>

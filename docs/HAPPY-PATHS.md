@@ -74,9 +74,9 @@ sequenceDiagram
     Note over P: async handler → task
 
     P->>P: allocate_download_directory(job, artifact)
-    P->>Y: yt-dlp -f <best ≤1080p mp4> --max-filesize N
+    P->>Y: yt-dlp -f <best ≤1080p streams within N> --max-filesize N
     loop every 1s while running
-        P->>P: download_directory_size ≤ max_artifact_bytes?
+        P->>P: download_directory_size ≤ 3 × max_artifact_bytes?
     end
     Y-->>P: exit 0
     P->>P: _discover_artifact → exactly one .mp4/.mkv/.webm
@@ -116,7 +116,7 @@ sequenceDiagram
 | not ready (Telegram down, shutting down) | `503 service_unavailable` |
 | yt-dlp exits non-zero | `artifact.production.failed` — `youtube_process_failed` |
 | yt-dlp exceeds `YTDLP_TIMEOUT_SECONDS` | process group killed, `youtube_timeout` |
-| partial download outgrows the limit | yt-dlp cancelled, `artifact_oversize` |
+| download scratch space outgrows 3× the artifact limit | yt-dlp cancelled, `artifact_oversize` |
 | output missing or ambiguous | `internal_error` |
 | Telegram upload times out | `artifact.upload.failed` — `telegram_timeout` |
 | Telegram connection lost | `telegram_unavailable` + `telegram.unavailable` → scheduler pauses |
