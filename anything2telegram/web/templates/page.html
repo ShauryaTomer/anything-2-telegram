@@ -134,7 +134,7 @@
   refreshHealth();
   window.setInterval(refreshHealth, 5000);
 
-  function applyQueueView() {
+  function applyQueueView(event) {
     const body = document.querySelector('#queue .queue-table tbody');
     if (!body) return;
 

@@ -255,6 +255,8 @@ class YouTubeArtifactProducer:
             artifact = self._discover_artifact(
                 event.job_id, artifact_id, directory, event.caption_prefix
             )
+            if artifact.size_bytes > self._max_artifact_bytes:
+                raise _ArtifactOversize()
             _LOGGER.info(
                 "Artifact produced: job=%s artifact=%s file=%s bytes=%d",
                 artifact.job_id,
@@ -359,10 +361,10 @@ class YouTubeArtifactProducer:
         video_budget = self._max_artifact_bytes * 4 // 5
         audio_budget = self._max_artifact_bytes - video_budget
         format_selector = (
-            f"bv*[ext=mp4][vcodec^=avc1][height<=1080][filesize<={video_budget}]"
-            f"+ba[ext=m4a][filesize<={audio_budget}]/"
-            f"b[ext=mp4][height<=1080][filesize<={self._max_artifact_bytes}]/"
-            f"b[height<=1080][filesize<={self._max_artifact_bytes}]"
+            f"bv*[ext=mp4][vcodec^=avc1][height<=1080][filesize<=?{video_budget}]"
+            f"+ba[ext=m4a][filesize<=?{audio_budget}]/"
+            f"b[ext=mp4][height<=1080][filesize<=?{self._max_artifact_bytes}]/"
+            f"b[height<=1080][filesize<=?{self._max_artifact_bytes}]"
         )
         return [
             *_YTDLP_COMMAND,

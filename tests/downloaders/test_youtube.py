@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from yt_dlp import YoutubeDL
 from pyee.asyncio import AsyncIOEventEmitter
 
 from anything2telegram.artifacts.storage import ArtifactStorage
@@ -400,11 +401,62 @@ async def test_the_download_command_bounds_size_and_uses_the_running_interpreter
     video_budget = settings.max_artifact_bytes * 4 // 5
     audio_budget = settings.max_artifact_bytes - video_budget
     selected_format = args[args.index("-f") + 1]
-    assert f"[filesize<={video_budget}]" in selected_format
-    assert f"[filesize<={audio_budget}]" in selected_format
+    assert f"[filesize<=?{video_budget}]" in selected_format
+    assert f"[filesize<=?{audio_budget}]" in selected_format
     assert args[args.index("--max-filesize") + 1] == str(settings.max_artifact_bytes)
     assert "--no-playlist" in args
     assert runner.timeout_seconds == settings.ytdlp_timeout_seconds
+
+
+@pytest.mark.parametrize(
+    "extension,size_metadata,expected",
+    [
+        ("mp4", {}, True),
+        ("mp4", {"filesize_approx": 100}, True),
+        ("mp4", {"filesize": 100}, True),
+        ("mp4", {"filesize": 1025}, False),
+        ("webm", {}, True),
+        ("webm", {"filesize": 1025}, False),
+    ],
+)
+async def test_download_selector_accepts_unknown_sizes_but_rejects_known_oversize(
+    bus, storage, recorder, tmp_path, extension, size_metadata, expected
+) -> None:
+    settings = settings_for(tmp_path, max_artifact_bytes=1024)
+    runner = ScriptedRunner(writes_file("clip.mp4"))
+    make_producer(bus, storage, runner, settings)
+    bus.emit("youtube.download.requested", download_request())
+    await settle(bus)
+
+    args = runner.calls[0]
+    with YoutubeDL({"quiet": True}) as ydl:
+        selector = ydl.build_format_selector(args[args.index("-f") + 1])
+        formats = [{
+            "format_id": "combined",
+            "ext": extension,
+            "height": 360,
+            "vcodec": "avc1",
+            "acodec": "mp4a",
+            "url": "https://example.com/video",
+            **size_metadata,
+        }]
+        assert bool(list(selector({"formats": formats, "incomplete_formats": False}))) is expected
+
+
+async def test_final_download_over_limit_is_rejected_below_temporary_quota(
+    bus, storage, recorder, tmp_path
+) -> None:
+    small = settings_for(tmp_path, max_artifact_bytes=8)
+    runner = ScriptedRunner(writes_file("clip.mp4", b"x" * 9))
+    make_producer(bus, storage, runner, small)
+    event = download_request()
+
+    bus.emit("youtube.download.requested", event)
+    await settle(bus)
+
+    assert recorder.failure_codes() == ["artifact_oversize"]
+    assert recorder.ready == []
+    assert not (storage.root / str(event.job_id)).exists()
 
 
 async def test_cookies_are_passed_only_when_configured(
