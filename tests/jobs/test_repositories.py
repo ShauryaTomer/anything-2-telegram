@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -193,6 +194,78 @@ async def test_job_queue_prepend_jumps_new_entries_ahead_of_existing_ones(
     assert await repo.dequeue() == later
 
 
+async def test_concurrent_prepends_keep_every_job_once_and_each_group_in_order(
+    conn: aiosqlite.Connection,
+) -> None:
+    repo = JobQueueRepository(conn)
+    existing = JobQueueRow(job_id=uuid4(), kind="youtube")
+    await repo.enqueue(existing)
+    groups = [
+        [JobQueueRow(job_id=uuid4(), kind="youtube") for _ in range(2)]
+        for _ in range(8)
+    ]
+
+    await asyncio.gather(*(repo.prepend(group) for group in groups))
+
+    queued = await repo.list_all()
+    assert len(queued) == 17
+    assert {row.job_id for row in queued} == {
+        existing.job_id, *(row.job_id for group in groups for row in group)
+    }
+    assert queued[-1] == existing
+    for group in groups:
+        start = queued.index(group[0])
+        assert queued[start : start + 2] == tuple(group)
+
+
+async def test_prepend_preserves_existing_playlist_and_video_order(
+    conn: aiosqlite.Connection,
+) -> None:
+    jobs = JobQueueRepository(conn)
+    batches = BatchQueueRepository(conn)
+    playlist = PlaylistQueueRow(batch_id=uuid4(), source_url="https://playlist")
+    later = JobQueueRow(job_id=uuid4(), kind="youtube", source_url="https://later")
+    await batches.enqueue(playlist)
+    await jobs.enqueue(later)
+    playlist_sequence = await batches.peek_sequence()
+    video_sequence = await jobs.peek_sequence()
+    retries = [JobQueueRow(job_id=uuid4(), kind="youtube") for _ in range(2)]
+
+    await jobs.prepend(retries)
+
+    assert await jobs.peek_sequence() < await batches.peek_sequence()
+    for retry in retries:
+        assert await jobs.dequeue() == retry
+    assert await batches.peek_sequence() == playlist_sequence
+    assert await jobs.peek_sequence() == video_sequence
+    assert playlist_sequence < video_sequence
+    assert await batches.dequeue() == playlist
+    assert await jobs.dequeue() == later
+
+
+async def test_concurrent_prepends_from_separate_connections_keep_complete_groups(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "shared.sqlite3"
+    first_conn = await open_database(db_path)
+    second_conn = await open_database(db_path)
+    try:
+        first = JobQueueRepository(first_conn)
+        second = JobQueueRepository(second_conn)
+        first_group = [JobQueueRow(job_id=uuid4(), kind="youtube") for _ in range(2)]
+        second_group = [JobQueueRow(job_id=uuid4(), kind="youtube") for _ in range(2)]
+
+        await asyncio.gather(first.prepend(first_group), second.prepend(second_group))
+
+        queued = await first.list_all()
+        assert queued in (
+            tuple(first_group + second_group), tuple(second_group + first_group)
+        )
+    finally:
+        await first_conn.close()
+        await second_conn.close()
+
+
 async def test_job_queue_remove_drops_a_specific_entry(conn: aiosqlite.Connection) -> None:
     repo = JobQueueRepository(conn)
     keep = JobQueueRow(job_id=uuid4(), kind="staged")
@@ -205,11 +278,17 @@ async def test_job_queue_remove_drops_a_specific_entry(conn: aiosqlite.Connectio
     assert await repo.list_all() == (keep,)
 
 
-async def test_job_queue_round_trips_staged_work_fields(conn: aiosqlite.Connection) -> None:
+@pytest.mark.parametrize("prepend", [False, True])
+async def test_job_queue_round_trips_staged_work_fields(
+    conn: aiosqlite.Connection, prepend: bool,
+) -> None:
     repo = JobQueueRepository(conn)
     row = JobQueueRow(
         job_id=uuid4(),
         kind="staged",
+        source_url="https://example.test/source",
+        caption_prefix="Playlist #1",
+        title="A title",
         artifact_id=uuid4(),
         local_path=Path("/private/artifacts/clip.mp4"),
         filename="clip.mp4",
@@ -217,7 +296,10 @@ async def test_job_queue_round_trips_staged_work_fields(conn: aiosqlite.Connecti
         size_bytes=123,
         caption="hi",
     )
-    await repo.enqueue(row)
+    if prepend:
+        await repo.prepend([row])
+    else:
+        await repo.enqueue(row)
 
     assert await repo.dequeue() == row
 

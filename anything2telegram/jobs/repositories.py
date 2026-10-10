@@ -5,6 +5,7 @@ job ids are derived by querying ``jobs.batch_id``, not duplicated here) —
 that stays in the tracker/scheduler.
 """
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -411,52 +412,65 @@ class JobQueueRepository:
                 artifact_id, local_path, filename, media_type, size_bytes, caption
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                sequence,
-                str(row.job_id),
-                row.kind,
-                row.source_url,
-                row.caption_prefix,
-                row.title,
-                _str_or_none(row.artifact_id),
-                _str_or_none(row.local_path),
-                row.filename,
-                row.media_type,
-                row.size_bytes,
-                row.caption,
-            ),
+            (sequence, *self._params(row)),
+        )
+
+    @staticmethod
+    def _params(row: JobQueueRow) -> tuple[object, ...]:
+        return (
+            str(row.job_id),
+            row.kind,
+            row.source_url,
+            row.caption_prefix,
+            row.title,
+            _str_or_none(row.artifact_id),
+            _str_or_none(row.local_path),
+            row.filename,
+            row.media_type,
+            row.size_bytes,
+            row.caption,
         )
 
     async def prepend(self, rows: list[JobQueueRow]) -> None:
-        """Insert ``rows`` ahead of anything already queued.
+        """Insert ``rows`` ahead of both queues without changing existing entries.
 
-        Sequence numbers only increase across job- and batch-queue reads when new
-        items are appended, but retry jobs and playlist children should run
-        *before* ordinary queued work. Re-sequence everything: delete
-        ``job_queue`` entries, insert the new rows ahead of its current min
-        sequence, then reinsert the survivors in their original order.
+        Allocate and insert the entire group in one SQLite statement so concurrent
+        prepends cannot overwrite work or allocate from the same stale minimum.
+        JSON passes large groups without adding a bound parameter for every field.
         """
         if not rows:
             return
-        existing = await self.list_all()
-        cursor = await self._conn.execute(
-            "SELECT MIN(sequence) AS minimum_sequence FROM ("
-            "SELECT sequence FROM job_queue UNION ALL SELECT sequence FROM batch_queue"
-            ")"
+        await self._conn.execute(
+            """
+            INSERT INTO job_queue (
+                sequence, job_id, kind, source_url, caption_prefix, title,
+                artifact_id, local_path, filename, media_type, size_bytes, caption
+            )
+            SELECT
+                front.minimum_sequence - ? + CAST(incoming.key AS INTEGER),
+                json_extract(incoming.value, '$[0]'),
+                json_extract(incoming.value, '$[1]'),
+                json_extract(incoming.value, '$[2]'),
+                json_extract(incoming.value, '$[3]'),
+                json_extract(incoming.value, '$[4]'),
+                json_extract(incoming.value, '$[5]'),
+                json_extract(incoming.value, '$[6]'),
+                json_extract(incoming.value, '$[7]'),
+                json_extract(incoming.value, '$[8]'),
+                json_extract(incoming.value, '$[9]'),
+                json_extract(incoming.value, '$[10]')
+            FROM json_each(?) AS incoming
+            CROSS JOIN (
+                SELECT COALESCE(MIN(sequence), 0) AS minimum_sequence FROM (
+                    SELECT sequence FROM job_queue
+                    UNION ALL
+                    SELECT sequence FROM batch_queue
+                )
+            ) AS front
+            ORDER BY CAST(incoming.key AS INTEGER)
+            """,
+            (len(rows), json.dumps([self._params(row) for row in rows])),
         )
-        min_row = await cursor.fetchone()
-        await cursor.close()
-        min_sequence = min_row["minimum_sequence"] if min_row is not None else None
-        start_sequence = (min_sequence or 0) - len(rows)
-        await self._conn.execute("DELETE FROM job_queue")
-        for row in rows:
-            sequence = start_sequence
-            start_sequence += 1
-            await self._insert(row, sequence)
-        for row in existing:
-            sequence = start_sequence
-            start_sequence += 1
-            await self._insert(row, sequence)
         await self._conn.commit()
 
     async def dequeue(self) -> JobQueueRow | None:
